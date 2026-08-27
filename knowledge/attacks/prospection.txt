@@ -1,0 +1,61 @@
+PROSPECTION NON SOLLICITEE ET INDESIRABLE COMMERCIAL
+
+Document de doctrine adverse. L'indesirable n'est pas le dangereux : il ne
+cherche ni a voler ni a nuire, il impose une sollicitation. Le distinguer
+compte autant que reconnaitre une attaque, car les deux appellent des reponses
+differentes.
+
+1. Ce qui distingue une diffusion honnete d'une prospection imposee
+
+Une diffusion legitime se declare : elle porte les en-tetes de liste, offre un
+desabonnement en un geste, nomme son destinataire, et correspond a un
+consentement anterieur. Une prospection imposee emprunte la forme du courrier
+ordinaire tout en s'adressant a une adresse collectee ou devinee.
+
+Marqueurs observables : destinataire absent des champs To et Cc, sans en-tete
+de liste pour l'expliquer ; aucun moyen de desabonnement ; aucun historique
+avec l'expediteur ; adresse destinataire figurant dans des fuites publiques.
+
+Ce qui ne prouve rien : l'envoi de masse en lui-meme. Les lettres
+d'information demandees en sont, et le destinataire les attend.
+
+2. Promesses invérifiables
+
+Le registre du discours suffit souvent a qualifier. Les promesses de resultat
+spectaculaire, chiffrees en jours, sans protocole ni source, relevent d'une
+rhetorique constante : inversion d'un declin, elimination sans effort, secret
+que les professionnels cacheraient, methode simple qui change tout.
+
+Marqueurs observables : verbe de cure associe a un delai chiffre ; invocation
+d'une autorite invérifiable (un medecin, une universite, un laboratoire) sans
+reference ; opposition a un groupe qui "supprimerait" l'information ; produit
+presente comme rare ou en stock limite.
+
+Domaines les plus exploites : sante et bien-etre, complements alimentaires,
+perte de poids, fonctions cognitives, circulation, sommeil, revenus passifs,
+placements et cryptomonnaies.
+
+3. Chaine d'envoi et reputation
+
+La prospection de masse utilise des infrastructures jetables ou des plateformes
+d'emailing en marque blanche. Le domaine expediteur peut etre ancien et
+correctement configure : ce qui varie, c'est l'absence de relation avec le
+destinataire et la repetition de motifs identiques depuis des origines
+differentes.
+
+Marqueurs observables : messages identiques ou quasi identiques recus depuis
+plusieurs domaines sans rapport ; meme nom affiche pour des domaines
+differents ; sujets identiques a quelques heures d'intervalle ; expediteur
+technique appartenant a une plateforme d'envoi alors que le nom affiche designe
+une enseigne.
+
+4. Frontiere avec l'attaque
+
+Un indesirable devient une attaque lorsqu'il ajoute une tromperie : usurpation
+d'une identite, collecte de donnees sur une destination trompeuse, ou paiement
+obtenu sous un pretexte faux. Le registre commercial seul, meme agressif,
+n'etablit pas cette tromperie.
+
+Consequence de qualification : un envoi promotionnel non sollicite dont
+l'identite est claire releve de l'indesirable ; le meme envoi sous le nom d'une
+enseigne qu'il n'est pas releve de l'usurpation, meme si le produit existe.

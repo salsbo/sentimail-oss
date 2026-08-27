@@ -1,0 +1,35 @@
+# Effacement des en-têtes de contrôle posés par un émetteur EXTERNE.
+#
+# Ces en-têtes sont des assertions du MX receveur, jamais de l'expéditeur.
+# Sans ce nettoyage, n'importe qui peut écrire lui-même son verdict et sa
+# propre authentification dans le message, et l'analyse de Sentinel V3 lit
+# alors la parole de l'attaquant comme si c'était celle de l'infrastructure.
+#
+# Les header_checks s'appliquent dans cleanup, avant que le milter rspamd
+# n'ajoute ses propres en-têtes : ce qui reste après ce filtre a donc été
+# produit ici, et nulle part ailleurs.
+
+# En-têtes d'état SentiMail / Sentinel : légitimes uniquement en sortie de
+# pipeline, ou par réinjection interne directe sur le collecteur (qui ne
+# transite pas par ce MX).
+/^X-Sentimail-(Zone|Score|Verdict|State|Rationale|Reanalyze):/  IGNORE
+/^X-Sentinel-(Zone|Score|Verdict|State|Rationale|Reanalyze):/   IGNORE
+
+# Un secret de sonde historique ne doit jamais atteindre une boîte finale.
+/^X-Sentimail-Probe-Token:/                                     IGNORE
+/^X-Sentinel-Probe-Token:/                                      IGNORE
+
+# Scores antispam : seuls comptent ceux que le milter ajoute après ce filtre.
+# Une valeur déjà présente à l'entrée précéderait celle du milter et serait
+# lue en premier par le collecteur.
+/^X-Spam-(Score|Status|Flag):/                                  IGNORE
+/^X-Spamd-(Score|Result):/                                      IGNORE
+/^X-Rspamd-Score:/                                              IGNORE
+
+# Authentication-Results : le hook d'authentification de V3 ne fait confiance
+# qu'à l'authserv-id « rspamd.sentimail ». Un expéditeur qui poserait cet
+# en-tête avec ce même identifiant obtiendrait un DMARC=pass gratuit. Tout est
+# effacé ; rspamd en réécrit un après.
+# ARC-Authentication-Results reste intact : c'est une preuve de chaîne
+# distincte, évaluée comme telle.
+/^Authentication-Results:/                                      IGNORE

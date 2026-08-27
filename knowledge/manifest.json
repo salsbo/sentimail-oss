@@ -1,0 +1,106 @@
+{
+  "schema": "sentimail-v3-knowledge-manifest-1",
+  "nature": "normative",
+  "documents": [
+    {
+      "id": "rfc5321",
+      "title": "RFC 5321 - Simple Mail Transfer Protocol",
+      "url": "https://www.rfc-editor.org/rfc/rfc5321.txt",
+      "topic": "smtp",
+      "path": "snapshots/rfc5321.txt",
+      "sha256": "7d560eddff1b213c17d4e1e5f95005728b2f05bc2b3947f0fcc91717c6707634",
+      "bytes": 225929,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc5322",
+      "title": "RFC 5322 - Internet Message Format",
+      "url": "https://www.rfc-editor.org/rfc/rfc5322.txt",
+      "topic": "format",
+      "path": "snapshots/rfc5322.txt",
+      "sha256": "cb459acca15a2aa895863eaeff6f1d5b9c4ca15578ae3e3706f757787a385969",
+      "bytes": 122322,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc5598",
+      "title": "RFC 5598 - Internet Mail Architecture",
+      "url": "https://www.rfc-editor.org/rfc/rfc5598.txt",
+      "topic": "architecture",
+      "path": "snapshots/rfc5598.txt",
+      "sha256": "80702e8e4da554bac8270af89fbf01ca35f43957b659afc475e4b9e3fcc3f87c",
+      "bytes": 115741,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc6376",
+      "title": "RFC 6376 - DomainKeys Identified Mail (DKIM) Signatures",
+      "url": "https://www.rfc-editor.org/rfc/rfc6376.txt",
+      "topic": "authentification",
+      "path": "snapshots/rfc6376.txt",
+      "sha256": "00ae1e26aa19e0b8a6087435a524d23e824e2c31ebd62544dd714923bf8553f0",
+      "bytes": 176999,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc7208",
+      "title": "RFC 7208 - Sender Policy Framework (SPF)",
+      "url": "https://www.rfc-editor.org/rfc/rfc7208.txt",
+      "topic": "authentification",
+      "path": "snapshots/rfc7208.txt",
+      "sha256": "3cca3f2551f50d24a7b6423a7451d285df077863dab4bb261080ee87844f2d5b",
+      "bytes": 144189,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc7489",
+      "title": "RFC 7489 - Domain-based Message Authentication (DMARC)",
+      "url": "https://www.rfc-editor.org/rfc/rfc7489.txt",
+      "topic": "authentification",
+      "path": "snapshots/rfc7489.txt",
+      "sha256": "1ac7c343cb45cad1b597a0fee05b66c80adcd0e55a2312df8c300762456d9a1b",
+      "bytes": 162707,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc8601",
+      "title": "RFC 8601 - Message Header Field for Indicating Message Authentication Status",
+      "url": "https://www.rfc-editor.org/rfc/rfc8601.txt",
+      "topic": "authentification",
+      "path": "snapshots/rfc8601.txt",
+      "sha256": "5b4508b7c948c1a296ef2e010a2d65f55635adb8a667f70420c4f479265586fb",
+      "bytes": 122384,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc8617",
+      "title": "RFC 8617 - Authenticated Received Chain (ARC)",
+      "url": "https://www.rfc-editor.org/rfc/rfc8617.txt",
+      "topic": "authentification",
+      "path": "snapshots/rfc8617.txt",
+      "sha256": "8eca988e695d12350ce1f5bf79c6ebf62037a26832a9c95c39d89b8779e43304",
+      "bytes": 70573,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc8058",
+      "title": "RFC 8058 - Signaling One-Click Functionality for List Email Headers",
+      "url": "https://www.rfc-editor.org/rfc/rfc8058.txt",
+      "topic": "desabonnement",
+      "path": "snapshots/rfc8058.txt",
+      "sha256": "94f4529f3545fd0d6e7faac0f57d59ab7933b8fdf6e700017114c783b526c68f",
+      "bytes": 18219,
+      "captured_on": "2026-08-13"
+    },
+    {
+      "id": "rfc2142",
+      "title": "RFC 2142 - Mailbox Names for Common Services, Roles and Functions",
+      "url": "https://www.rfc-editor.org/rfc/rfc2142.txt",
+      "topic": "adressage",
+      "path": "snapshots/rfc2142.txt",
+      "sha256": "99a436105faa5a703fff3c4aee7e0d96c917950a170baa6cf8ee10c4b3616241",
+      "bytes": 12195,
+      "captured_on": "2026-08-13"
+    }
+  ]
+}

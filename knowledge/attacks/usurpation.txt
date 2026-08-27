@@ -1,0 +1,84 @@
+USURPATION D'IDENTITE DANS LE COURRIER ELECTRONIQUE
+
+Document de doctrine adverse. Il decrit des mecanismes d'attaque observes, les
+marqueurs qui permettent de les reconnaitre, et surtout ce qui ne les prouve
+pas. Il ne constate aucun fait sur un message particulier : il aide a qualifier
+un faisceau d'indices deja observe.
+
+1. Emprunt du nom affiche
+
+Le destinataire lit un nom, pas une adresse. La plupart des clients de
+messagerie affichent le champ display name en gros et masquent l'adresse
+reelle, en particulier sur telephone. Ecrire "Doctolib", "La Poste" ou "Service
+client" dans ce champ suffit donc a emporter la confiance, sans aucune
+compromission ni configuration particuliere : le champ est libre et n'est
+soumis a aucune verification par le protocole.
+
+Marqueurs observables : le nom affiche nomme une organisation connue alors que
+le domaine expediteur ne lui appartient pas ; le nom affiche contient lui-meme
+une adresse de courrier differente de l'adresse reelle ; le nom affiche imite
+un role interne ("Direction", "Comptabilite", "Service Retrait").
+
+Ce qui ne prouve rien : une agence de communication ou un prestataire ecrivent
+legitimement au nom de leur client depuis leur propre domaine. Le seul emprunt
+de nom, sans autre indice, ne distingue pas les deux situations. C'est sa
+conjonction avec l'absence d'historique, un defaut d'authentification, une
+destination etrangere ou une pression a l'action qui construit la charge.
+
+2. Domaine sosie et domaine cousin
+
+L'attaquant enregistre un domaine qui se lit comme celui d'une organisation
+connue : substitution d'un caractere (paypa1 pour paypal), ajout d'un mot
+(notif-colissimo-laposte.info), inversion de deux lettres, extension differente
+(.info, .top, .shop au lieu de .fr). Le domaine lui appartient reellement, ce
+qui a une consequence majeure : il peut y publier SPF, DKIM et DMARC en regle.
+
+Marqueurs observables : distance d'edition faible avec un nom de marque ; nom
+de marque present comme composant d'un domaine plus long ; extension inhabituelle
+pour l'organisation imitee ; date d'enregistrement recente.
+
+Piege d'analyse a connaitre : sur ce montage, l'authentification est valide.
+Un raisonnement qui exige un echec SPF ou DMARC pour conclure a l'usurpation ne
+verra jamais ces messages. L'authentification prouve que l'expediteur possede
+le domaine d'ou il ecrit, jamais qu'il est l'organisation qu'il nomme.
+
+3. Compte ou serveur legitime compromis
+
+L'attaquant n'usurpe rien : il utilise le domaine et l'infrastructure d'une
+entreprise reelle dont il a pris le controle, souvent une PME. Le message part
+du vrai serveur, avec la vraie configuration : authentification parfaite,
+domaine ancien, aucune reputation defavorable.
+
+Marqueurs observables : premier contact depuis une organisation sans lien avec
+le destinataire ni avec l'objet du message ; secteur d'activite de l'expediteur
+sans rapport avec le contenu (un fabricant de meubles qui ecrit au sujet d'un
+colis) ; plusieurs messages identiques recus depuis des domaines differents et
+sans rapport entre eux, a quelques minutes d'intervalle ; contenu en une langue
+qui n'est pas celle du pays du domaine expediteur.
+
+Ce qui ne prouve rien : l'anciennete du domaine et la qualite de
+l'authentification, precisement, ne disent rien ici. Ce sont les seuls indices
+que ce montage laisse intacts.
+
+4. Detournement du canal de reponse
+
+Le message se presente sous une identite et oriente la reponse ailleurs :
+champ Reply-To pointant vers un autre domaine, invitation a repondre a une
+adresse citee dans le corps, numero de telephone a rappeler. L'attaquant
+recupere ainsi la conversation sans avoir a controler le domaine affiche.
+
+Marqueurs observables : Reply-To sur un domaine distinct du From ; adresse de
+contact dans le corps differente de l'expediteur ; consigne explicite de
+repondre a une autre adresse ; domaine de reponse enregistre recemment.
+
+5. Reprise de fil de discussion
+
+L'attaquant repond a un echange reel, souvent obtenu apres compromission d'une
+boite. Le message cite l'historique, reprend l'objet precede de "Re:", et
+s'insere dans une conversation que le destinataire reconnait. La confiance
+vient du contexte, pas de l'expediteur.
+
+Marqueurs observables : objet en "Re:" sans qu'aucun message anterieur de ce
+fil n'ait ete envoye par le destinataire ; identifiants de reference absents ou
+incoherents avec l'historique local ; changement de domaine expediteur au
+milieu d'un fil.

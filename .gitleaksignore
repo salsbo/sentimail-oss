@@ -1,0 +1,5 @@
+# La RFC 6376 (DKIM) publie une paire de clés d'exemple dans son annexe C.
+# C'est le texte de la norme, identique chez tout le monde depuis 2011, pas un
+# secret de cette instance. Le snapshot est vérifié par son empreinte SHA-256
+# dans knowledge/manifest.json.
+knowledge/snapshots/rfc6376.txt:private-key:3983

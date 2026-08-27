@@ -1,0 +1,96 @@
+FRAUDE FINANCIÈRE PAR COURRIER ÉLECTRONIQUE
+
+Document de doctrine adverse. Il décrit des mécanismes d'attaque observés, les
+marqueurs qui permettent de les reconnaître, et surtout ce qui ne les prouve
+pas. Il ne constate aucun fait sur un message particulier : il aide à qualifier
+un faisceau d'indices déjà observé.
+
+Cette famille se distingue de l'hameçonnage classique sur un point décisif :
+elle ne cherche pas d'identifiants et n'a souvent ni lien, ni pièce jointe, ni
+défaut d'authentification. Elle demande seulement à un humain de faire un
+virement. Les défenses techniques n'ont donc presque rien à mordre, et c'est
+l'acte réclamé qui porte toute la charge.
+
+1. Fraude au dirigeant
+
+Un message se présente comme venant d'un responsable et demande une opération
+urgente, confidentielle, hors procédure. Le ressort n'est pas technique mais
+hiérarchique : il exploite la réticence à contredire une autorité et à faire
+perdre du temps à quelqu'un d'important.
+
+Marqueurs observables : demande d'un virement présentée comme urgente et
+exceptionnelle ; consigne explicite de confidentialité, souvent motivée par une
+opération « en cours de négociation » ; découragement de la vérification
+habituelle, du circuit de validation ou du contact téléphonique ; adresse de
+réponse différente de l'adresse d'envoi ; message envoyé hors des heures
+ouvrées ; nom affiché correct mais domaine personnel ou voisin ; premier contact
+écrit avec une personne dont l'expéditeur devrait déjà avoir l'adresse interne.
+
+Ce qui ne prouve rien : l'urgence et la confidentialité existent réellement dans
+la vie des affaires, et un dirigeant écrit parfois depuis son téléphone
+personnel. Le vocabulaire seul - « urgent », « virement », « confidentiel » - ne
+qualifie rien : un service comptable en reçoit tous les jours de parfaitement
+légitimes. C'est le contournement délibéré de la procédure, joint à
+l'irréversibilité de l'acte, qui construit la charge.
+
+2. Détournement de règlement et changement de coordonnées bancaires
+
+L'attaquant n'invente pas de facture : il attend une transaction réelle et en
+change la destination. C'est la fraude la plus rentable, car le montant et le
+motif sont exacts - seul l'IBAN diffère.
+
+Marqueurs observables : notification d'un changement de coordonnées bancaires,
+souvent justifiée par un « changement de banque », un « audit » ou une
+« restructuration » ; nouvelles coordonnées dans un pays sans rapport avec
+l'activité du fournisseur ; le message arrive peu avant une échéance connue ;
+l'IBAN diffère de celui des documents antérieurs du même émetteur ; toute
+demande de confirmation est renvoyée vers un numéro de téléphone fourni dans le
+message lui-même.
+
+Ce qui ne prouve rien : un changement de banque est un événement ordinaire et
+s'annonce légitimement par courrier. Un IBAN étranger n'a rien d'anormal dans
+l'espace SEPA. Ce qui compte est que la vérification soit rendue impossible ou
+circulaire : quand le seul moyen de vérifier est fourni par le message qui doit
+être vérifié, la boucle est le marqueur.
+
+3. Fausse facture et faux avis d'échéance
+
+Le message présente un document d'apparence comptable réclamant paiement. Il
+vise soit un règlement direct, soit l'ouverture d'une pièce jointe active.
+
+Marqueurs observables : facture d'un fournisseur avec lequel aucune relation
+n'existe ; montant faible, choisi pour passer sous les seuils de validation ;
+référence de commande absente, illisible ou générique ; document joint au format
+actif là où une facture est habituellement un PDF simple ; pression sur les
+pénalités de retard ou la suspension de service ; coordonnées de contact
+différentes de celles du fournisseur réel.
+
+Ce qui ne prouve rien : les relances automatiques, les factures d'abonnements
+oubliés et les prestataires ponctuels produisent régulièrement des factures
+inattendues et authentiques. L'inattendu seul n'accuse pas.
+
+4. Cartes prépayées et actifs non traçables
+
+Une variante demande l'achat de cartes cadeaux, de crypto-actifs ou de recharges
+téléphoniques, puis la transmission des codes. L'attrait pour l'attaquant est
+l'irréversibilité immédiate et l'absence de circuit bancaire.
+
+Marqueurs observables : demande d'achat de cartes cadeaux, quel que soit le
+prétexte invoqué - cadeaux aux salariés, urgence, remerciement client ; demande
+de photographier ou recopier les codes au dos ; promesse de remboursement
+ultérieur ; insistance sur la discrétion.
+
+Ce qui ne prouve rien : très peu de choses, en vérité. Aucune organisation
+légitime ne demande à un collaborateur d'acheter des cartes cadeaux sur ses
+deniers et d'en transmettre les codes par courrier. C'est l'un des rares
+marqueurs qui, seul, suffit presque à qualifier - mais il reste à vérifier qu'il
+s'agit bien d'une demande, et non de la mention d'un programme de fidélité.
+
+5. Le principe qui gouverne cette famille
+
+Ce n'est pas le thème qui qualifie, c'est l'acte et son coût. Un message qui
+parle d'argent n'est pas suspect ; un message qui demande de déplacer de
+l'argent hors des procédures, sans vérification possible, l'est. La gravité se
+mesure à ce qu'on ne pourra pas défaire : un virement parti ne revient pas, un
+code de carte cadeau lu est dépensé, tandis qu'un clic sur un lien laisse
+encore plusieurs occasions de s'arrêter.

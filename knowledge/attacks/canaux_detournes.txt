@@ -1,0 +1,115 @@
+CANAUX DÉTOURNÉS ET CONTOURNEMENT DE L'ANALYSE
+
+Document de doctrine adverse. Il décrit des mécanismes d'attaque observés, les
+marqueurs qui permettent de les reconnaître, et surtout ce qui ne les prouve
+pas. Il ne constate aucun fait sur un message particulier : il aide à qualifier
+un faisceau d'indices déjà observé.
+
+Cette famille regroupe les procédés qui ne cherchent pas à tromper le
+destinataire mais à échapper à l'analyse. Leur trait commun : le message livré
+ne contient pas l'attaque, il contient le chemin vers elle.
+
+1. Le code graphique comme porteur de lien
+
+Un code QR remplace le lien cliquable. L'analyse textuelle ne voit qu'une image,
+et le destinataire scanne avec un téléphone personnel, souvent hors de toute
+protection d'entreprise. Le procédé a connu une croissance forte parce qu'il
+franchit d'un coup l'analyse de liens et le périmètre technique.
+
+Marqueurs observables : code QR dans le corps ou dans une pièce jointe, présenté
+comme le seul moyen d'agir ; prétexte justifiant le scan - authentification,
+suivi de colis, document à signer, mise à jour de sécurité, réservation ; image
+unique portant tout l'appel à l'action alors qu'aucun lien textuel n'est
+proposé ; message pauvre en texte, dont le contenu utile est entièrement dans
+l'image.
+
+Ce qui ne prouve rien : les codes QR sont d'usage courant et légitime -
+billetterie, restauration, notices, cartes de visite, authentification
+d'entreprise. Leur seule présence n'accuse pas. C'est leur conjonction avec
+l'absence de tout autre chemin, une destination hors du domaine expéditeur, ou
+un prétexte d'urgence, qui construit la charge.
+
+2. Le texte rendu en image
+
+Le message n'a presque pas de texte : tout est dans une image, y compris le
+discours. Le procédé prive l'analyse lexicale de matière et neutralise les
+règles fondées sur le vocabulaire.
+
+Marqueurs observables : rapport image sur texte très déséquilibré ; corps
+textuel réduit à une formule neutre ou à du texte sans rapport ; le contenu
+substantiel n'apparaît qu'après lecture optique de l'image ; texte invisible
+ajouté pour diluer les statistiques - police blanche, taille nulle, blocs
+masqués par des styles.
+
+Ce qui ne prouve rien : de nombreuses lettres d'information commerciales
+légitimes sont presque entièrement graphiques, par choix de mise en page. Le
+déséquilibre seul est un signal faible. Il devient sérieux quand il s'accompagne
+de texte délibérément dissimulé, car la dissimulation, elle, n'a pas d'usage
+légitime.
+
+3. L'hébergement chez un tiers de confiance
+
+Plutôt que d'enregistrer un domaine, l'attaquant héberge sa charge sur un
+service dont la réputation est excellente : espace de stockage grand public,
+suite bureautique en ligne, formulaire, outil de signature électronique,
+plateforme de conception graphique. Le lien envoyé pointe vers un domaine
+irréprochable ; la tromperie n'est qu'au bout.
+
+Marqueurs observables : lien vers un service de partage ou de formulaire dont
+l'expéditeur n'a aucune raison d'usage établie ; document hébergé qui ne fait
+lui-même que rediriger ou afficher un second lien ; invitation à collaborer sur
+un document dont le sujet n'a aucun rapport avec la relation ; notification
+émise par la plateforme elle-même, donc authentifiée par elle, mais dont le
+contenu libre a été rédigé par l'attaquant.
+
+Ce qui ne prouve rien : ces services sont massivement employés de façon
+légitime, et une notification de plateforme est authentiquement signée par
+elle. L'authentification prouve ici que la plateforme a bien envoyé le message,
+jamais que son contenu est honnête - la distinction est essentielle, car
+l'attaquant emprunte la réputation du transporteur, pas celle de l'expéditeur.
+
+4. L'imbrication et le rebond
+
+La destination réelle est atteinte au terme d'une chaîne : raccourcisseur,
+redirecteur ouvert, service de suivi publicitaire, page intermédiaire.
+L'analyse qui s'arrête au premier maillon ne voit rien d'hostile.
+
+Marqueurs observables : chaîne de redirections dont l'apex final n'a aucun lien
+avec l'apex initial ; usage d'un redirecteur ouvert appartenant à une
+organisation connue - le lien commence par un domaine de confiance et se
+poursuit par un paramètre qui emporte ailleurs ; page intermédiaire dont le seul
+rôle est de rediriger ; destination finale différente selon le visiteur.
+
+Ce qui ne prouve rien : les liens de suivi et les redirections sont la norme
+absolue du courrier commercial légitime, et un expéditeur authentifié qui
+redirige depuis son propre domaine vers un partenaire fait un usage ordinaire du
+procédé. Une redirection entre domaines n'est pas une dissimulation. Elle le
+devient quand la destination est cachée au destinataire, ou quand la chaîne part
+d'un domaine sans rapport avec l'expéditeur.
+
+5. Le service livré conditionnellement
+
+La page servie diffère selon qui la demande : le visiteur ordinaire voit un
+contenu anodin, la victime ciblée voit l'attaque. Le tri se fait sur l'adresse
+réseau, le pays, le type d'appareil, ou sur un identifiant unique placé dans le
+lien.
+
+Marqueurs observables : lien portant un identifiant unique par destinataire ;
+contenu distant anodin alors que le message annonce une action précise ;
+comportement différent entre deux consultations ; page qui refuse les outils
+d'analyse mais s'ouvre normalement pour un navigateur ordinaire.
+
+Ce qui ne prouve rien : les liens personnalisés sont universels dans le courrier
+transactionnel - suivi de commande, désinscription, espace client. Un refus
+d'analyse est fréquent chez des services légitimes soucieux de leur charge. Ne
+pas pouvoir vérifier n'accuse personne ; cela limite seulement ce qu'on peut
+affirmer.
+
+6. Le principe qui gouverne cette famille
+
+Ces procédés ne visent pas la crédulité du destinataire mais l'aveuglement de
+l'analyse. Leur présence ne prouve donc pas l'hostilité - beaucoup ont un usage
+légitime massif - mais elle change ce que le silence des autres familles
+signifie. Quand un procédé d'évitement est constaté, l'absence de preuve dans
+les familles techniques ne doit plus être lue comme rassurante : elle peut être
+le résultat recherché.

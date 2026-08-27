@@ -1,0 +1,96 @@
+{
+  "schema": "sentimail-v3-knowledge-manifest-1",
+  "nature": "adversarial",
+  "documents": [
+    {
+      "id": "attaques-usurpation",
+      "title": "Techniques d'usurpation d'identité dans le courrier",
+      "url": "https://sentimail.example/doctrine/usurpation",
+      "topic": "usurpation",
+      "path": "usurpation.txt",
+      "sha256": "8252db9aeb304177c2365af8b31e2f09b447a6eed0371f8b3d8b46bf302c913c",
+      "bytes": 4457,
+      "captured_on": "2026-08-16"
+    },
+    {
+      "id": "attaques-hameconnage",
+      "title": "Scénarios d'hameçonnage et marqueurs",
+      "url": "https://sentimail.example/doctrine/hameconnage",
+      "topic": "hameconnage",
+      "path": "hameconnage.txt",
+      "sha256": "9e968eed9bbfb6036e1b6386d87f5509564fdad16658ee16f01c98e27fec05ce",
+      "bytes": 4387,
+      "captured_on": "2026-08-16"
+    },
+    {
+      "id": "attaques-dissimulation",
+      "title": "Dissimulation, obfuscation et détournement des liens",
+      "url": "https://sentimail.example/doctrine/dissimulation",
+      "topic": "dissimulation",
+      "path": "dissimulation.txt",
+      "sha256": "696f48bf1007bbbd6e9abaf89b5ae884a397b0f87b8d56af128473bb3cbdddc2",
+      "bytes": 3927,
+      "captured_on": "2026-08-16"
+    },
+    {
+      "id": "attaques-prospection",
+      "title": "Prospection non sollicitée et indésirable commercial",
+      "url": "https://sentimail.example/doctrine/prospection",
+      "topic": "prospection",
+      "path": "prospection.txt",
+      "sha256": "583cf801959035617fe82986daa1779441a0f239225b1b6764de849a30ceee5a",
+      "bytes": 2994,
+      "captured_on": "2026-08-16"
+    },
+    {
+      "id": "attaques-compromission",
+      "title": "Expéditeur légitime compromis et détournement de fil",
+      "url": "https://sentimail.example/doctrine/compromission",
+      "topic": "compromission",
+      "path": "compromission.txt",
+      "sha256": "af4778b30141bb78986f9c41d91c8ece61dcb0626607b6aedf77494a9b9fcfc4",
+      "bytes": 5172,
+      "captured_on": "2026-08-17"
+    },
+    {
+      "id": "attaques-fraude-financiere",
+      "title": "Fraude financière par courrier électronique",
+      "url": "https://sentimail.example/doctrine/fraude_financiere",
+      "topic": "fraude_financiere",
+      "path": "fraude_financiere.txt",
+      "sha256": "495a4ee2142fb36f8866e0b12b84efd9fe4208aad247438e50f6193975112877",
+      "bytes": 5425,
+      "captured_on": "2026-08-17"
+    },
+    {
+      "id": "attaques-codes-secrets",
+      "title": "Capture des codes à usage unique et des seconds facteurs",
+      "url": "https://sentimail.example/doctrine/codes_secrets",
+      "topic": "codes_secrets",
+      "path": "codes_et_secrets.txt",
+      "sha256": "981a9d59554bbad52bca8f902c4ad4c4121ba56ffcb3244e83750050af067b01",
+      "bytes": 5172,
+      "captured_on": "2026-08-17"
+    },
+    {
+      "id": "attaques-canaux-detournes",
+      "title": "Canaux détournés et contournement de l'analyse",
+      "url": "https://sentimail.example/doctrine/evitement",
+      "topic": "evitement",
+      "path": "canaux_detournes.txt",
+      "sha256": "f0df790a249704ac7b1128ddb59cf9ac2155a32b98393250c5cfc2dcc154d139",
+      "bytes": 6237,
+      "captured_on": "2026-08-17"
+    },
+    {
+      "id": "attaques-industrialisation",
+      "title": "Industrialisation de l'attaque et rédaction assistée",
+      "url": "https://sentimail.example/doctrine/industrialisation",
+      "topic": "industrialisation",
+      "path": "industrialisation.txt",
+      "sha256": "15ac238be643792badd6aa50dc863cba5272574baf80bb4dfe09e4454156cdc0",
+      "bytes": 5351,
+      "captured_on": "2026-08-17"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+# Étend la configuration par défaut de gitleaks. Un seul cas exempté :
+# l'exemple de clé RSA publié à l'annexe DKIM de la RFC 6376, copié verbatim
+# et verrouillé par somme de contrôle dans knowledge/snapshots/rfc6376.txt.
+# Ce n'est pas un secret de l'instance : c'est un extrait d'une norme IETF
+# publique, utilisé comme illustration dans le texte de la RFC elle-même.
+title = "SentiMail gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Exemple de clé RSA de la RFC 6376 (annexe DKIM), texte normatif public"
+regexes = [
+  '''MIICXwIBAAKBgQDwIRP/UC3SBsEmGqZ9ZJW3/DkMoGeLnQg1fWn7/zYtIxN2SnFC''',
+]

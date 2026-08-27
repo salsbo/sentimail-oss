@@ -1,0 +1,11 @@
+.DS_Store
+.env
+__pycache__/
+*.pyc
+secrets/
+.pytest_cache/
+.ruff_cache/
+.superpowers/
+
+# Environnement de test local (Python 3.12, comme la production)
+.venv-test/

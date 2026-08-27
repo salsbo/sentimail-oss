@@ -1,0 +1,11 @@
+# Routage lu en base, même source que relay_domains : tout domaine actif part
+# vers le collecteur de SentiMail V3, qui décide ensuite de la livraison.
+#
+# Postfix essaie successivement la clé « user@domaine » puis « domaine ». Seule
+# la seconde correspond à un fqdn, ce qui suffit : le routage est par domaine.
+# Aucune adresse n'est énumérée à la main ; enrôler un domaine le route.
+hosts = ${POSTGRES_HOST}
+user = ${POSTGRES_USER}
+password = ${POSTGRES_PASSWORD}
+dbname = ${POSTGRES_DB}
+query = SELECT 'smtp:[${SENTINEL_COLLECTOR_HOST}]:${SENTINEL_COLLECTOR_PORT}' FROM mx_relay_domains WHERE fqdn = lower('%s')

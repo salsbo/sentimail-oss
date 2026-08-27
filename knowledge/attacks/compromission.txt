@@ -1,0 +1,87 @@
+EXPÉDITEUR LÉGITIME COMPROMIS ET DÉTOURNEMENT DE FIL
+
+Document de doctrine adverse. Il décrit des mécanismes d'attaque observés, les
+marqueurs qui permettent de les reconnaître, et surtout ce qui ne les prouve
+pas. Il ne constate aucun fait sur un message particulier : il aide à qualifier
+un faisceau d'indices déjà observé.
+
+Ce document traite le cas le plus difficile de toute la doctrine : celui où
+l'authentification est parfaite, l'expéditeur réel, l'historique bon, et le
+message pourtant hostile. C'est le chemin le plus efficace du hameçonnage,
+précisément parce qu'il franchit toutes les barrières d'identité.
+
+1. Le compte authentique aux mains d'un tiers
+
+L'attaquant ne fabrique rien : il entre dans une boîte existante, par mot de
+passe volé, jeton dérobé ou session persistante. Il écrit ensuite depuis le
+serveur légitime de l'organisation. SPF, DKIM et DMARC passent tous, car ils
+sont exacts : le message vient bien du domaine qu'il prétend. Toute la famille
+identité est muette, ou favorable.
+
+Marqueurs observables : rupture de style ou de langue par rapport aux échanges
+antérieurs du même correspondant ; changement soudain de coordonnées bancaires,
+de mode de paiement ou d'adresse de réponse ; demande qui ne s'inscrit dans
+aucune relation d'affaires connue ; envoi à une liste inhabituelle de
+destinataires, notamment le carnet d'adresses entier ; horaire très éloigné des
+habitudes du correspondant ; message qui presse alors que la relation était
+posée ; pièce jointe ou lien dans un échange qui n'en comportait jamais.
+
+Ce qui ne prouve rien : une authentification réussie n'établit que l'origine
+technique du message, jamais l'intention de la personne qui l'a écrit. À
+l'inverse, un correspondant peut légitimement changer de banque, écrire depuis
+un téléphone dans un style plus bref, ou envoyer un document pour la première
+fois. Aucun de ces faits isolés n'établit une compromission : c'est leur
+convergence avec une demande coûteuse et irréversible qui la construit.
+
+2. Détournement de fil de discussion
+
+L'attaquant répond dans une conversation réelle et ancienne, souvent en citant
+l'historique complet. Le destinataire reconnaît le sujet, les interlocuteurs et
+le contexte : sa vigilance tombe, car le message ne surgit de nulle part, il
+prolonge quelque chose qu'il attendait.
+
+Deux variantes se distinguent. Dans la première, le compte d'un participant est
+compromis et la réponse part réellement du fil. Dans la seconde, l'attaquant a
+seulement volé le contenu du fil et le rejoue depuis un domaine voisin : il
+recrée l'apparence d'une réponse sans en avoir l'origine.
+
+Marqueurs observables : un In-Reply-To ou des References qui ne correspondent à
+aucun message réellement reçu ; un sujet en « Re: » sans message antérieur
+connu ; l'historique cité est authentique mais l'en-tête d'origine appartient à
+un domaine différent, souvent voisin ; le fil reprend après un silence
+inhabituellement long ; la réponse change l'objet réel de l'échange, par exemple
+en introduisant un règlement dans une discussion technique.
+
+Ce qui ne prouve rien : les transferts humains, les listes de diffusion et
+certains clients de messagerie cassent régulièrement les chaînes de références.
+Une chaîne incohérente est fréquente dans du courrier parfaitement ordinaire.
+Elle ne devient une charge qu'associée à une demande nouvelle dans un fil
+ancien, ou à un domaine expéditeur qui n'est pas celui du fil d'origine.
+
+3. Le prestataire ou fournisseur compromis
+
+Plutôt que la cible, l'attaquant compromet un tiers en relation avec elle :
+comptable, transporteur, agence, sous-traitant. Il écrit alors depuis une
+organisation réelle, attendue, dont les messages passent déjà toutes les
+vérifications et qui a des raisons légitimes de parler d'argent.
+
+Marqueurs observables : la facture ou le devis arrive d'un fournisseur connu
+mais avec des coordonnées bancaires modifiées ; le message insiste pour que le
+règlement suive de nouvelles instructions ; une confirmation par un autre canal
+est découragée ; le montant ou l'échéance ne correspond à aucun engagement
+connu ; le document joint est visuellement conforme mais le pied de page, le
+numéro de TVA ou l'IBAN diffèrent des documents précédents.
+
+Ce qui ne prouve rien : une entreprise change parfois de banque, de logiciel de
+facturation ou de mise en page, et l'annonce par courrier. C'est le caractère
+irréversible du versement demandé, joint au découragement de toute vérification
+indépendante, qui doit alerter - jamais le seul changement de coordonnées.
+
+4. Le principe qui gouverne cette famille
+
+Quand l'identité est établie, ce n'est plus l'expéditeur qu'il faut examiner
+mais l'acte réclamé et la rupture de contexte. Un compte authentifié qui demande
+un virement, un changement de coordonnées bancaires ou la divulgation d'un code
+mérite le même examen qu'un inconnu qui le demanderait, et non un examen moindre
+parce qu'il est authentifié. La confiance accordée à une adresse ne doit jamais
+excéder ce que l'acte demandé coûterait s'il était détourné.

@@ -1,0 +1,99 @@
+INDUSTRIALISATION DE L'ATTAQUE ET RÉDACTION ASSISTÉE
+
+Document de doctrine adverse. Il décrit des mécanismes d'attaque observés, les
+marqueurs qui permettent de les reconnaître, et surtout ce qui ne les prouve
+pas. Il ne constate aucun fait sur un message particulier : il aide à qualifier
+un faisceau d'indices déjà observé.
+
+Ce document a une portée particulière : il ne décrit pas un mode d'attaque de
+plus, mais l'obsolescence d'une méthode de défense. Les marqueurs de rédaction -
+fautes d'orthographe, tournures maladroites, mise en page grossière - ont
+longtemps servi d'indice principal. Ils ne valent plus rien. Un jugement qui
+s'appuie encore sur eux se trompe dans les deux sens.
+
+1. La disparition des marqueurs de rédaction
+
+La rédaction assistée produit aujourd'hui, dans toutes les langues, des messages
+grammaticalement irréprochables, au registre juste, adaptés au secteur d'activité
+et au niveau hiérarchique visés. La traduction automatique a supprimé l'avantage
+que donnait la barrière de la langue : un attaquant sans aucune notion de
+français produit un courrier en français impeccable.
+
+Conséquence pour le jugement, dans les deux sens :
+
+- une rédaction soignée n'est plus un indice favorable. Elle ne coûte plus rien
+  et ne témoigne d'aucun sérieux ;
+- une rédaction maladroite n'est plus un indice défavorable sérieux. Beaucoup de
+  courrier authentique est écrit vite, par des personnes non francophones, ou
+  traduit approximativement par des entreprises légitimes.
+
+Ce qui ne prouve rien : le style, à peu près seul. C'est le renversement le plus
+important de cette doctrine, et il vaut d'être énoncé explicitement, parce que
+l'intuition contraire est tenace.
+
+2. La personnalisation de masse
+
+Les informations publiques - réseaux professionnels, registres d'entreprise,
+sites institutionnels, fuites de données - permettent d'adresser un message
+nominatif, mentionnant le poste réel, un projet en cours, un collègue existant,
+à des milliers de destinataires simultanément. Le caractère ciblé n'implique
+donc plus un effort particulier, ni une attaque rare.
+
+Marqueurs observables : le message cite des informations exactes mais toutes
+publiquement accessibles ; il nomme correctement le destinataire et son rôle
+sans qu'aucune relation préalable n'existe ; il fait référence à un événement
+public de l'organisation ; la précision porte sur ce qui est publié, jamais sur
+ce qui ne l'est pas.
+
+Ce qui ne prouve rien : la prospection commerciale légitime emploie exactement
+les mêmes sources et les mêmes procédés. Un message précis et nominatif venant
+d'un inconnu est aussi bien un démarchage qu'une attaque ; c'est l'acte réclamé
+qui les sépare, pas la personnalisation.
+
+La distinction utile est celle-ci : une information publique exactement citée ne
+prouve aucune relation. Une information non publique - un montant en cours, une
+référence interne, le contenu d'un échange privé - en prouve une, ou prouve une
+compromission.
+
+3. L'attaque comme service
+
+Des kits complets se louent : pages de connexion clonées et maintenues à jour,
+relais de second facteur en temps réel, hébergement, listes de cibles, tableau
+de bord des victimes. Il n'est plus nécessaire de savoir programmer pour mener
+une campagne techniquement aboutie.
+
+Marqueurs observables : page de connexion parfaitement conforme au service
+imité, à jour de sa dernière refonte graphique ; infrastructure éphémère, créée
+et abandonnée en quelques jours ; réutilisation d'un même gabarit sur des
+domaines différents ; enregistrement du domaine très récent au regard de la
+marque imitée, laquelle est ancienne.
+
+Ce qui ne prouve rien : un domaine récent n'est pas hostile en soi - toute
+entreprise nouvelle en a un, et les campagnes légitimes créent des domaines
+dédiés. La jeunesse d'un domaine ne devient une charge qu'associée à une marque
+ancienne usurpée, ou à une collecte de données sensibles.
+
+4. Le volume et la variation
+
+Une même campagne est diffusée en milliers de variantes, chacune différente par
+le sujet, l'ordre des phrases, les images, le domaine d'envoi. Les défenses
+fondées sur la reconnaissance d'un contenu déjà vu perdent en efficacité.
+
+Marqueurs observables : structure identique sous un habillage changeant ;
+infrastructure d'envoi partagée entre messages de contenus différents ;
+convergence de destinations finales pour des messages apparemment sans rapport.
+
+Ce qui ne prouve rien : les grandes plateformes d'envoi légitimes produisent
+elles aussi des variantes massives d'un même message, depuis une infrastructure
+mutualisée. Partager une infrastructure avec du courrier hostile n'est pas une
+charge : c'est la situation ordinaire de tout gros émetteur.
+
+5. Le principe qui gouverne cette famille
+
+Puisque la forme ne coûte plus rien à l'attaquant, elle ne renseigne plus. Il
+faut juger ce qui coûte encore : établir une identité authentifiée et alignée,
+disposer d'un historique réel avec le destinataire, détenir une information non
+publique, exercer réellement l'activité dont le message parle, et supporter une
+vérification indépendante. Ces cinq choses restent chères à falsifier. La
+qualité de l'écriture, elle, est devenue gratuite - et un critère gratuit ne
+sépare plus rien.

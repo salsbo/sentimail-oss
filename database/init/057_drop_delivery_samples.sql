@@ -1,0 +1,20 @@
+-- La table du sondage aléatoire n'a plus de producteur : le mécanisme a été
+-- retiré le jour même de son introduction (migration 056).
+--
+-- Le sondage prélevait des messages correctement livrés pour demander à
+-- l'utilisateur s'ils étaient bien à leur place. C'était rigoureux du point de
+-- vue de la mesure - seul moyen d'estimer sans biais ce qu'un système laisse
+-- passer - et mauvais du point de vue du produit : SentiMail est là pour
+-- traiter le courrier, pas pour mener des expériences sur celui qu'il protège.
+-- Déranger quelqu'un à propos d'un message qui lui est bien parvenu est un coût
+-- sans contrepartie pour lui.
+--
+-- La conséquence reste écrite dans la mesure et n'est pas maquillée : le taux
+-- de faux négatifs n'est pas estimable, et le rapport continue d'annoncer une
+-- borne inférieure plutôt qu'un chiffre. Compter le silence comme une réussite
+-- afficherait zéro erreur pour toujours, par construction.
+--
+-- Les six tirages qu'elle contenait sont perdus avec elle. Ils ne valaient
+-- rien : les lettres correspondantes sont parties sans expéditeur ni adresse de
+-- réponse, donc aucune n'a jamais pu recevoir de réponse.
+DROP TABLE IF EXISTS delivery_samples;

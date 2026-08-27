@@ -1,0 +1,80 @@
+DISSIMULATION, OBFUSCATION ET DETOURNEMENT DES LIENS
+
+Document de doctrine adverse. Il decrit comment un message cache sa nature ou
+sa destination reelle aux filtres comme au lecteur.
+
+1. Caracteres invisibles et substitutions visuelles
+
+Le texte est parseme de caracteres de largeur nulle, d'espaces insecables
+inhabituels ou de marques de direction, afin de casser la reconnaissance de
+motifs par mots-cles sans changer ce que l'oeil lit. Variante voisine : la
+substitution de caracteres visuellement proches, en ASCII (zero pour o, un pour
+l, I majuscule pour l minuscule) ou entre alphabets (cyrillique, grec).
+
+Marqueurs observables : caracteres de controle Unicode dans le sujet ou le
+corps ; melange d'alphabets dans un meme mot ; jeton comportant un chiffre la
+ou un mot attend une lettre.
+
+Ce qui ne prouve rien : les emojis, les alphabets non latins et les guillemets
+typographiques sont ordinaires dans du courrier legitime. Seul un melange qui
+recompose un mot different porte un sens adverse.
+
+2. Texte porte par l'image
+
+Le message ne contient presque aucun texte : l'essentiel est une image unique,
+souvent cliquable, qui affiche le discours commercial ou l'alerte. L'analyse
+textuelle n'a alors rien a lire, et le score antispam reste bas.
+
+Marqueurs observables : rapport texte sur image tres faible ; corps reduit a
+quelques mots neutres ; image unique couvrant tout le message et portant le
+lien ; nom de fichier de l'image porteur du discours reel.
+
+3. Redirection en cascade et cloaking
+
+Le lien visible passe par un ou plusieurs sauts avant d'atteindre sa
+destination. Le premier saut appartient parfois a un service legitime de
+raccourcissement ou de suivi. Sur les montages soignes, le redirecteur observe
+qui demande la page : a un robot d'analyse, il sert une destination inoffensive
+- un grand site d'information, une page vide - et reserve la page frauduleuse
+aux visiteurs reels.
+
+Marqueurs observables : chaine de redirection de plusieurs sauts ; destination
+finale sans rapport ni avec l'expediteur ni avec le texte du lien ; destination
+finale inoffensive alors que le message annonce une action a accomplir ;
+divergence entre le texte affiche du lien et sa cible ; usage d'un
+raccourcisseur pour un message transactionnel.
+
+Piege d'analyse a connaitre : une destination finale anodine observee par un
+bac a sable ne prouve pas l'innocuite du lien. Elle peut etre le resultat
+attendu du cloaking. Un message dont l'appel a l'action aboutit a une page sans
+rapport doit etre considere comme non explique, et non comme rassurant.
+
+4. Detournement de service de confiance
+
+Le contenu frauduleux est heberge chez un fournisseur reconnu : stockage objet
+public, service de documents partages, constructeur de sites, plateforme de
+formulaires. Le domaine final appartient a un acteur majeur, ce qui desarme les
+listes de reputation.
+
+Marqueurs observables : document ou formulaire heberge sur un service generique
+alors que le message pretend venir d'une organisation qui a son propre site ;
+page intermediaire invitant a cliquer une seconde fois ; absence totale de
+personnalisation.
+
+5. Piece jointe deguisee
+
+L'extension affichee ne correspond pas au type reel, ou une seconde extension
+est masquee par l'affichage. Le fichier peut aussi etre une archive protegee
+par un mot de passe donne dans le corps, pour empecher toute inspection
+automatique.
+
+Marqueurs observables : double extension ; type declare different du type
+detecte ; archive chiffree dont le mot de passe figure dans le message ;
+document bureautique porteur de macros ; fichier executable.
+
+6. Code de suivi contre lien direct
+
+Les envois commerciaux legitimes emploient massivement des liens de suivi
+passant par le domaine d'un prestataire. Ce seul fait n'est pas adverse : il
+devient significatif quand la destination finale n'a aucun lien etabli avec
+l'expediteur, ni par le nom, ni par le proprietaire enregistre du domaine.

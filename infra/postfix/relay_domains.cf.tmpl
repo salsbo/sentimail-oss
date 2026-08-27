@@ -1,0 +1,12 @@
+# relay_domains lu en base : la liste des domaines protégés n'est écrite nulle
+# part dans la configuration. Elle est la table `domains` de SentiMail V3.
+#
+# La vue mx_relay_domains (migration 029) n'expose que status='active' et
+# stocke le fqdn déjà normalisé en minuscules : un domaine 'pending' ou
+# 'suspended' n'est jamais un relay_domain, donc son courrier est refusé par
+# reject_unauth_destination.
+hosts = ${POSTGRES_HOST}
+user = ${POSTGRES_USER}
+password = ${POSTGRES_PASSWORD}
+dbname = ${POSTGRES_DB}
+query = SELECT fqdn FROM mx_relay_domains WHERE fqdn = lower('%s')

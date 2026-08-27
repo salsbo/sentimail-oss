@@ -1,0 +1,89 @@
+HAMECONNAGE : SCENARIOS ET MARQUEURS
+
+Document de doctrine adverse. Il decrit les scenarios de collecte frauduleuse
+les plus employes, ce qui les caracterise et ce qui ne les distingue pas d'un
+message ordinaire.
+
+1. Avis de colis en attente
+
+Scenario le plus repandu en France. Le message annonce un colis bloque, une
+livraison manquee ou des frais de port a regulariser, et conduit vers une page
+de paiement. Le montant reclame est faible - une a trois unites monetaires -
+car l'objectif n'est pas ce paiement mais la capture du numero de carte.
+
+Marqueurs observables : contexte de livraison sans commande correspondante ;
+expediteur qui n'est pas un transporteur, ou qui l'imite dans le nom affiche ;
+premiere observation de cet expediteur ; urgence portant sur un delai de
+retrait ou de restitution ; ressource nommee explicitement (frais de port,
+regularisation, redelivery) ; formulaire distant demandant carte ou identite.
+
+Ce qui ne prouve rien : les avis de livraison legitimes existent, emploient le
+meme vocabulaire et la meme urgence. La distinction tient a l'expediteur reel,
+a l'absence de commande, et a la destination du lien.
+
+2. Faux sondage recompense
+
+Le message propose un cadeau, un bon d'achat ou un lot en echange d'un
+questionnaire, au nom d'une enseigne connue. Le parcours se termine par une
+demande de coordonnees bancaires pour des "frais de livraison" du lot, ou par
+un abonnement dissimule.
+
+Marqueurs observables : nom d'enseigne dans le nom affiche, domaine sans
+rapport ; envoi par une plateforme d'emailing en marque blanche ; destinataire
+absent des en-tetes To et Cc ; promesse chiffree ou gratuite ; delai court
+annonce ; redirection vers un domaine tiers sans lien avec l'enseigne.
+
+3. Alerte de securite ou de quota
+
+Le message annonce une connexion suspecte, une boite pleine, un mot de passe
+qui expire, un compte suspendu. Il joue sur la crainte de perdre l'acces et
+conduit vers une page de connexion imitee.
+
+Marqueurs observables : sujet portant sur l'etat du compte ou du stockage ;
+expediteur qui n'est pas le fournisseur du service concerne ; formulaire de
+connexion heberge hors du domaine du service ; menace de suppression ou de
+suspension a echeance ; absence de personnalisation reelle.
+
+Ce qui ne prouve rien : les fournisseurs envoient de vraies alertes de
+securite, avec le meme vocabulaire. C'est l'heberge­ment du formulaire hors du
+domaine du service qui est determinant.
+
+4. Fraude au president et arnaque au devis
+
+Cible les organisations. Un dirigeant, un fournisseur ou un client demande un
+virement urgent, un changement de coordonnees bancaires, ou sollicite un devis
+pour engager une relation. Le montage est prepare : domaine enregistre pour
+l'occasion, identite plausible, ton professionnel, aucune piece jointe
+malveillante.
+
+Marqueurs observables : domaine expediteur enregistre depuis peu ; nom affiche
+d'une personne sans rapport avec l'adresse ; demande de discretion ou
+d'urgence ; changement de coordonnees bancaires ; reponse orientee vers un
+autre domaine ; premier contact sans historique commercial.
+
+Ce qui ne prouve rien : ce scenario ne contient ni lien malveillant, ni piece
+jointe, ni faute de langue. Les moteurs qui cherchent une preuve materielle de
+dommage ne trouvent rien : c'est la convergence identite recente, canal de
+reponse detourne et demande financiere qui le designe.
+
+5. Extorsion et sextorsion
+
+Le message affirme detenir des enregistrements compromettants ou un acces au
+poste, et reclame un versement en cryptomonnaie sous quelques jours. Il cite
+parfois un mot de passe reel, issu d'une fuite publique ancienne, pour
+credibiliser la menace.
+
+Marqueurs observables : menace explicite ; adresse de portefeuille ; delai
+imperatif ; affirmation d'un acces technique non demontre ; envoi de masse
+identique a de nombreux destinataires.
+
+6. Collecte par formulaire heberge chez un tiers
+
+Constante de tous les scenarios ci-dessus : la page de collecte est rarement
+hebergee sur le domaine imite. Elle vit sur un service d'hebergement gratuit,
+un stockage objet public, un constructeur de sites, ou un domaine jetable.
+
+Marqueurs observables : formulaire demandant identifiants, carte ou piece
+d'identite ; domaine final different du domaine expediteur et du domaine
+imite ; page atteinte apres une ou plusieurs redirections ; certificat recent ;
+absence de mentions legales coherentes.

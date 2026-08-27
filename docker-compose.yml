@@ -1,0 +1,812 @@
+services:
+  db:
+    image: postgres:16.11-alpine3.23
+    container_name: sentimail-v3-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sentimail_v3
+      POSTGRES_USER: sentimail_v3
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - sentimail_v3_db:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - data_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentimail_v3 -d sentimail_v3"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    image: postgres:16.11-alpine3.23
+    container_name: sentimail-v3-migrate
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: sentimail_v3
+      PGUSER: sentimail_v3
+    command:
+      - /bin/sh
+      - -c
+      - 'export PGPASSWORD="$$(cat /run/secrets/db_password)"; exec /bin/sh /migrations/migrate.sh'
+    secrets:
+      - db_password
+    volumes:
+      - ./database:/migrations:ro
+    networks:
+      - data_net
+    logging:
+      driver: json-file
+      options:
+        # migrate ne tourne qu'au démarrage : peu de volume, mais borné quand
+        # même pour qu'un redémarrage en boucle ne remplisse pas le disque.
+        max-size: "10m"
+        max-file: "3"
+
+  backup:
+    build: ./ops/backup
+    container_name: sentimail-v3-backup
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: sentimail_v3
+      PGUSER: sentimail_v3
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      BACKUP_PASSWORD_FILE: /run/secrets/backup_password
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    secrets:
+      - backup_password
+      - db_password
+    volumes:
+      - sentimail_v3_backups:/backups
+    networks:
+      - data_net
+    healthcheck:
+      test: ["CMD", "python3", "/app/backup.py", "--check", "90000"]
+      interval: 1m
+      timeout: 10s
+      retries: 2
+      start_period: 10m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  collector:
+    build: ./collector
+    container_name: sentimail-v3-collector
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      RAW_EML_KEY_FILE: /run/secrets/raw_eml_key
+      SMTP_HOST: 0.0.0.0
+      SMTP_PORT: "2525"
+      RELAY_HOST: "172.20.0.1"
+      RELAY_PORT: "10027"
+      CONVERSATION_ENABLED: "true"
+      ACTION_ADDRESS: "${ACTION_ADDRESS:-maia@sentinel.sentimail.example}"
+      PROBE_RECIPIENT: "${PROBE_RECIPIENT:-sentinel-probe@sentimail.example}"
+      ACTION_ALIASES: "${ACTION_ALIASES:-kitt@sentinel.sentimail.example,maia@sentimail.example}"
+      ASSISTANT_SENDER: "${ASSISTANT_SENDER:-MAIA - SentiMail <maia@sentimail.example>}"
+      OPERATOR_ADDRESS: "${OPERATOR_ADDRESS:-}"
+      DECISION_MODE: ${SENTINEL_V3_DECISION_MODE:-true}
+      PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4}
+      ASSISTANT_LLM_HOURLY_LIMIT: ${ASSISTANT_LLM_HOURLY_LIMIT:-20}
+      ASSISTANT_LLM_DAILY_LIMIT: ${ASSISTANT_LLM_DAILY_LIMIT:-100}
+      ASSISTANT_LLM_CONVERSATION_LIMIT: ${ASSISTANT_LLM_CONVERSATION_LIMIT:-10}
+      VERDICT_LLM_HOURLY_LIMIT: ${VERDICT_LLM_HOURLY_LIMIT:-100}
+      VERDICT_LLM_DAILY_LIMIT: ${VERDICT_LLM_DAILY_LIMIT:-500}
+    networks:
+      - data_net
+      - sentimail_net
+    volumes:
+      - sentimail_v3_provider_secrets:/run/sentinel-provider-secrets
+    secrets:
+      - raw_eml_key
+      - db_password
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1',2525),3).close()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  assistant:
+    build: ./collector
+    container_name: sentimail-v3-assistant
+    restart: unless-stopped
+    command: ["python", "-m", "sentimail_v3.conversation.assistant"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      RAW_EML_KEY_FILE: /run/secrets/raw_eml_key
+      CONVERSATION_ENABLED: "true"
+      ACTION_ADDRESS: "${ACTION_ADDRESS:-maia@sentinel.sentimail.example}"
+      PROBE_RECIPIENT: "${PROBE_RECIPIENT:-sentinel-probe@sentimail.example}"
+      ACTION_ALIASES: "${ACTION_ALIASES:-kitt@sentinel.sentimail.example,maia@sentimail.example}"
+      ASSISTANT_SENDER: "${ASSISTANT_SENDER:-MAIA - SentiMail <maia@sentimail.example>}"
+      OPERATOR_ADDRESS: "${OPERATOR_ADDRESS:-}"
+      ASSISTANT_TOKEN_SECRET_FILE: /run/secrets/assistant_token_secret
+      ASSISTANT_INTERVAL_SECONDS: "5"
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+      DEEPSEEK_ASSISTANT_MODEL: "deepseek-v4-pro"
+      DEEPSEEK_TIMEOUT_SECONDS: "180"
+      DECISION_MODE: ${SENTINEL_V3_DECISION_MODE:-true}
+      RELAY_HOST: "172.20.0.1"
+      RELAY_PORT: "10027"
+      PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4}
+      ASSISTANT_LLM_HOURLY_LIMIT: ${ASSISTANT_LLM_HOURLY_LIMIT:-20}
+      ASSISTANT_LLM_DAILY_LIMIT: ${ASSISTANT_LLM_DAILY_LIMIT:-100}
+      ASSISTANT_LLM_CONVERSATION_LIMIT: ${ASSISTANT_LLM_CONVERSATION_LIMIT:-10}
+      VERDICT_LLM_HOURLY_LIMIT: ${VERDICT_LLM_HOURLY_LIMIT:-100}
+      VERDICT_LLM_DAILY_LIMIT: ${VERDICT_LLM_DAILY_LIMIT:-500}
+      # Corpus normatif figé, en lecture seule, et embeddings locaux.
+      KNOWLEDGE_PATH: /app/knowledge
+      KNOWLEDGE_EMBEDDING_URL: ${KNOWLEDGE_EMBEDDING_URL:-http://172.20.0.1:11434}
+      KNOWLEDGE_EMBEDDING_MODEL: ${KNOWLEDGE_EMBEDDING_MODEL:-bge-m3}
+      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://172.20.0.1:11434}
+    networks:
+      - data_net
+      - sentimail_net
+    secrets:
+      - raw_eml_key
+      - deepseek_api_key
+      - db_password
+      - assistant_token_secret
+    volumes:
+      - sentimail_v3_provider_secrets:/run/sentinel-provider-secrets:ro
+      - ./knowledge:/app/knowledge:ro
+    healthcheck:
+      test: ["CMD", "python", "-m", "sentimail_v3.supervision.health", "assistant", "240"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  verdict:
+    build: ./collector
+    container_name: sentimail-v3-verdict
+    restart: unless-stopped
+    command: ["python", "-m", "sentimail_v3.judgment.verdict_engine"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      RAW_EML_KEY_FILE: /run/secrets/raw_eml_key
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+      # Recherche des domaines officiels d'une organisation nommée dans le
+      # « De ». Sans elle, la question reste posée au seul modèle.
+      SEARCH_API_KEY_FILE: /run/secrets/search_api_key
+      SEARCH_BASE_URL: "${SEARCH_BASE_URL:-https://api.tavily.com}"
+      DEEPSEEK_VERDICT_MODEL: "deepseek-v4-pro"
+      DEEPSEEK_TIMEOUT_SECONDS: "180"
+      VERDICT_INTERVAL_SECONDS: "5"
+      VERDICT_NOT_BEFORE: ${VERDICT_NOT_BEFORE:-}
+      ACTION_ADDRESS: "${ACTION_ADDRESS:-maia@sentinel.sentimail.example}"
+      PROBE_RECIPIENT: "${PROBE_RECIPIENT:-sentinel-probe@sentimail.example}"
+      ACTION_ALIASES: "${ACTION_ALIASES:-kitt@sentinel.sentimail.example,maia@sentimail.example}"
+      ASSISTANT_SENDER: "${ASSISTANT_SENDER:-MAIA - SentiMail <maia@sentimail.example>}"
+      OPERATOR_ADDRESS: "${OPERATOR_ADDRESS:-}"
+      ASSISTANT_TOKEN_SECRET_FILE: /run/secrets/assistant_token_secret
+      DECISION_MODE: ${SENTINEL_V3_DECISION_MODE:-true}
+      AUTO_DELIVERY_CONFIDENCE: ${AUTO_DELIVERY_CONFIDENCE:-0.90}
+      ANALYSIS_WAIT_SECONDS: ${ANALYSIS_WAIT_SECONDS:-30}
+      URL_SANDBOX_URL: "http://url-sandbox:8090"
+      FILE_SANDBOX_URL: "http://file-sandbox:8091"
+      RENDER_SANDBOX_URL: "http://render-sandbox:8092"
+      RELAY_HOST: "172.20.0.1"
+      RELAY_PORT: "10027"
+      PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4}
+      ASSISTANT_LLM_HOURLY_LIMIT: ${ASSISTANT_LLM_HOURLY_LIMIT:-20}
+      ASSISTANT_LLM_DAILY_LIMIT: ${ASSISTANT_LLM_DAILY_LIMIT:-100}
+      ASSISTANT_LLM_CONVERSATION_LIMIT: ${ASSISTANT_LLM_CONVERSATION_LIMIT:-10}
+      VERDICT_LLM_HOURLY_LIMIT: ${VERDICT_LLM_HOURLY_LIMIT:-100}
+      VERDICT_LLM_DAILY_LIMIT: ${VERDICT_LLM_DAILY_LIMIT:-500}
+      # Le juge interroge le corpus. Sans ces deux réglages sa recherche
+      # restait lexicale : aveugle à toute question posée avec d'autres mots.
+      KNOWLEDGE_EMBEDDING_URL: ${KNOWLEDGE_EMBEDDING_URL:-http://172.20.0.1:11434}
+      KNOWLEDGE_EMBEDDING_MODEL: ${KNOWLEDGE_EMBEDDING_MODEL:-bge-m3}
+      VERDICT_CONCURRENCY: ${VERDICT_CONCURRENCY:-2}
+    networks:
+      - sentimail_net
+      - data_net
+      - url_sandbox_net
+      - file_sandbox_net
+      - render_sandbox_net
+    secrets:
+      - raw_eml_key
+      - deepseek_api_key
+      - search_api_key
+      - db_password
+      - assistant_token_secret
+    volumes:
+      - sentimail_v3_provider_secrets:/run/sentinel-provider-secrets:ro
+    healthcheck:
+      test: ["CMD", "python", "-m", "sentimail_v3.supervision.health", "verdict", "300"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  enricher:
+    build: ./collector
+    container_name: sentimail-v3-enricher
+    restart: unless-stopped
+    command: ["python", "-m", "sentimail_v3.observation.enricher"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      ENRICHMENT_INTERVAL_SECONDS: "30"
+    networks:
+      - sentimail_net
+      - data_net
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "python", "-m", "sentimail_v3.supervision.health", "enricher", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  retention:
+    build: ./collector
+    container_name: sentimail-v3-retention
+    restart: unless-stopped
+    command: ["python", "-m", "sentimail_v3.execution.retention"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      RETENTION_ENABLED: ${RETENTION_ENABLED:-true}
+      RETENTION_REDACT_AFTER_DAYS: ${RETENTION_REDACT_AFTER_DAYS:-30}
+      RETENTION_DELETE_AFTER_DAYS: ${RETENTION_DELETE_AFTER_DAYS:-180}
+      RETENTION_INTERVAL_SECONDS: ${RETENTION_INTERVAL_SECONDS:-3600}
+      RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-500}
+    networks:
+      - data_net
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD", "python", "-m", "sentimail_v3.supervision.health", "retention", "7200"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  watchdog:
+    build: ./collector
+    container_name: sentimail-v3-watchdog
+    restart: unless-stopped
+    command: ["python", "-m", "sentimail_v3.supervision.watchdog"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      backup:
+        condition: service_healthy
+      collector:
+        condition: service_healthy
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      ACTION_ADDRESS: "${ACTION_ADDRESS:-maia@sentinel.sentimail.example}"
+      PROBE_RECIPIENT: "${PROBE_RECIPIENT:-sentinel-probe@sentimail.example}"
+      ACTION_ALIASES: "${ACTION_ALIASES:-kitt@sentinel.sentimail.example,maia@sentimail.example}"
+      ASSISTANT_SENDER: "${ASSISTANT_SENDER:-MAIA - SentiMail <maia@sentimail.example>}"
+      OPERATOR_ADDRESS: "${OPERATOR_ADDRESS:-}"
+      RELAY_HOST: "172.20.0.1"
+      RELAY_PORT: "10027"
+      WATCHDOG_INGRESS_HOST: "collector"
+      WATCHDOG_INGRESS_PORT: "2525"
+      WATCHDOG_SMTP_PREFLIGHT_ENABLED: "true"
+      VERDICT_LLM_HOURLY_LIMIT: ${VERDICT_LLM_HOURLY_LIMIT:-100}
+      VERDICT_LLM_DAILY_LIMIT: ${VERDICT_LLM_DAILY_LIMIT:-500}
+    volumes:
+      - sentimail_v3_backups:/backups:ro
+      # Le registre des sources hostiles, exporté en table cidr pour le MX.
+      - sentimail_v3_hostile:/hostile-export
+    secrets:
+      - db_password
+    networks:
+      - data_net
+      - sentimail_net
+    healthcheck:
+      test: ["CMD", "python", "-m", "sentimail_v3.supervision.health", "watchdog", "180"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  admin:
+    profiles: ["admin"]
+    build: ./admin
+    container_name: sentimail-v3-admin
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      # Écoute *à l'intérieur* du conteneur, qui n'a pas d'adresse Tailscale.
+      # La frontière réelle est l'adresse de publication ci-dessous : c'est
+      # elle qui doit rester l'adresse Tailscale de l'hôte, jamais 0.0.0.0.
+      ADMIN_BIND_HOST: "0.0.0.0"
+      ADMIN_BIND_UNRESTRICTED: "true"
+      ADMIN_PORT: "8093"
+      ADMIN_TRUSTED_ORIGINS: ${ADMIN_TRUSTED_ORIGINS:-}
+      ADMIN_TRUSTED_PROXIES: ${ADMIN_TRUSTED_PROXIES:-}
+      ADMIN_MESSAGES_LIMIT: ${ADMIN_MESSAGES_LIMIT:-100}
+      ADMIN_EVENTS_LIMIT: ${ADMIN_EVENTS_LIMIT:-50}
+      PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
+      # Mêmes valeurs que côté collector : « Reprendre la main » écrit ces
+      # identités dans instance_identity, qui écrase l'environnement de tous
+      # les services sous 60 s. Sans elles ici, la console repartirait des
+      # valeurs par défaut codées en dur au lieu de celles réellement actives.
+      ACTION_ADDRESS: "${ACTION_ADDRESS:-maia@sentinel.sentimail.example}"
+      PROBE_RECIPIENT: "${PROBE_RECIPIENT:-sentinel-probe@sentimail.example}"
+      ACTION_ALIASES: "${ACTION_ALIASES:-kitt@sentinel.sentimail.example,maia@sentimail.example}"
+      ASSISTANT_SENDER: "${ASSISTANT_SENDER:-MAIA - SentiMail <maia@sentimail.example>}"
+    volumes:
+      # La console pose la cle du moteur ici, pour qu'elle ne transite par
+      # aucune boite aux lettres. Elle y ecrit et n'y lit jamais : aucune de
+      # ses pages ne sait relire un secret, et des tests le verrouillent.
+      - sentimail_v3_provider_secrets:/run/sentinel-provider-secrets
+    ports:
+      # Repli sur la boucle locale : une variable oubliee ne doit jamais
+      # exposer la console, ni empecher le reste de la pile de demarrer.
+      - "${SENTINEL_ADMIN_ADDR:-127.0.0.1}:8093:8093"
+    # Hors Swarm, un secret monte depuis un fichier garde les droits de
+    # l'hote : uid/mode y sont ignores. La console tourne donc sous l'identite
+    # qui possede le fichier, plutot que d'elargir les droits du secret.
+    user: "${SENTINEL_SECRETS_UID:-1001}:${SENTINEL_SECRETS_GID:-1001}"
+    secrets:
+      - db_password
+    networks:
+      # Réseau d'entrée dédié : c'est lui qui porte le port publié.
+      admin_net:
+        priority: 100
+      # Accès à la base, qui reste sur un réseau sans issue vers l'extérieur.
+      data_net:
+        priority: 10
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8093/sante', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  relay:
+    build: .
+    container_name: sentimail-v3
+    restart: unless-stopped
+    depends_on:
+      collector:
+        condition: service_healthy
+    environment:
+      RELAY_HOST: collector
+      RELAY_PORT: "2525"
+    networks:
+      sentimail_net:
+        ipv4_address: 172.20.0.250
+    volumes:
+      - sentimail_v3_queue:/var/spool/postfix
+    healthcheck:
+      test: ["CMD-SHELL", "postfix status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caretaker:
+    build: ./collector
+    container_name: sentimail-v3-caretaker
+    restart: unless-stopped
+    command: ["python", "-m", "sentimail_v3.supervision.caretaker"]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      DEEPSEEK_API_KEY_FILE: /run/secrets/deepseek_api_key
+      RAW_EML_KEY_FILE: /run/secrets/raw_eml_key
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+      DEEPSEEK_ASSISTANT_MODEL: "deepseek-v4-pro"
+      PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      OPERATOR_ADDRESS: "${OPERATOR_ADDRESS:-}"
+      CONSOLE_URL: "${CONSOLE_URL:-}"
+      ASSISTANT_SENDER: "${ASSISTANT_SENDER:-MAIA - SentiMail <maia@sentimail.example>}"
+      ACTION_ADDRESS: "${ACTION_ADDRESS:-maia@sentinel.sentimail.example}"
+      PROBE_RECIPIENT: "${PROBE_RECIPIENT:-sentinel-probe@sentimail.example}"
+      CARETAKER_INTERVAL_HOURS: ${CARETAKER_INTERVAL_HOURS:-6}
+      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://172.20.0.1:11434}
+    networks:
+      - data_net
+      - sentimail_net
+    secrets:
+      - db_password
+      - deepseek_api_key
+      - raw_eml_key
+    volumes:
+      - sentimail_v3_provider_secrets:/run/sentinel-provider-secrets:ro
+    healthcheck:
+      # Le pouls ne bat qu'à chaque tour d'entretien : la fenêtre couvre un
+      # intervalle entier, plus une marge.
+      test: ["CMD", "python", "-m", "sentimail_v3.supervision.health", "caretaker", "26000"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+
+  # --------------------------------------------------------------------------
+  # Bacs a sable d'analyse : URL, pieces jointes, rendu.
+  # --------------------------------------------------------------------------
+  # Ils etaient des conteneurs de SentiMail V2, que V3 atteignait par leur nom
+  # sur le reseau partage : son decommissionnement les a emportes, et l'analyse
+  # profonde s'est mise a echouer en ConnectError (fail-soft, sans perte).
+  # Les images sont autonomes ; elles vivent desormais dans cette pile.
+
+  url-sandbox:
+    # Sources rapatriées de SentiMail V2 (infra/url-sandbox) : V3 construit ses
+    # propres bacs à sable, elle ne dépend plus d'une image héritée.
+    build: ./infra/url-sandbox
+    image: sentimail-v3-url-sandbox:latest
+    container_name: sentimail-v3-url-sandbox
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+    networks:
+      - sentimail_net
+    pids_limit: 128
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  file-sandbox:
+    # Sources rapatriées de SentiMail V2 (infra/file-sandbox) : V3 construit ses
+    # propres bacs à sable, elle ne dépend plus d'une image héritée.
+    build: ./infra/file-sandbox
+    image: sentimail-v3-file-sandbox:latest
+    container_name: sentimail-v3-file-sandbox
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8091/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+    networks:
+      - sentimail_net
+    pids_limit: 128
+    mem_limit: 768m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  render-sandbox:
+    # Sources rapatriées de SentiMail V2 (infra/render-sandbox) : V3 construit ses
+    # propres bacs à sable, elle ne dépend plus d'une image héritée.
+    build: ./infra/render-sandbox
+    image: sentimail-v3-render-sandbox:latest
+    container_name: sentimail-v3-render-sandbox
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8092/health',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+    networks:
+      - sentimail_net
+    shm_size: "512m"
+    pids_limit: 256
+    mem_limit: 2g
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+
+  # --------------------------------------------------------------------------
+  # Réception autonome du courrier : valkey -> rspamd -> mx -> collector
+  # --------------------------------------------------------------------------
+  # Cette chaîne rend SentiMail V3 capable de recevoir seul. Elle ne dépend
+  # d'aucun service ni d'aucune table de SentiMail V2.
+
+  valkey:
+    profiles: ["mx"]
+    # Fork BSD de Redis. rspamd s'en sert pour le Bayes et ses caches ; rien
+    # d'autre n'y écrit, et rien n'y est durable : la base est jetable.
+    image: valkey/valkey:8.1.9-alpine3.24 # gitleaks:allow -- version, pas un secret
+    container_name: sentimail-v3-valkey
+    restart: unless-stopped
+    command: ["valkey-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    # Démarré directement sous l'utilisateur final : l'entrypoint n'a plus de
+    # privilèges à abandonner, ce que cap_drop ALL lui interdirait de faire.
+    user: valkey
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 320m
+    networks:
+      - rspamd_net
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  rspamd:
+    profiles: ["mx"]
+    build:
+      context: .
+      dockerfile: infra/rspamd/Dockerfile
+    container_name: sentimail-v3-rspamd
+    restart: unless-stopped
+    depends_on:
+      valkey:
+        condition: service_healthy
+    # rspamd doit résoudre SPF, les clés DKIM et les politiques DMARC : il lui
+    # faut un accès DNS sortant, donc un réseau non `internal`.
+    networks:
+      - mx_net
+      - rspamd_net
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "rspamadm", "control", "stat"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  mx:
+    profiles: ["mx"]
+    build:
+      context: .
+      dockerfile: infra/postfix/Dockerfile
+    container_name: sentimail-v3-mx
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rspamd:
+        condition: service_started
+      collector:
+        condition: service_healthy
+    environment:
+      # Nom annoncé en HELO et dans le certificat : doit correspondre à
+      # l'enregistrement MX publié et à la PTR de l'adresse publique.
+      POSTFIX_MYHOSTNAME: ${SENTINEL_V3_MX_HOSTNAME:-mx.sentinel.sentimail.example}
+      POSTFIX_MYORIGIN: ${SENTINEL_V3_MX_ORIGIN:-sentinel.sentimail.example}
+      POSTFIX_MYDOMAIN: ${SENTINEL_V3_MX_DOMAIN:-sentinel.sentimail.example}
+      POSTFIX_TLS_CERT_FILE: ${SENTINEL_V3_MX_TLS_CERT:-/etc/letsencrypt/live/mx.sentinel.sentimail.example/fullchain.pem}
+      POSTFIX_TLS_KEY_FILE: ${SENTINEL_V3_MX_TLS_KEY:-/etc/letsencrypt/live/mx.sentinel.sentimail.example/privkey.pem}
+      # Les maps relay_domains et transport interrogent la base de V3.
+      POSTGRES_HOST: db
+      POSTGRES_USER: sentimail_v3
+      POSTGRES_DB: sentimail_v3
+      DATABASE_PASSWORD_FILE: /run/secrets/db_password
+      SENTINEL_COLLECTOR_HOST: collector
+      SENTINEL_COLLECTOR_PORT: "2525"
+      RSPAMD_MILTER_HOST: rspamd
+      RSPAMD_MILTER_PORT: "11332"
+    secrets:
+      - db_password
+    volumes:
+      - ${SENTINEL_V3_MX_TLS_SOURCE:-sentimail_v3_mx_tls}:/etc/letsencrypt:ro
+      - sentimail_v3_mx_queue:/var/spool/postfix
+      # Table cidr des sources hostiles, écrite par le watchdog.
+      - sentimail_v3_hostile:/etc/postfix/hostile
+    ports:
+      # Défaut prudent : rien d'exposé publiquement et aucun conflit avec un
+      # MX déjà en écoute sur le port 25 de cet hôte. Une instance qui reçoit
+      # vraiment du courrier public met SENTINEL_V3_MX_BIND_HOST à son adresse
+      # publique et SENTINEL_V3_MX_BIND_PORT à 25.
+      - "${SENTINEL_V3_MX_BIND_HOST:-127.0.0.1}:${SENTINEL_V3_MX_BIND_PORT:-2525}:25"
+    networks:
+      # data_net : la base et le collecteur. mx_net : le milter et le monde.
+      - data_net
+      - mx_net
+    # Pas de no-new-privileges ici : Postfix s'appuie sur des binaires setgid
+    # (postdrop, postqueue) que cette option ferait échouer.
+    pids_limit: 256
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "postfix status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  # Le sous-réseau est figé : la passerelle 172.20.0.1 est l'adresse par
+  # laquelle les conteneurs joignent l'hôte - relais SMTP vers Dovecot (10027)
+  # et embeddings Ollama (11434). La laisser attribuer au hasard changerait ces
+  # deux dépendances sans prévenir, et couperait la livraison.
+  # Réseau créé hors compose, et c'est délibéré : sa passerelle 172.20.0.1 est
+  # l'adresse par laquelle les conteneurs joignent l'hôte - relais SMTP vers
+  # Dovecot (10027) et embeddings Ollama (11434). Laisser compose le recréer
+  # ferait varier ce subnet au gré des plages libres, et couperait les deux
+  # dépendances sans prévenir.
+  #   docker network create --subnet 172.20.0.0/16 --gateway 172.20.0.1 sentimail_v3_net
+  sentimail_net:
+    external: true
+    name: sentimail_v3_net
+  data_net:
+    internal: true
+  # Entrée de la console de configuration. Le port n'est publié que sur
+  # l'adresse Tailscale de l'hôte : hors du tailnet, il n'existe pas.
+  admin_net:
+    name: sentimail_v3_admin_net
+  # Face publique de la réception : le MX y expose le port 25 et rspamd y
+  # trouve le DNS. Volontairement propre à V3, sans réseau externe de V2.
+  mx_net:
+    name: sentimail_v3_mx_net
+  # Valkey n'a aucune raison d'être joignable hors de rspamd.
+  rspamd_net:
+    internal: true
+  url_sandbox_net:
+    name: sentimail_v3_url_sandbox_net
+  file_sandbox_net:
+    name: sentimail_v3_file_sandbox_net
+  render_sandbox_net:
+    name: sentimail_v3_render_sandbox_net
+
+volumes:
+  sentimail_v3_hostile:
+    name: sentimail_v3_hostile
+  sentimail_v3_queue:
+    name: sentimail_v3_queue
+  sentimail_v3_db:
+    name: sentimail_v3_db
+  sentimail_v3_provider_secrets:
+    name: sentimail_v3_provider_secrets
+  sentimail_v3_backups:
+    name: sentimail_v3_backups
+  sentimail_v3_mx_queue:
+    name: sentimail_v3_mx_queue
+  # Volume vide par défaut, monté à la place de l'arborescence Let's Encrypt de
+  # l'hôte tant qu'aucune n'est fournie : l'entrypoint constate alors l'absence
+  # de certificat et bascule sur un auto-signé temporaire. En production,
+  # SENTINEL_V3_MX_TLS_SOURCE pointe le vrai /etc/letsencrypt.
+  sentimail_v3_mx_tls:
+    name: sentimail_v3_mx_tls
+
+secrets:
+  raw_eml_key:
+    file: ./secrets/raw_eml_key
+  db_password:
+    file: ./secrets/db_password
+  assistant_token_secret:
+    file: ./secrets/assistant_token_secret
+  deepseek_api_key:
+    file: ./secrets/deepseek_api_key
+  search_api_key:
+    file: ./secrets/search_api_key
+  backup_password:
+    file: ./secrets/backup_password

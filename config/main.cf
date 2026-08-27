@@ -1,0 +1,31 @@
+compatibility_level = 3.6
+
+# Relais SMTP uniquement. Aucune boite locale et aucun traitement du contenu.
+myhostname = sentimail-v3
+myorigin = $myhostname
+mydestination =
+local_recipient_maps =
+relay_domains = *
+
+inet_interfaces = all
+inet_protocols = ipv4
+smtpd_banner = sentimail-v3 ESMTP
+smtpd_relay_restrictions = permit_mynetworks, reject
+smtpd_recipient_restrictions = permit_mynetworks, reject
+mynetworks = 127.0.0.0/8 172.16.0.0/12
+
+# Explicitement aucun filtre, milter, SASL ou stockage applicatif.
+smtpd_milters =
+non_smtpd_milters =
+smtpd_sasl_auth_enable = no
+content_filter =
+
+# Transport interne vers le SMTP de livraison existant.
+relayhost = [collector]:2525
+smtp_tls_security_level = none
+smtpd_tls_security_level = none
+
+message_size_limit = 26214400
+mailbox_size_limit = 0
+disable_vrfy_command = yes
+maillog_file = /dev/stdout

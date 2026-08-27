@@ -1,0 +1,126 @@
+# MX public de SentiMail V3. Rendu par envsubst au démarrage (entrypoint.sh),
+# avec une liste de variables explicite : les références Postfix natives
+# ($data_directory, $myhostname...) doivent survivre au rendu.
+#
+# Ce MX est autonome : il ne dépend d'aucune table ni d'aucun service de
+# SentiMail V2. Les domaines qu'il accepte sont lus dans la table `domains`
+# de la base de SentiMail V3, à chaque requête, sans redémarrage.
+
+compatibility_level = 3.6
+
+myhostname = ${POSTFIX_MYHOSTNAME}
+myorigin = ${POSTFIX_MYORIGIN}
+mydomain = ${POSTFIX_MYDOMAIN}
+smtpd_banner = $myhostname ESMTP
+
+# Rien n'est livré localement : ce nœud reçoit puis passe la main au collecteur.
+mydestination =
+local_recipient_maps =
+inet_interfaces = all
+inet_protocols = ipv4
+
+# mynetworks reste volontairement limité à la boucle locale du conteneur.
+# Y ajouter le sous-réseau Docker transformerait le MX en relais pour tout
+# conteneur voisin.
+mynetworks = 127.0.0.0/8 [::1]/128
+
+# ---------------------------------------------------------------------------
+# Qui est protégé : la base, pas un fichier
+# ---------------------------------------------------------------------------
+# relay_domains est résolu en direct sur la vue mx_relay_domains (migration
+# 029), qui n'expose que les domaines status='active'. Enrôler un domaine
+# suffit à le rendre recevable ; le suspendre suffit à ne plus l'accepter.
+relay_domains = pgsql:/etc/postfix/relay_domains.cf
+
+# Même source pour le routage : un domaine actif part vers le collecteur V3.
+# Aucune adresse n'est écrite à la main dans ce fichier.
+transport_maps = pgsql:/etc/postfix/transport.cf
+
+# ---------------------------------------------------------------------------
+# Anti-relais ouvert
+# ---------------------------------------------------------------------------
+# Pas de SASL : ce nœud est exclusivement entrant. reject_unauth_destination
+# refuse tout destinataire dont le domaine n'est ni mydestination (vide) ni
+# relay_domains (les domaines actifs) : hors de cette liste, rien ne passe.
+smtpd_sasl_auth_enable = no
+smtpd_relay_restrictions =
+    permit_mynetworks,
+    reject_unauth_destination
+
+smtpd_recipient_restrictions =
+    permit_mynetworks,
+    reject_non_fqdn_recipient,
+    reject_unauth_destination
+
+smtpd_sender_restrictions =
+    permit_mynetworks,
+    reject_non_fqdn_sender
+
+# ---------------------------------------------------------------------------
+# Registre des sources hostiles
+# ---------------------------------------------------------------------------
+# La table cidr est exportée par le superviseur depuis les verdicts confirmés
+# et les entrées manuelles de l'administration. Le rejet est un 554 explicite,
+# visible dans les journaux : jamais un drop silencieux. Les processus smtpd
+# étant éphémères, le fichier régénéré est pris en compte sans reload.
+smtpd_client_restrictions =
+    permit_mynetworks,
+    check_client_access cidr:/etc/postfix/hostile/hostile.cidr
+
+smtpd_helo_required = yes
+smtpd_helo_restrictions =
+    permit_mynetworks,
+    reject_invalid_helo_hostname
+
+disable_vrfy_command = yes
+smtpd_data_restrictions = reject_unauth_pipelining
+
+# ---------------------------------------------------------------------------
+# En-têtes de contrôle usurpés
+# ---------------------------------------------------------------------------
+# Appliqué avant le milter : un expéditeur ne peut pas se délivrer lui-même un
+# Authentication-Results ni un score antispam. Voir header_checks.
+header_checks = regexp:/etc/postfix/header_checks
+
+# ---------------------------------------------------------------------------
+# Milter rspamd
+# ---------------------------------------------------------------------------
+milter_default_action = accept
+smtpd_milters = inet:${RSPAMD_MILTER_HOST}:${RSPAMD_MILTER_PORT}
+non_smtpd_milters = inet:${RSPAMD_MILTER_HOST}:${RSPAMD_MILTER_PORT}
+milter_protocol = 6
+# authserv-id de l'Authentication-Results produit par rspamd. Le hook
+# d'authentification de V3 (dossier/hooks/authentication.py) n'accorde sa
+# confiance qu'à la valeur exacte « rspamd.sentimail » : elle est fixée ici
+# ET dans milter_headers.conf côté rspamd, pour que la preuve reste lisible
+# même si l'un des deux réglages est modifié par erreur.
+milter_macro_daemon_name = rspamd.sentimail
+
+# Résolution native puis DNS : permet de viser un backend déclaré en
+# extra_hosts sans qu'il existe dans le DNS.
+smtp_host_lookup = native, dns
+
+# ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+# STARTTLS opportuniste sur le port 25 : un MX public ne peut pas exiger TLS
+# sans perdre du courrier légitime.
+smtpd_tls_security_level = may
+smtpd_tls_cert_file = ${POSTFIX_TLS_CERT_FILE}
+smtpd_tls_key_file = ${POSTFIX_TLS_KEY_FILE}
+smtpd_tls_loglevel = 1
+smtpd_tls_received_header = yes
+smtpd_tls_session_cache_database = btree:$data_directory/smtpd_scache
+smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtpd_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+tls_random_source = dev:/dev/urandom
+
+smtp_tls_security_level = may
+smtp_tls_loglevel = 1
+
+# ---------------------------------------------------------------------------
+# Limites et journalisation
+# ---------------------------------------------------------------------------
+message_size_limit = 26214400
+mailbox_size_limit = 0
+maillog_file = /dev/stdout
