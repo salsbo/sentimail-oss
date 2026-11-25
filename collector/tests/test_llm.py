@@ -10,11 +10,15 @@ from unittest.mock import patch
 import httpx
 from sentimail_v3.config import load_settings
 from sentimail_v3.llm import (
+    ANTHROPIC_MIN_OUTPUT_TOKENS,
     LlmError,
     ProviderRoute,
+    anthropic_chat_json,
     openai_compatible_chat_json,
     provider_chat_json,
+    with_system_addendum,
 )
+from sentimail_v3.judgment.prompt import ANTHROPIC_ADDENDUM, PROVIDER_ADDENDA
 from sentimail_v3.judgment.verdict_engine import (
     MAX_LLM_DOSSIER_CHARS,
     _deduplicate_clues,
@@ -68,6 +72,20 @@ class VerdictParsingTests(unittest.TestCase):
         self.assertEqual(parsed["classification"], "undetermined")
         self.assertEqual(parsed["confidence"], 1.0)
         self.assertEqual(parsed["supporting_clue_codes"], ["AUTH.DMARC.PASS"])
+
+    def test_first_json_object_wins_when_text_follows_it(self) -> None:
+        verdict = (
+            '{"classification":"suspect","confidence":0.6,"delivery_decision":"ask_user",'
+            '"rationale":"incertain","supporting_clue_codes":[],'
+            '"contradicting_clue_codes":[],"uncertainties":[],'
+            '"requested_additional_evidence":[]}'
+        )
+        for suffix in ('\n\nNote : {"remarque": 1}', "\n(voir ci-dessus {sic})"):
+            parsed = _parse_verdict(verdict + suffix, self.dossier)
+            self.assertEqual(parsed["delivery_decision"], "ask_user")
+        # Une réponse coupée reste rejetée.
+        with self.assertRaises(ValueError):
+            _parse_verdict(verdict[:80] + "}", self.dossier)
 
     def test_parses_three_role_trial_and_enforces_evidence_direction(self) -> None:
         dossier = {
@@ -427,3 +445,121 @@ class MaterialSpamProfileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnthropicProviderTests(unittest.IsolatedAsyncioTestCase):
+    """Bascule vers l'API Claude : requête acceptée par les modèles actuels."""
+
+    @staticmethod
+    def _route() -> ProviderRoute:
+        return ProviderRoute(
+            "anthropic", "https://api.anthropic.test", "claude-sonnet-5-5",
+            "sk-ant-test", "max_tokens",
+        )
+
+    @staticmethod
+    def _answer() -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg-test", "model": "claude-sonnet-5-5", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": '{"ok":true}'}],
+                "usage": {"input_tokens": 3, "output_tokens": 2},
+            },
+        )
+
+    async def test_request_has_no_temperature_and_a_large_enough_output(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            seen["key"] = request.headers.get("x-api-key")
+            return self._answer()
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            content, metadata = await anthropic_chat_json(
+                client, route=self._route(), max_tokens=2400,
+                messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+            )
+        body = seen["body"]
+        self.assertEqual(content, '{"ok":true}')
+        self.assertNotIn("temperature", body)  # type: ignore[operator]
+        # La limite historique de 2400 jetons coupait les réponses de Claude.
+        self.assertEqual(body["max_tokens"], ANTHROPIC_MIN_OUTPUT_TOKENS)  # type: ignore[index]
+        self.assertEqual(body["system"], "S")  # type: ignore[index]
+        self.assertEqual(seen["key"], "sk-ant-test")
+        self.assertEqual(metadata["usage"]["input_tokens"], 3)
+
+    async def test_a_larger_requested_output_is_kept(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return self._answer()
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await anthropic_chat_json(
+                client, route=self._route(), max_tokens=9000,
+                messages=[{"role": "user", "content": "U"}],
+            )
+        self.assertEqual(seen["body"]["max_tokens"], 9000)  # type: ignore[index]
+
+    def test_addendum_is_appended_to_the_system_message_only(self) -> None:
+        original = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
+        result = with_system_addendum(original, "ADD")
+        self.assertEqual(result[0]["content"], "S\n\nADD")
+        self.assertEqual(result[1], original[1])
+        self.assertEqual(original[0]["content"], "S")  # l'original n'est pas modifié
+        self.assertIs(with_system_addendum(original, None), original)
+
+    def test_the_base_prompt_never_carries_the_provider_addendum(self) -> None:
+        system = _prompt({"clues": []})[0]["content"]
+        self.assertNotIn(ANTHROPIC_ADDENDUM, system)
+        self.assertEqual(set(PROVIDER_ADDENDA), {"anthropic"})
+        self.assertIn("deliver garde toutes ses conditions", ANTHROPIC_ADDENDUM)
+
+    async def _provider_call(self, provider: str, base_url: str) -> dict[str, object]:
+        seen: dict[str, object] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            seen["json"] = json.loads(request.content)
+            if provider == "anthropic":
+                return self._answer()
+            return httpx.Response(200, json={
+                "model": "m", "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                "usage": {},
+            })
+
+        class Pool:
+            async def fetchrow(self, query: str, *args: object):
+                del query, args
+                return {
+                    "provider": provider, "base_url": base_url, "model_name": "m",
+                    "token_limit_param": "max_tokens", "secret_filename": "k",
+                }
+
+            async def execute(self, *args: object):
+                del args
+
+            async def fetchval(self, *args: object):
+                del args
+
+        with TemporaryDirectory() as directory:
+            Path(directory, "k").write_text("secret-key-1234567890")
+            with patch.dict("os.environ", {"DATABASE_URL": "postgresql://test"}):
+                settings = replace(load_settings(), provider_secrets_dir=directory)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                await provider_chat_json(
+                    Pool(), client, settings,  # type: ignore[arg-type]
+                    messages=[{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+                    max_tokens=2400, role="verdict", allow_local=False,
+                    provider_addenda=PROVIDER_ADDENDA,
+                )
+        return seen
+
+    async def test_addendum_reaches_claude_but_never_deepseek(self) -> None:
+        claude = await self._provider_call("anthropic", "https://api.anthropic.test")
+        self.assertIn(ANTHROPIC_ADDENDUM, claude["json"]["system"])  # type: ignore[index]
+        deepseek = await self._provider_call("openai_compatible", "https://api.deepseek.test")
+        sent = json.dumps(deepseek["json"], ensure_ascii=False)
+        self.assertNotIn("Précision de lecture", sent)

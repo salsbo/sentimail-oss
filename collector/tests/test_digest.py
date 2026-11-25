@@ -94,6 +94,13 @@ class ResidualTextTests(unittest.TestCase):
         self.assertEqual([d.number for d in decisions], [6])
         self.assertIn("5", residual_text(text, decisions))
 
+    def test_c_is_always_left_for_llm_interpretation(self) -> None:
+        text = "2 C c'est mon comptable, conserve cette information"
+        decisions = parse_digest_reply(text)
+        rest = residual_text(text, decisions)
+        self.assertIn("2 C", rest)
+        self.assertIn("comptable", rest)
+
 
 class ValidateInterpretationTests(unittest.TestCase):
     MAPPING: ClassVar[dict[str, str]] = {
@@ -260,7 +267,7 @@ class LettreSeuleTests(unittest.TestCase):
             self.assertEqual(decision.choice, attendu)
 
     def test_une_reponse_numerotee_n_est_pas_une_lettre_seule(self) -> None:
-        from sentimail_v3.conversation.digest import lone_choice, parse_digest_reply
+        from sentimail_v3.conversation.digest import parse_digest_reply
 
         # « 1 A » se lit par le chemin normal ; la lettre seule ne sert qu'au
         # cas où aucun numéro n'a été écrit.
@@ -279,3 +286,32 @@ class LettreSeuleTests(unittest.TestCase):
         self.assertIsNotNone(decision)
         self.assertEqual(decision.choice, "C")
         self.assertIn("reservations", decision.detail)
+
+
+class ConfirmationDuDangerTests(unittest.TestCase):
+    def test_accuse_dit_classe_dangereux_sans_preuve_materielle(self) -> None:
+        demandes = [
+            (DigestDecision(2, "A", "", True), "Colis en attente"),
+            (DigestDecision(4, "A", "", True), "Compte suspendu"),
+        ]
+        texte = acknowledgement(
+            [], [], remaining=3, needs_confirmation=demandes, dangerous_numbers={4}
+        )
+        deuxieme, quatrieme = texte.split("Je n’ai pas livré le ")[1:3]
+        self.assertIn("preuve matérielle", deuxieme)
+        self.assertNotIn("classe dangereux", deuxieme)
+        self.assertIn("classe dangereux", quatrieme)
+        self.assertNotIn("preuve matérielle", quatrieme)
+        self.assertIn("« 4 A »", quatrieme)
+
+
+class ACorrigeParLeClavierTests(unittest.TestCase):
+    def test_a_accentue_seul_vaut_a_quand_un_dossier_attend(self) -> None:
+        from sentimail_v3.conversation.digest import read_reply
+
+        lecture = read_reply("À", "À", "", 1)
+        self.assertEqual(
+            [(value.number, value.choice) for value in lecture.decisions], [(0, "A")]
+        )
+        self.assertEqual(read_reply("à demain", "à demain", "", 1).decisions, [])
+        self.assertEqual(parse_digest_reply("1 à 3"), [])

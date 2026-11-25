@@ -7,6 +7,7 @@ from sentimail_v3.judgment.verdict_engine import (
     FILED_AS_JUNK,
     JudgmentContradiction,
     _judgment_execution,
+    _authenticated_suppression,
     _validate_final_judgment,
 )
 
@@ -67,10 +68,44 @@ class PolitiqueTests(unittest.TestCase):
         self._valide(_verdict("spam", "junk"), deep_execution_complete=False)
 
     def test_un_danger_exige_toujours_une_analyse_profonde_aboutie(self) -> None:
-        # Là où il y a un risque réel, la dernière vérification reste humaine.
+        # Sans indicateur de pièce jointe distinct, l'analyse profonde
+        # incomplète reste bloquante pour un verdict dangereux.
         with self.assertRaises(JudgmentContradiction) as leve:
             self._valide(_verdict("dangerous", "junk"), deep_execution_complete=False)
         self.assertIn("deep_execution_incomplete", leve.exception.contradictions)
+
+    def test_un_danger_se_classe_en_junk_si_seul_un_lien_a_echoue(self) -> None:
+        # Une URL morte ou lente ne force plus une demande d'avis si les pièces
+        # jointes ont été inspectées et que le juge est certain du danger.
+        self._valide(
+            _verdict("dangerous", "junk", confidence=0.90),
+            attachment_analysis_complete=True,
+            deep_execution_complete=False,
+        )
+
+    def test_un_danger_avec_piece_jointe_non_inspectee_reste_bloque(self) -> None:
+        with self.assertRaises(JudgmentContradiction) as leve:
+            self._valide(
+                _verdict("dangerous", "junk", confidence=0.95),
+                attachment_analysis_complete=False,
+                deep_execution_complete=False,
+            )
+        self.assertIn("deep_execution_incomplete", leve.exception.contradictions)
+
+    def test_conflit_destination_bloque_livraison_mais_autorise_junk(self) -> None:
+        verdict_legitime = _verdict("legitimate", "deliver")
+        verdict_legitime["verdict_doubt"] = False
+        with self.assertRaises(JudgmentContradiction) as leve:
+            self._valide(verdict_legitime, identity_destination_conflict=True)
+        self.assertIn(
+            "identity_destination_conflict_unresolved", leve.exception.contradictions
+        )
+        for classification in ("spam", "dangerous"):
+            self._valide(
+                _verdict(classification, "junk", confidence=0.90),
+                identity_destination_conflict=True,
+                material_danger_evidence=[],
+            )
 
     def test_une_investigation_statique_incomplete_interdit_de_classer(self) -> None:
         # Sans même les vérifications de base, il n'y a rien sur quoi trancher.
@@ -112,6 +147,23 @@ class PolitiqueTests(unittest.TestCase):
 
 
 class ExecutionTests(unittest.TestCase):
+    def test_une_regle_b_produit_une_suppression_locale(self) -> None:
+        verdict = _authenticated_suppression(
+            {"judgment_rules": {"authenticated_sender_policy": "hold"}}
+        )
+        self.assertIsNotNone(verdict)
+        ordre = _judgment_execution(verdict or {})
+        self.assertEqual(ordre["delivery_decision"], "suppress")
+        self.assertTrue(ordre["policy_suppressed"])
+        self.assertFalse(ordre["original_delivery_allowed"])
+
+    def test_sans_regle_b_le_modele_reste_decisionnaire(self) -> None:
+        self.assertIsNone(
+            _authenticated_suppression(
+                {"judgment_rules": {"authenticated_sender_policy": "allow"}}
+            )
+        )
+
     def test_un_message_classe_est_livre_mais_marque(self) -> None:
         ordre = _judgment_execution(
             {"delivery_decision": "junk", "classification": "spam", "confidence": 0.95}

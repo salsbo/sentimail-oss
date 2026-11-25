@@ -51,7 +51,7 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
         try:
             await reference_for_clues(
                 None,
-                ["AUTH_DMARC_FAIL", "URL_CLOAKING"],
+                ["AUTH_DMARC_FAIL", "URL_DECEPTIVE_LINK_TEXT"],
             )
         finally:
             knowledge.search = original
@@ -63,9 +63,15 @@ class SelectionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(demandes), 2)
         attendues = {
-            "AUTH DMARC FAIL URL CLOAKING",
+            "AUTH DMARC FAIL URL DECEPTIVE LINK TEXT",
             " ".join(
-                filter(None, (plain_clue(c, "") for c in ("AUTH_DMARC_FAIL", "URL_CLOAKING")))
+                filter(
+                    None,
+                    (
+                        plain_clue(c, "")
+                        for c in ("AUTH_DMARC_FAIL", "URL_DECEPTIVE_LINK_TEXT")
+                    ),
+                )
             ).strip(),
         }
         self.assertEqual(set(demandes), attendues)

@@ -3,12 +3,8 @@ from __future__ import annotations
 import re
 import unittest
 
-from sentimail_v3.conversation.choice_answers import (
-    GRIS,
-    ROUGE,
-    VERT,
-    render_choices,
-)
+from sentimail_v3.conversation.choice_answers import render_choices
+from sentimail_v3.conversation.choice_registry import GRIS, ROUGE, VERT
 
 CHOIX = (
     ("A", "Je le veux", "Cet expéditeur est fiable, livre-le-moi", VERT),
@@ -85,20 +81,24 @@ class BoutonCompactTests(unittest.TestCase):
 
 
 class CouleurTests(unittest.TestCase):
-    """La couleur dit la lettre : vert, rouge, gris."""
+    """La couleur dit la lettre : A plein, B contour rouge, C contour neutre."""
 
     def test_chaque_lettre_porte_sa_couleur_de_fond(self) -> None:
         html = render_choices(CHOIX, LIENS)
-        for lettre, couleur in (("A", VERT), ("B", ROUGE), ("C", GRIS)):
+        attendus = {
+            "A": f"background:{VERT}",
+            "B": "color:#b91c1c;background:#ffffff;border:1px solid #fecaca",
+            "C": "color:#334155;background:#ffffff;border:1px solid #cbd5e1",
+        }
+        for lettre, style in attendus.items():
             with self.subTest(lettre=lettre):
-                self.assertIn(f"background:{couleur}", _lien(html, lettre))
+                self.assertIn(style, _lien(html, lettre))
 
     def test_le_texte_du_bouton_est_blanc(self) -> None:
-        # Du texte sombre sur un fond vert ou rouge ne se lit pas.
         html = render_choices(CHOIX, LIENS)
-        for lettre in ("A", "B", "C"):
-            with self.subTest(lettre=lettre):
-                self.assertIn("color:#ffffff", _lien(html, lettre))
+        self.assertIn("color:#ffffff", _lien(html, "A"))
+        self.assertIn("color:#b91c1c", _lien(html, "B"))
+        self.assertIn("color:#334155", _lien(html, "C"))
 
 
 class JeuPartielTests(unittest.TestCase):

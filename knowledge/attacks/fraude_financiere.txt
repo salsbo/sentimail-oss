@@ -86,7 +86,43 @@ deniers et d'en transmettre les codes par courrier. C'est l'un des rares
 marqueurs qui, seul, suffit presque à qualifier - mais il reste à vérifier qu'il
 s'agit bien d'une demande, et non de la mention d'un programme de fidélité.
 
-5. Le principe qui gouverne cette famille
+5. Faux reçu et fausse confirmation d'achat
+
+L'inverse de la fausse facture : le message ne réclame rien, il « confirme ».
+Un paiement accepté, un abonnement renouvelé, une commande expédiée, pour un
+achat que le destinataire n'a jamais fait. Le montant, la référence et parfois
+un RIB ou un IBAN servent de décor. Le seul acte proposé est un lien pour
+« gérer mon abonnement », « annuler » ou « contester » : c'est lui qui mène à la
+collecte de coordonnées bancaires ou d'identifiants, sous prétexte de
+rembourser. La victime clique pour se défendre, pas pour acheter.
+
+Marqueurs observables : paiement ou abonnement « confirmé » sans commande
+connue ; montant précis et modeste, souvent le prix réel d'un abonnement
+connu ; prénom ou nom en majuscules issus d'une fuite de données ; marque ou
+service nommés dans le corps mais absents de l'adresse d'envoi ; nom
+d'expéditeur générique (« Annuel-Famille », « Service Facturation ») ; domaine
+d'envoi authentifié (SPF, DKIM, DMARC en règle) dont personne ne répond
+publiquement : pas de site lisible, rien dans la recherche ; envoi par une
+plateforme d'emailing ; un seul lien d'action, souvent vers un hébergeur
+gratuit ou une page vide pour un lecteur sans JavaScript ; fenêtre
+d'annulation (« sous 14 jours ») qui remplace l'urgence.
+
+Ce qui ne prouve rien : un vrai reçu est aussi un paiement confirmé sans
+pression, et il arrive parfois en première observation, depuis un domaine
+dédié à l'envoi ; l'absence de demande explicite est justement le procédé.
+C'est la conjonction qui qualifie : contexte financier, expéditeur dont
+personne ne répond, premier contact. Un reçu d'un service que le destinataire
+utilise vient d'un domaine qui répond de lui, ou dont l'historique répond.
+Une seconde conjonction qualifie aussi : contexte financier, premier contact,
+et un lien d'action qui mène à une page vide pour tout lecteur sans script,
+hors du domaine de l'expéditeur. Un vrai reçu mène à une page qui se lit ;
+une page qui ne montre rien au contrôle cache la collecte derrière un script.
+
+Piège d'analyse : lu isolément, chaque fait est neutre, et l'authentification
+du domaine pèse à décharge. Le domaine est authentique ; personne ne se
+réclame de lui.
+
+6. Le principe qui gouverne cette famille
 
 Ce n'est pas le thème qui qualifie, c'est l'acte et son coût. Un message qui
 parle d'argent n'est pas suspect ; un message qui demande de déplacer de

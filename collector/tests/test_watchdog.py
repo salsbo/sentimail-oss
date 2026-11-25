@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sentimail_v3.supervision.watchdog import (
     DEGRADED_THRESHOLDS,
+    FAIL_CLOSED_SQL,
+    FEEDBACK_INTEGRITY_SQL,
     SOFT_FAILURE_COUNTERS,
     _check,
     _confirmed_reasons,
@@ -30,11 +33,17 @@ class _SnapshotPool:
     def __init__(self, **counters: int) -> None:
         self.counters = counters
 
-    async def fetchrow(self, query: str, *args: object) -> _Counters | None:
+    async def fetchrow(self, query: str, *args: object) -> _Counters | dict[str, object] | None:
         # instance_identity interroge sa propre table : sans ligne posée, elle
         # doit retomber sur l'environnement (settings), pas sur les compteurs.
         if "instance_identity" in query:
             return None
+        if "core_rollout_config" in query:
+            return {"mode": "legacy", "canary_percent": 0, "qualification_id": None}
+        if "core_rollout_qualifications" in query:
+            return None
+        if "legacy_runs_inflight" in query:
+            return {"legacy_runs_inflight": 0, "legacy_unclaimed": 0}
         return _Counters(**self.counters)
 
     async def fetchval(self, query: str, *args: object) -> int:
@@ -73,6 +82,23 @@ def _check_settings() -> SimpleNamespace:
     )
 
 
+def _tx_pool(**attrs: object) -> SimpleNamespace:
+    """Faux pool qui supporte `async with pool.acquire() as conn, conn.transaction():`."""
+    pool = SimpleNamespace(**attrs)
+
+    @asynccontextmanager
+    async def _acquire():
+        yield pool
+
+    @asynccontextmanager
+    async def _transaction():
+        yield pool
+
+    pool.acquire = _acquire
+    pool.transaction = _transaction
+    return pool
+
+
 def _fetchrow_side_effect(previous_row: object):
     """`fetchrow` de `_check` : la ligne `operational_status`, puis None pour
     `instance_identity` afin que le repli sur l'environnement s'applique."""
@@ -102,16 +128,60 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
             {
                 "smtp_events_without_queue_id": 1,
                 "verdict_execution_mismatches": 1,
+                "feedback_application_mismatches": 1,
+                "verdict_provider_credit_exhausted": 1,
                 "silent_holds": 1,
                 "unprotected_holds": 1,
                 "outbox_errors": 1,
+                "suppressed_without_event": 1,
             }
         )
         self.assertIn("smtp_events_without_queue_id", reasons)
         self.assertIn("verdict_execution_mismatches", reasons)
+        self.assertIn("feedback_application_mismatches", reasons)
+        self.assertIn("verdict_provider_credit_exhausted", reasons)
         self.assertIn("silent_holds", reasons)
         self.assertIn("unprotected_holds", reasons)
         self.assertIn("outbox_errors", reasons)
+        self.assertIn("suppressed_without_event", reasons)
+
+    async def test_un_solde_llm_epuise_est_mesure_explicitement(self) -> None:
+        pool = _SnapshotPool(verdict_provider_credit_exhausted=1)
+        with patch(
+            "sentimail_v3.supervision.watchdog.BACKUP_HEARTBEAT", _FreshBackup()
+        ):
+            snapshot = await _snapshot(
+                pool,  # type: ignore[arg-type]
+                _snapshot_settings(),  # type: ignore[arg-type]
+                previously_observed=frozenset({"verdict_provider_credit_exhausted"}),
+            )
+
+        self.assertEqual(
+            snapshot["details"]["verdict_provider_credit_exhausted"], 1
+        )
+        self.assertIn(
+            "verdict_provider_credit_exhausted", snapshot["details"]["reasons"]
+        )
+
+    async def test_un_retour_sans_effet_est_mesure_explicitement(self) -> None:
+        pool = _SnapshotPool(feedback_application_mismatches=1)
+        with patch(
+            "sentimail_v3.supervision.watchdog.BACKUP_HEARTBEAT", _FreshBackup()
+        ):
+            snapshot = await _snapshot(
+                pool,  # type: ignore[arg-type]
+                _snapshot_settings(),  # type: ignore[arg-type]
+                previously_observed=frozenset(
+                    {"feedback_application_mismatches"}
+                ),
+            )
+
+        self.assertEqual(
+            snapshot["details"]["feedback_application_mismatches"], 1
+        )
+        self.assertIn(
+            "feedback_application_mismatches", snapshot["details"]["reasons"]
+        )
 
     async def test_les_messages_anterieurs_a_un_enqueteur_ne_l_accusent_pas(self) -> None:
         """Ajouter un enquêteur ne doit pas dénoncer le passé.
@@ -120,9 +190,9 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
         trace : les compter ferait sonner l'alerte à chaque ajout, pendant
         toute la fenêtre d'observation.
         """
-        from sentimail_v3.supervision.watchdog import _snapshot as snap
-
         import inspect
+
+        from sentimail_v3.supervision.watchdog import _snapshot as snap
 
         source = inspect.getsource(snap)
         self.assertIn("MIN(hr.created_at)", source.replace("min(", "MIN("))
@@ -244,7 +314,7 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
             "status": "ok",
             "details": {"reasons": [], "observed_reasons": ["silent_holds"]},
         }
-        pool = SimpleNamespace(
+        pool = _tx_pool(
             fetchrow=AsyncMock(side_effect=_fetchrow_side_effect(previous)),
             fetchval=AsyncMock(return_value="ok"),
             execute=AsyncMock(),
@@ -265,7 +335,7 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_first_degraded_snapshot_sends_an_alert(self) -> None:
-        pool = SimpleNamespace(
+        pool = _tx_pool(
             fetchrow=AsyncMock(side_effect=_fetchrow_side_effect(None)),
             fetchval=AsyncMock(return_value=None),
             execute=AsyncMock(),
@@ -291,7 +361,7 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(historised[0][1], "degraded")
 
     async def test_failed_alert_is_persisted_and_retried(self) -> None:
-        pool = SimpleNamespace(
+        pool = _tx_pool(
             fetchrow=AsyncMock(side_effect=_fetchrow_side_effect(None)),
             fetchval=AsyncMock(return_value=None),
             execute=AsyncMock(),
@@ -322,7 +392,7 @@ class WatchdogTests(unittest.IsolatedAsyncioTestCase):
             "status": "down",
             "details": {"reasons": ["smtp_relay_preflight_failed"], "alert_pending": True},
         }
-        pool = SimpleNamespace(
+        pool = _tx_pool(
             fetchrow=AsyncMock(side_effect=_fetchrow_side_effect(previous)),
             fetchval=AsyncMock(return_value="down"),
             execute=AsyncMock(),
@@ -452,3 +522,209 @@ class ApaisementDesAlertesTests(unittest.IsolatedAsyncioTestCase):
             "degraded", previous, {"status": "ok", "details": {"reasons": []}}
         )
         self.assertEqual(sent, ["ok"])
+
+
+class RetourAppliquePuisRevoqueTests(unittest.TestCase):
+    """Une autorisation retirée après coup n'est pas un retour sans effet.
+
+    Le 2 septembre 2026, un choix « ce message est légitime » a créé sa règle
+    d'autorisation à la microseconde près. Le 9, un opérateur l'a révoquée -
+    fraude constatée - et une révocation désactive la règle au lieu d'en
+    poser une opposée. Le contrôle d'intégrité ne voyait plus aucune règle
+    active et concluait que le retour n'avait jamais été appliqué :
+    l'exploitation est restée dégradée huit jours sur un geste volontaire.
+
+    Faute de harnais SQL exécutable dans cette suite, le garde porte sur la
+    requête elle-même : c'est la clause d'échappement qui doit exister.
+    """
+
+    def test_la_regle_attendue_desactivee_apres_le_retour_est_un_changement_d_avis(
+        self,
+    ) -> None:
+        clause = FEEDBACK_INTEGRITY_SQL[
+            FEEDBACK_INTEGRITY_SQL.index("f.expected_policy IS NOT NULL") :
+        ]
+        self.assertIn("p.action=f.expected_policy", clause)
+        self.assertIn("p.active=false", clause)
+        self.assertIn("p.updated_at > f.created_at", clause)
+
+    def test_une_regle_desactivee_avant_le_retour_ne_l_excuse_pas(self) -> None:
+        # La borne est bien la date du retour : une règle éteinte depuis
+        # longtemps ne prouve pas qu'il a été pris en compte.
+        self.assertNotIn("p.active=false\n            AND p.updated_at <", FEEDBACK_INTEGRITY_SQL)
+        self.assertNotIn("p.updated_at >= f.created_at", FEEDBACK_INTEGRITY_SQL)
+
+    def test_la_regle_opposee_reste_un_changement_d_avis(self) -> None:
+        # L'ancienne clause ne disparaît pas : poser l'inverse et retirer
+        # l'attendue sont deux gestes distincts, tous deux postérieurs.
+        self.assertIn("p.action<>f.expected_policy", FEEDBACK_INTEGRITY_SQL)
+
+
+class _PoolAvecAttente(_SnapshotPool):
+    """Le faux pool rend un message en attente à la requête qui les cherche."""
+
+    async def fetch(self, query: str, *args: object) -> list[object]:
+        if "stalled" in query:
+            return [
+                {
+                    "message_id": "28f2c85e-fc76-4851-abac-654c07d55ebf",
+                    "subject": "Your Gaia membership has been canceled.",
+                    "delivery_status": "analyzing",
+                    "waiting_seconds": 671,
+                    "run_status": "running",
+                    "run_attempts": 1,
+                    "run_error_type": None,
+                    "llm_model": "deepseek-v4-flash",
+                    "llm_stage": "economy",
+                    "llm_since_seconds": 610,
+                }
+            ]
+        return []
+
+
+class MessagesEnAttenteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_le_releve_nomme_les_messages_en_attente(self) -> None:
+        with patch("sentimail_v3.supervision.watchdog.BACKUP_HEARTBEAT", _FreshBackup()):
+            snapshot = await _snapshot(
+                _PoolAvecAttente(analysis_backlog=1),  # type: ignore[arg-type]
+                _snapshot_settings(),  # type: ignore[arg-type]
+            )
+        attente = snapshot["details"]["stalled_messages"]
+        self.assertEqual(len(attente), 1)
+        self.assertEqual(attente[0]["subject"], "Your Gaia membership has been canceled.")
+        self.assertEqual(attente[0]["llm_model"], "deepseek-v4-flash")
+        self.assertEqual(attente[0]["waiting_seconds"], 671)
+
+
+class RemissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_la_remission_raconte_l_episode(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        debut = (datetime.now(timezone.utc) - timedelta(seconds=304)).isoformat()
+        previous = {
+            "status": "degraded",
+            "details": {
+                "reasons": ["analysis_backlog"],
+                "stalled_messages": [
+                    {
+                        "message_id": "28f2c85e-fc76-4851-abac-654c07d55ebf",
+                        "subject": "Your Gaia membership has been canceled.",
+                    }
+                ],
+                "alert_history": {
+                    "degraded_sent_at": debut,
+                    "degraded_signature": "analysis_backlog",
+                    "episode_alerted": True,
+                },
+            },
+        }
+        pool = _tx_pool(
+            fetchrow=AsyncMock(side_effect=_fetchrow_side_effect(previous)),
+            fetchval=AsyncMock(return_value="degraded"),
+            fetch=AsyncMock(
+                return_value=[
+                    {
+                        "message_id": "28f2c85e-fc76-4851-abac-654c07d55ebf",
+                        "subject": "Your Gaia membership has been canceled.",
+                        "delivery_status": "delivered",
+                        "waited_seconds": 953,
+                    }
+                ]
+            ),
+            execute=AsyncMock(),
+        )
+        snapshot = {"status": "ok", "details": {"reasons": []}}
+        with (
+            patch("sentimail_v3.supervision.watchdog._snapshot", AsyncMock(return_value=snapshot)),
+            patch("sentimail_v3.supervision.watchdog._notify", AsyncMock(return_value="QUEUE3")) as notify,
+            patch("sentimail_v3.supervision.watchdog.set_status"),
+        ):
+            await _check(pool, _check_settings())  # type: ignore[arg-type]
+
+        self.assertEqual(notify.await_args.args[3], "ok")
+        episode = notify.await_args.args[4]["episode"]
+        self.assertGreaterEqual(episode["duration_seconds"], 300)
+        self.assertEqual(episode["messages"][0]["delivery_status"], "delivered")
+        self.assertEqual(episode["messages"][0]["waited_seconds"], 953)
+        # Le sort des messages est demandé avec leurs identifiants.
+        self.assertIn("28f2c85e-fc76-4851-abac-654c07d55ebf", str(pool.fetch.await_args))
+
+
+class SecoursDesRetenuesTests(unittest.IsolatedAsyncioTestCase):
+    """Les chemins d'échec se voient : retenue fermée, secours, repli d'enveloppe."""
+
+    async def _degrade(self, compteur: str) -> dict[str, object]:
+        pool = _SnapshotPool(**{compteur: 1})
+        with patch(
+            "sentimail_v3.supervision.watchdog.BACKUP_HEARTBEAT", _FreshBackup()
+        ):
+            return await _snapshot(
+                pool,  # type: ignore[arg-type]
+                _snapshot_settings(),  # type: ignore[arg-type]
+                previously_observed=frozenset({compteur}),
+            )
+
+    async def test_une_retenue_fermee_est_signalee(self) -> None:
+        snapshot = await self._degrade("fail_closed_holds")
+        self.assertEqual(snapshot["details"]["fail_closed_holds"], 1)
+        self.assertIn("fail_closed_holds", snapshot["details"]["reasons"])
+        self.assertEqual(snapshot["status"], "degraded")
+
+    async def test_un_secours_de_retenue_est_signale(self) -> None:
+        snapshot = await self._degrade("review_fail_open_last_hour")
+        self.assertEqual(snapshot["details"]["review_fail_open_last_hour"], 1)
+        self.assertIn("review_fail_open_last_hour", snapshot["details"]["reasons"])
+
+    async def test_un_repli_d_enveloppe_est_signale(self) -> None:
+        snapshot = await self._degrade("junk_envelope_fallbacks_last_hour")
+        self.assertEqual(snapshot["details"]["junk_envelope_fallbacks_last_hour"], 1)
+        self.assertIn(
+            "junk_envelope_fallbacks_last_hour", snapshot["details"]["reasons"]
+        )
+
+    def test_une_retenue_fermee_n_est_pas_un_echec_passager(self) -> None:
+        # Rien ne la résorbe seul : un compteur d'intégrité, comme les
+        # retenues non protégées et silencieuses.
+        self.assertNotIn("fail_closed_holds", SOFT_FAILURE_COUNTERS)
+        self.assertEqual(DEGRADED_THRESHOLDS["fail_closed_holds"], 1)
+        for compteur in (
+            "review_fail_open_last_hour",
+            "junk_envelope_fallbacks_last_hour",
+        ):
+            self.assertIn(compteur, SOFT_FAILURE_COUNTERS)
+            self.assertEqual(DEGRADED_THRESHOLDS[compteur], 1)
+
+    def test_la_retenue_fermee_ne_depend_pas_de_l_horodatage(self) -> None:
+        # Chaque retentative réhorodate le dossier : un filtre sur l'heure
+        # ferait clignoter le compteur, et l'alerte avec lui.
+        self.assertNotIn("updated_at", FAIL_CLOSED_SQL)
+        self.assertIn("fail_closed_holds", FAIL_CLOSED_SQL)
+        self.assertIn("'ignored','closed'", FAIL_CLOSED_SQL)
+
+    def test_verdict_execution_mismatches_ignore_une_retenue_fermee(self) -> None:
+        # Le contrôle ne compare que la décision du verdict et celle du
+        # jugement en base, que les chemins d'échec ne touchent pas. Pour
+        # 'junk', rien ne regarde l'état de livraison : une retenue fermée,
+        # un repli annoté ou un secours ne le font pas trébucher.
+        import inspect
+
+        from sentimail_v3.supervision.watchdog import _snapshot as snap
+
+        source = inspect.getsource(snap)
+        debut = source.index("verdict_execution_mismatches = await pool.fetchval(")
+        fin = source.index("feedback_application_mismatches = await", debut)
+        bloc = source[debut:fin]
+        self.assertNotIn("'junk'", bloc)
+        self.assertNotIn("review_guard", bloc)
+        self.assertNotIn("junk_envelope", bloc)
+
+    def test_l_exemple_d_audit_ne_casse_pas_le_releve(self) -> None:
+        # Un identifiant d'audit mal formé ferait échouer la conversion en
+        # uuid, donc tout le relevé du superviseur.
+        import inspect
+
+        from sentimail_v3.supervision.watchdog import _snapshot as snap
+
+        source = inspect.getsource(snap)
+        self.assertIn("al.payload->>'message_id' ~ '^[0-9a-f-]{36}$'", source)
+

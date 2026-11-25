@@ -30,7 +30,7 @@ from sentimail_v3.config import load_settings
 from sentimail_v3.llm import ROLES, LlmError, local_chat_json
 
 # Ce que le code attend vraiment d'un modèle : un objet, des clés précises,
-# rien autour. Les deux rôles ont des exigences différentes.
+# rien autour. Les trois rôles ont des exigences différentes.
 PROBES: dict[str, dict[str, Any]] = {
     "conversation": {
         "system": (
@@ -52,6 +52,14 @@ PROBES: dict[str, dict[str, Any]] = {
             "jointe, d'un expéditeur déjà accepté. Rends ton verdict."
         ),
         "required": ("unfavorable", "favorable", "final_verdict"),
+    },
+    "analysis": {
+        "system": (
+            "Tu identifies uniquement l'action demandée. Réponds par un objet "
+            'JSON avec les clés "actions" (liste) et "explication" (chaîne).'
+        ),
+        "user": "Merci de me renvoyer le code de vérification reçu par SMS.",
+        "required": ("actions", "explication"),
     },
 }
 

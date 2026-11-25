@@ -8,8 +8,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from email import policy
 from email.message import EmailMessage
+from email.errors import InvalidHeaderDefect
+from email.headerregistry import HeaderRegistry, UnstructuredHeader
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 from sentimail_v3 import PARSER_VERSION
 
@@ -36,6 +39,43 @@ class ParsedMessage:
     facts: dict[str, object]
 
 
+class _UndecodedHeader(UnstructuredHeader):
+    @classmethod
+    def parse(cls, value: str, kwds: dict[str, Any]) -> None:
+        """Un repli conserve le texte, sans prétendre avoir validé sa structure."""
+        super().parse(value, kwds)
+        kwds["defects"].append(InvalidHeaderDefect("En-tête structuré illisible, valeur brute conservée"))
+
+
+_UNSTRUCTURED_HEADERS = HeaderRegistry(default_class=_UndecodedHeader, use_default_map=False)
+
+
+def parse_email(raw: bytes, *, header_errors: set[tuple[str, str]] | None = None) -> EmailMessage:
+    """Isole une panne de décodage d'en-tête sans perdre le message original.
+
+    Le décodeur structuré de Python peut lui-même échouer sur une syntaxe
+    invalide. Tous les lecteurs MIME partagent ce repli, qui reste marqué
+    comme défaut plutôt que transformer une identité malformée en identité sûre.
+    """
+    errors = header_errors if header_errors is not None else set()
+    message: EmailMessage | None = None
+    defect = InvalidHeaderDefect("Un décodage structuré a échoué ; valeur brute conservée")
+
+    def header_factory(name: str, value: str) -> str:
+        try:
+            return policy.default.header_factory(name, value)
+        except Exception as exc:  # noqa: BLE001 - un en-tête reste une donnée hostile
+            errors.add((name.casefold(), type(exc).__name__))
+            if message is not None and defect not in message.defects:
+                message.defects.append(defect)
+            return _UNSTRUCTURED_HEADERS(name, value)
+
+    message = BytesParser(policy=policy.default.clone(header_factory=header_factory)).parsebytes(raw)
+    if errors and defect not in message.defects:
+        message.defects.append(defect)
+    return message
+
+
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -46,7 +86,7 @@ def scrub(value: object) -> str:
     Le module email décode certains en-têtes en `surrogateescape` : chaque
     octet non-ASCII devient un demi-codet isolé, que PostgreSQL refuse
     d'encoder. Or ces octets sont très souvent de l'UTF-8 parfaitement valide
-    (« \udcc3\udca9 » est un « é ») : on récupère donc d'abord les octets
+    (« \\udcc3\\udca9 » est un « é ») : on récupère donc d'abord les octets
     d'origine, puis on décode pour de bon. Un vrai octet invalide devient �,
     et un message étrange reste un message capturé - jamais un message qui
     tourne en boucle devant la porte de la base.
@@ -97,6 +137,27 @@ def _parameters(part: EmailMessage) -> dict[str, dict[str, str | None]]:
     return result
 
 
+def is_attachment_part(part: EmailMessage) -> bool:
+    """Une seule définition de la pièce jointe, pour le parseur et le bac à sable.
+
+    Le parseur comptait comme pièce jointe toute partie hors texte brut et
+    HTML ; le bac à sable ne remontait que les parties nommées ou déclarées
+    « attachment ». Une invitation d'agenda ou une image inline sans nom
+    existait donc pour l'un et pas pour l'autre, et l'analyse concluait
+    « contenu introuvable » sur des parties de quelques ko. Au 29 septembre
+    2026 : 36 parties sur 60 jours, toutes sans nom de fichier, aucune
+    au-dessus du budget de 25 Mo.
+    """
+    return bool(
+        part.get_content_disposition() == "attachment"
+        or part.get_filename()
+        or (
+            not part.is_multipart()
+            and part.get_content_type() not in {"text/plain", "text/html"}
+        )
+    )
+
+
 def _part_rows(
     root: EmailMessage,
 ) -> tuple[list[dict[str, object]], list[str], list[str]]:
@@ -107,14 +168,7 @@ def _part_rows(
     def visit(part: EmailMessage, path: str, parent: str | None) -> None:
         disposition = part.get_content_disposition()
         filename = part.get_filename()
-        is_attachment = bool(
-            disposition == "attachment"
-            or filename
-            or (
-                not part.is_multipart()
-                and part.get_content_type() not in {"text/plain", "text/html"}
-            )
-        )
+        is_attachment = is_attachment_part(part)
         payload = _decoded_payload(part)
         # Le texte d'une part n'est pas réservé au maintype « text » : un SVG
         # (image/svg+xml) ou un fragment XML est du texte balisé, et c'est
@@ -165,13 +219,10 @@ def _part_rows(
 
 def _header_rows(message: EmailMessage) -> list[dict[str, object]]:
     raw_items = list(message.raw_items())
-    decoded_items = list(message.items())
     rows: list[dict[str, object]] = []
     for ordinal, (name, value) in enumerate(raw_items):
         normalized = name.casefold()
-        decoded = scrub(
-            decoded_items[ordinal][1] if ordinal < len(decoded_items) else value
-        )
+        decoded = scrub(message.policy.header_fetch_parse(name, value))
         rows.append(
             {
                 "ordinal": ordinal,
@@ -227,7 +278,8 @@ def _content_facts(text: str, html: str) -> dict[str, object]:
 
 
 def parse_message(raw: bytes) -> ParsedMessage:
-    parsed: EmailMessage = BytesParser(policy=policy.default).parsebytes(raw)
+    header_errors: set[tuple[str, str]] = set()
+    parsed = parse_email(raw, header_errors=header_errors)
     headers = _header_rows(parsed)
     parts, plain_parts, html_parts = _part_rows(parsed)
     body_text = "\n".join(plain_parts) or None
@@ -238,6 +290,9 @@ def parse_message(raw: bytes) -> ParsedMessage:
         type(defect).__name__ for part in parsed.walk() for defect in part.defects
     ]
     facts = {
+        "header_decode_errors": [
+            {"header": name, "error_type": error} for name, error in sorted(header_errors)
+        ],
         "header_count": len(headers),
         "distinct_header_count": len(names),
         "duplicate_headers": {

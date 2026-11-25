@@ -12,6 +12,7 @@ import inspect
 import os
 import re
 import unittest
+import uuid
 from pathlib import Path
 
 import asyncpg
@@ -379,6 +380,11 @@ class HistorySqlIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self) -> None:
         self.pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+        suffix = uuid.uuid4().hex
+        self.apex = f"historique-{suffix}.com"
+        self.recipient = f"historique-{suffix}@example.org"
+        self.created_messages: list[str] = []
+        self.created_labels: list[int] = []
         await self.pool.execute(
             """
             INSERT INTO domains (fqdn, status, admin_email, verified_at)
@@ -389,18 +395,29 @@ class HistorySqlIntegrationTests(unittest.IsolatedAsyncioTestCase):
         forget_cache()
 
     async def asyncTearDown(self) -> None:
-        await self.pool.close()
+        try:
+            # Les labels survivent à la suppression du message : les retirer
+            # d'abord, sans toucher aux données des autres tests du client.
+            await self.pool.execute(
+                "DELETE FROM labels WHERE id=ANY($1::bigint[])", self.created_labels
+            )
+            await self.pool.execute(
+                "DELETE FROM messages WHERE id=ANY($1::uuid[])", self.created_messages
+            )
+        finally:
+            await self.pool.close()
 
     async def test_un_apex_eprouve_par_trois_autres_adresses_est_constate(
         self,
     ) -> None:
         store = Store(self.pool)
-        recipient = "dest-apex-1@example.org"
+        recipient = self.recipient
         for ordinal in range(1, 4):
-            sender = f"seniority-{ordinal}@apex-eprouve.example"
+            sender = f"seniority-{ordinal}@{self.apex}"
             result = await store.capture(
                 _apex_email(sender, recipient, ordinal), sender, [recipient], _SMTP
             )
+            self.created_messages.append(result.message_id)
             await store.mark_delivered(result.message_id)
             # L'ancienneté de sept jours protège contre un domaine qui
             # s'auto-blanchirait en enchaînant des adresses fraîches.
@@ -409,10 +426,11 @@ class HistorySqlIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "WHERE id=$1::uuid",
                 result.message_id,
             )
-        sender_nouveau = f"jamais-vue@apex-eprouve.example"
+        sender_nouveau = f"jamais-vue@{self.apex}"
         current = await store.capture(
             _apex_email(sender_nouveau, recipient, 4), sender_nouveau, [recipient], _SMTP
         )
+        self.created_messages.append(current.message_id)
         history = await _history(self.pool, current.message_id)
         self.assertEqual(history["previous_message_count"], 0)
         self.assertEqual(history["apex_delivered_count"], 3)
@@ -423,13 +441,14 @@ class HistorySqlIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         store = Store(self.pool)
-        recipient = "dest-apex-2@example.org"
+        recipient = self.recipient
         first_message_id = None
         for ordinal in range(1, 4):
-            sender = f"poison-{ordinal}@apex-etiquete.example"
+            sender = f"poison-{ordinal}@{self.apex}"
             result = await store.capture(
                 _apex_email(sender, recipient, ordinal), sender, [recipient], _SMTP
             )
+            self.created_messages.append(result.message_id)
             first_message_id = first_message_id or result.message_id
             await store.mark_delivered(result.message_id)
             await self.pool.execute(
@@ -439,38 +458,42 @@ class HistorySqlIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
         # Une seule étiquette humaine défavorable, n'importe où sur l'apex,
         # neutralise le fait pour toutes les adresses de ce domaine.
-        await self.pool.execute(
+        label_id = await self.pool.fetchval(
             """
             INSERT INTO labels (
                 message_id, source, label, is_ground_truth, active,
                 sender_normalized, participant_email
-            ) VALUES ($1::uuid, 'user', 'spam', true, true, $2, $3)
+            ) VALUES ($1::uuid, 'user', 'spam', true, true, $2, $3) RETURNING id
             """,
             first_message_id,
-            "poison-1@apex-etiquete.example",
+            f"poison-1@{self.apex}",
             recipient,
         )
-        sender_nouveau = "jamais-vue@apex-etiquete.example"
+        self.created_labels.append(label_id)
+        sender_nouveau = f"jamais-vue@{self.apex}"
         current = await store.capture(
             _apex_email(sender_nouveau, recipient, 4), sender_nouveau, [recipient], _SMTP
         )
+        self.created_messages.append(current.message_id)
         history = await _history(self.pool, current.message_id)
         self.assertEqual(history["apex_adverse_label_count"], 1)
         self.assertFalse(history["apex_established_locally"])
 
     async def test_la_langue_dominante_du_destinataire_est_constatee(self) -> None:
         store = Store(self.pool)
-        recipient = "polyglotte@example.org"
+        recipient = self.recipient
         for ordinal in range(1, 11):
-            sender = f"expediteur-{ordinal}@divers-mail.example"
+            sender = f"expediteur-{ordinal}@{self.apex}"
             result = await store.capture(
                 _french_email(sender, recipient, ordinal), sender, [recipient], _SMTP
             )
+            self.created_messages.append(result.message_id)
             await store.mark_delivered(result.message_id)
-        sender_courant = "expediteur-11@divers-mail.example"
+        sender_courant = f"expediteur-11@{self.apex}"
         current = await store.capture(
             _french_email(sender_courant, recipient, 11), sender_courant, [recipient], _SMTP
         )
+        self.created_messages.append(current.message_id)
         history = await _history(self.pool, current.message_id)
         self.assertEqual(history["recipient_dominant_language"], "fr")
         self.assertGreaterEqual(history["recipient_language_total"], 10)

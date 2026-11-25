@@ -8,6 +8,13 @@ seule sa formulation change ici.
 Trois règles tenues par ce module : aucun code interne ni score dans un message,
 une limite d'analyse n'est jamais présentée comme un danger, et rien n'est
 inventé — chaque phrase traduit un indice réellement observé.
+
+Une phrase dit le constat, pas ce qu'on imagine qu'il entraîne. Elle ne nomme
+une conséquence (« s'exécute », « prend la main »), une intention (« pour
+cacher ») ou une certitude que si le détecteur l'a établie, dans le contexte
+réel d'une messagerie. Compter des balises <script> ne prouve pas qu'un code
+s'exécute : aucune messagerie ne les lance. Les expressions de ce genre sont
+réservées aux indices qui les prouvent ; un test tient la liste.
 """
 
 from __future__ import annotations
@@ -15,17 +22,25 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from email.utils import parseaddr
 
 # Traduction d'un indice observé vers ce qu'il signifie pour le destinataire.
 # Une entrée par article du Code ; l'énoncé technique sert de repli.
 _PLAIN = {
-    "AUTH_DMARC_FAIL": "Le message n’est pas envoyé par qui il prétend : le domaine affiché ne le reconnaît pas.",
+    "URL_ACTION_DESTINATION_MISMATCH": "La page atteinte par le bouton ne correspond pas à l'opération annoncée dans le message.",
+    "URL_ACTION_DESTINATION_UNVERIFIED": "Je n'ai pas pu établir si le bouton permet bien l'opération annoncée.",
+    "URL_ACTION_DESTINATION_CONSISTENT": "La destination observée ne contredit pas l'opération annoncée. Cela ne prouve pas que le message est honnête.",
+    "SENDER_ACTIVITY_UNVERIFIED": "Je n'ai pas pu comparer le contenu avec une activité vérifiable de l'expéditeur.",
+    "CORRELATION_UNVERIFIED_IDENTITY_DESTINATION": "Je n'ai pas établi qui se présente derrière cet expéditeur, et son bouton ne mène pas à l'opération annoncée. Je te demande ton avis avant de donner suite.",
+    "AUTH_DMARC_FAIL": "Le domaine affiché ne reconnaît pas cet envoi : quelqu’un prétend peut-être écrire en son nom, à moins que sa configuration soit mal réglée.",
     "AUTH_SPF_FAIL": "Le serveur qui a envoyé ce message n’est pas autorisé par le domaine affiché.",
     "AUTH_SPF_SOFTFAIL": "Le domaine affiché n’autorise qu’à moitié le serveur d’envoi.",
     "AUTH_DKIM_INCONCLUSIVE": "Rien ne prouve que le message n’a pas été modifié en chemin.",
-    "AUTH_UNALIGNED": "La signature du message appartient à un autre domaine que celui affiché.",
     "AUTH_NO_TRUSTED_RESULTS": "Je n’ai pas pu vérifier l’identité de l’expéditeur.",
-    "AUTH_DMARC_PASS": "L’expéditeur est bien celui qu’il annonce.",
+    # « L'expéditeur est bien celui qu'il annonce » se lisait comme une
+    # légitimité. DMARC prouve que le domaine affiché a écrit, rien de plus :
+    # on peut être le bon domaine sans être qui l'on prétend.
+    "AUTH_DMARC_PASS": "L’adresse d’envoi est authentique : le domaine affiché a bien écrit ce message. Reste à savoir qui est derrière ce domaine.",
     # « Non modifié » disait vrai du texte, et laissait croire à l'authenticité
     # de l'expéditeur : une signature valide peut appartenir à n'importe quel
     # hébergeur d'envoi. La phrase dit maintenant ce qu'elle prouve.
@@ -34,32 +49,39 @@ _PLAIN = {
     "AUTH_DKIM_UNALIGNED": "Le message est signé par une autre organisation que celle qu’il affiche.",
     "AUTH_SPF_INCONCLUSIVE": "Le domaine affiché ne dit pas quels serveurs ont le droit d’envoyer en son nom.",
     "AUTH_DMARC_INCONCLUSIVE": "Le domaine affiché ne publie aucune règle permettant de vérifier son identité.",
+    # Plus émis depuis la suppression du référentiel de marques (27 août
+    # 2026), mais encore relu par la conversation et le récapitulatif tant
+    # que la rétention garde ses dossiers : à retirer après le 2027-02-23.
     "IDENTITY_BRAND_MISMATCH": "Le nom affiché est celui d’une marque connue, mais le message vient d’ailleurs.",
     "IDENTITY_CLAIMED_ORGANISATION_UNRELATED": "Le message se présente au nom d’une organisation, depuis un domaine qui n’est pas le sien.",
     "IDENTITY_CLAIMED_ORGANISATION_REFUTED": "Le message se présente au nom d’une organisation dont les sites officiels, vérifiés à l’instant, ne comprennent pas le domaine qui a écrit.",
-    "IDENTITY_COUSIN_DOMAIN": "L’adresse d’envoi imite celle d’une marque connue, à un caractère près.",
+    # La référence est un domaine que la recherche a établi officiel, pas
+    # forcément une marque ; et « rn » pour « m » change deux caractères.
+    "IDENTITY_COUSIN_DOMAIN": "L’adresse d’envoi imite le domaine officiel d’une organisation : des caractères sosies y remplacent les vrais (un 1 pour un l, un zéro pour un o).",
     "IDENTITY_ASCII_LOOKALIKE": "L’adresse utilise des caractères qui se ressemblent à l’œil (un zéro pour un o, un 1 pour un l).",
+    "IDENTITY_DISPLAY_NAME_DISGUISED": "Le nom affiché imite l’organisation que le message annonce, avec des lettres sosies (un l pour un I, un zéro pour un o).",
     "HEADERS_RECIPIENT_NOT_ADDRESSED": "Ton adresse n’apparaît pas dans le message : tu es en copie cachée.",
     "NATURE_MESSAGE_LANGUAGE": "Voici la langue dans laquelle ce message est écrit.",
-    "CONTENT_ACTIVE_HTML": "Le message contient du code qui s’exécute à l’ouverture.",
+    "CONTENT_ACTIVE_HTML": "Le message embarque un script ou un formulaire, comme une page web. Ta messagerie ne les exécute pas, mais un courrier ordinaire n’en contient pas.",
     "RSPAMD_PHISHING_HEURISTIC": "Le filtre antispam reconnaît une tournure habituelle des tentatives d’hameçonnage.",
+    "CORRELATION_UNAUTHENTICATED_PHISHING_HEURISTIC": "Le filtre antispam soupçonne un hameçonnage, et rien n’authentifie l’expéditeur.",
     "URL_STATIC_RISK": "Un lien du message présente une construction inhabituelle.",
     "URL_UNAUTHENTICATED_CROSS_APEX": "Un expéditeur non vérifié te renvoie vers un site qui ne lui appartient pas.",
-    "CORRELATION_BRAND_SPOOFING": "Ce message se fait passer pour une marque connue : le nom est le bon, l’expéditeur non.",
+    "CORRELATION_BRAND_SPOOFING": "Ce message se présente sous le nom d’une marque connue, depuis un expéditeur que rien n’authentifie.",
     "CORRELATION_CREDENTIAL_HARVESTING": "Ce message mène à un formulaire qui réclame tes identifiants, sur un site qui n’est pas le sien.",
     "CORRELATION_UNSOLICITED_BULK": "Ce message est une publicité envoyée en masse, que tu n’as pas demandée.",
-    "ATTACHMENT_MACRO_SHELL": "Un fichier joint contient un programme caché capable de prendre la main sur ton ordinateur.",
-    "ATTACHMENT_MACRO_AUTO": "Un fichier joint contient un programme qui se lance tout seul à l’ouverture.",
-    "ATTACHMENT_ACTIVE_DOCUMENT": "Un document joint contient du code qui s’exécute quand on l’ouvre.",
+    "ATTACHMENT_MACRO_SHELL": "Un fichier joint contient une macro qui peut lancer des commandes sur ton ordinateur.",
+    "ATTACHMENT_MACRO_AUTO": "Un document joint contient une macro programmée pour se lancer à l’ouverture, si les macros sont autorisées.",
+    "ATTACHMENT_ACTIVE_DOCUMENT": "Un document joint mentionne du code actif ou une action de lancement, sans preuve qu’il en contienne vraiment.",
     "ATTACHMENT_ENCRYPTED_ARCHIVE": "Un fichier joint est protégé par un mot de passe : personne n’a pu vérifier ce qu’il contient.",
     "ATTACHMENT_EXECUTABLE_MEMBER": "Un fichier joint contient un programme à exécuter.",
     "ATTACHMENT_COMPRESSION_ANOMALY": "Un fichier joint est compressé d’une façon anormale.",
     "ATTACHMENT_YARA_MATCH": "Un fichier joint ressemble à un logiciel malveillant connu.",
-    "ATTACHMENT_IMAGE_TEXT": "Une image jointe contient du texte, invisible à une lecture automatique.",
+    "ATTACHMENT_IMAGE_TEXT": "Une image jointe contient du texte, que j’ai lu par reconnaissance de caractères.",
     "ATTACHMENT_EMBEDDED_URL": "Un fichier joint contient des liens vers Internet.",
     "ATTACHMENT_ANALYSIS_BLOCKED": "Je n’ai pas pu inspecter entièrement un fichier joint.",
-    "CORRELATION_ANALYSIS_EVASION": "Ce message joint un fichier protégé par mot de passe et te presse de l’ouvrir : le mot de passe sert à empêcher toute vérification.",
-    "CORRELATION_MALICIOUS_ATTACHMENT": "Ce message joint un fichier capable de prendre la main sur ton ordinateur, et t’invite à l’ouvrir.",
+    "CORRELATION_ANALYSIS_EVASION": "Ce message joint un fichier protégé par mot de passe, que personne n’a donc pu vérifier, et te presse de l’ouvrir.",
+    "CORRELATION_MALICIOUS_ATTACHMENT": "Ce message joint un fichier capable d’exécuter du code, et t’invite à l’ouvrir.",
     "ACTION_PAYMENT_TRANSFER": "Ce message te demande de faire un virement ou un paiement.",
     "ACTION_BANK_DETAILS_CHANGE": "Ce message te demande de changer des coordonnées bancaires.",
     "ACTION_GIFT_CARD_PURCHASE": "Ce message te demande d’acheter des cartes cadeaux.",
@@ -78,33 +100,44 @@ _PLAIN = {
     "CORRELATION_FINANCIAL_FRAUD": "Ce message réclame de l’argent ou un changement bancaire, et son expéditeur n’est pas vérifié.",
     "SENDER_ACTIVITY_INCOHERENT": "Ce message parle de quelque chose qui n’a rien à voir avec ce que fait cet expéditeur.",
     "SENDER_ACTIVITY_COHERENT": "Ce message correspond bien à l’activité de cet expéditeur.",
+    # Les trois constats neutres de l'enquêteur sender_relation : ne pas savoir
+    # s'écrit, il n'accuse pas. Leur vocabulaire est celui de la doctrine du
+    # faux reçu, c'est par lui que le juge la retrouve.
+    "SENDER_WITHOUT_PUBLIC_FOOTPRINT": "Personne ne répond de ce domaine : pas de site lisible, rien dans la recherche, et le message ne se présente au nom d’aucune organisation connue. Ce n’est pas une preuve, c’est un vide.",
+    "SENDER_RELATION_UNVERIFIED": "Je n’ai pas pu vérifier le rapport entre l’expéditeur et ce que dit le message.",
+    "SENDER_RELATION_CONSISTENT": "Le nom que le message affiche et le domaine qui a écrit concordent. Cela dit qui a écrit, pas que le message est honnête.",
+    "CONTENT_FINANCIAL_CONTEXT": "Ce message parle d’un paiement, d’un reçu, d’un abonnement ou de coordonnées bancaires.",
+    "CORRELATION_FAKE_TRANSACTION_LURE": "Ce message annonce un paiement ou un abonnement depuis un expéditeur jamais vu dont personne ne répond : c’est le procédé du faux reçu, qui pousse à cliquer pour annuler.",
+    # Plus émis depuis le 25 août 2026, relu comme IDENTITY_BRAND_MISMATCH
+    # jusqu'à la purge de rétention : à retirer après le 2027-02-23.
     "SENDER_SITE_CLAIMS_FOREIGN_BRAND": "Le site de cet expéditeur se fait passer pour une marque qui n’est pas la sienne.",
     "URL_SAME_ORGANISATION_DESTINATION": "Le lien mène à un site appartenant à la même organisation que l’expéditeur.",
-    "CORRELATION_COMPROMISED_SENDER": "Cet expéditeur existe vraiment, mais ce message n’a rien à voir avec son métier : son compte a sans doute été détourné.",
+    "CORRELATION_COMPROMISED_SENDER": "L’adresse est authentifiée, mais le contenu paraît sans rapport avec l’activité publiée. Cela peut signaler un compte détourné, ou une mauvaise interprétation.",
+    "CORRELATION_SPOOFED_UNRELATED_SENDER": "L’adresse n’est pas authentifiée, et le domaine qu’elle affiche exerce un tout autre métier que celui dont parle le message : quelqu’un écrit sous un nom qui n’est pas le sien.",
     "CORRELATION_BRAND_FIRST_CONTACT": "Une marque connue t’écrit pour la première fois, depuis une adresse qui n’est pas la sienne.",
-    "CORRELATION_PREPARED_APPROACH": "Ce message vient d’une adresse créée pour l’occasion, dont les réponses partent ailleurs.",
-    "CORRELATION_COUSIN_DOMAIN_APPROACH": "Ce message vient d’une adresse créée pour ressembler à une marque connue.",
+    "CORRELATION_PREPARED_APPROACH": "Ce message vient d’un domaine récemment créé, dont les réponses partent ailleurs.",
+    "CORRELATION_COUSIN_DOMAIN_APPROACH": "Ce message vient d’une adresse qui imite le domaine officiel d’une organisation, et ce domaine est récent ou renvoie tes réponses ailleurs.",
     "AUTH_SPF_PASS": "Le serveur d’envoi est autorisé par le domaine affiché.",
     "IDENTITY_ENVELOPE_VISIBLE_ALIGNED": "L’adresse visible et l’adresse technique concordent.",
     "IDENTITY_ENVELOPE_FROM_CROSS_APEX": "L’adresse technique d’envoi appartient à un autre domaine que l’adresse affichée.",
-    "IDENTITY_DISPLAY_NAME_LOOKS_LIKE_ADDRESS": "Le nom affiché imite une adresse email.",
     "HEADERS_REPLY_TO_DIFFERENT_DOMAIN": "Une réponse partirait vers un autre domaine que l’expéditeur affiché.",
     "HEADERS_MULTIPLE_FROM": "Le message déclare plusieurs expéditeurs différents.",
     "CONTENT_SENSITIVE_REQUEST": "Le message demande une information sensible.",
     "CONTENT_URGENCY": "Le message cherche à te faire agir vite.",
-    "CONTENT_COERCIVE_PRESSURE": "Le message menace d’une conséquence si tu n’agis pas.",
-    "CONTENT_OBFUSCATION": "Le texte contient des caractères cachés qui masquent son contenu réel.",
+    "CONTENT_OBFUSCATION": "Le texte contient des caractères invisibles ou un encodage inhabituel, un signe possible de dissimulation.",
     "CONTENT_SOCIAL_ENGINEERING_COMBINATION": "Le message combine urgence et demande sensible, comme une tentative de manipulation.",
     "CONTENT_NO_SENSITIVE_PRESSURE": "Je n’ai repéré ni demande sensible ni pression, mais je ne peux pas l’affirmer.",
     "CONTENT_EXTORTION": "Le message te menace ou réclame un versement pour ne pas nuire.",
     "CONTENT_ONE_TIME_CREDENTIAL_PROVIDED_NOT_REQUESTED": "Le message fournit un code de connexion sans te demander de le communiquer.",
     "URL_SANDBOX_FORM": "Un lien mène à un formulaire qui réclame des informations personnelles.",
+    "URL_FAKE_HUMAN_VERIFICATION": "Un lien mène à une page qui imite une vérification « vérifiez que vous êtes humain », sans rien d’autre derrière ce décor.",
+    "URL_OPAQUE_LANDING": "Le lien d’action mène à une page vide pour qui n’exécute pas ses scripts : je n’ai rien pu lire de la destination.",
+    "CORRELATION_BRAND_TRANSACTION_LURE": "Ce message te facture un paiement ou un abonnement au nom d’une marque connue, mais il vient d’un expéditeur qui n’est pas cette marque et qui t’écrit pour la première fois : c’est le procédé de la fausse facture.",
+    "CORRELATION_OPAQUE_TRANSACTION_LURE": "Un paiement ou un abonnement annoncé par un expéditeur jamais vu, et un lien d’action qui mène à une page vide sans script : cela ressemble au montage du faux reçu, qui pousse à cliquer pour « annuler ».",
     "URL_AMBIENT_SENSITIVE_FORM": "La page visée contient un formulaire sensible, sans que le message le demande.",
     "URL_SANDBOX_CROSS_APEX": "Un bouton conduit vers un site qui n’appartient pas à l’expéditeur.",
     "URL_CROSS_APEX": "Le message renvoie vers des sites extérieurs à l’expéditeur.",
     "URL_DECEPTIVE_LINK_TEXT": "Un lien affiche une destination différente de celle où il mène vraiment.",
-    "URL_CLOAKING": "Un lien cache sa véritable destination derrière des redirections.",
-    "URL_KNOWN_MALICIOUS": "Un lien de ce message est répertorié comme malveillant.",
     "URL_SANDBOX_INCOMPLETE": "Je n’ai pas pu ouvrir tous les liens pour les vérifier.",
     "URL_PROTECTED_ACTION_NOT_VISITED": "Un lien à usage unique n’a pas été ouvert, pour ne pas le consommer à ta place.",
     "URL_GENERIC_FORM": "La page visée propose un formulaire ordinaire, sans donnée sensible.",
@@ -112,17 +145,20 @@ _PLAIN = {
     "ATTACHMENT_EXECUTABLE": "Une pièce jointe peut exécuter du code sur ton appareil.",
     "ATTACHMENT_DOUBLE_EXTENSION": "Une pièce jointe déguise son type réel.",
     "ATTACHMENT_MACRO": "Un document joint contient des macros.",
-    "ATTACHMENT_KNOWN_MALICIOUS": "Une pièce jointe est reconnue comme malveillante.",
     "ATTACHMENT_SANDBOX_INCOMPLETE": "Je n’ai pas pu inspecter toutes les pièces jointes.",
     "NATURE_BULK_MAILING": "C’est un envoi de masse, comme une lettre d’information.",
     "NATURE_UNVERIFIABLE_PROMOTIONAL_CLAIMS": "Le message promet des résultats invérifiables.",
     "NATURE_SOLICITATION_WITHOUT_OPT_OUT": "Cette sollicitation n’offre aucun moyen de se désinscrire.",
     "HISTORY_FIRST_OBSERVATION": "C’est la première fois que cet expéditeur t’écrit.",
-    "HISTORY_CONFIRMED_SENDER": "Tu as déjà reçu et accepté des messages de cet expéditeur.",
+    # Au moins trois messages qualifiés légitimes, aucun défavorable.
+    "HISTORY_CONFIRMED_LEGITIMATE_SENDER": "Tu as déjà confirmé plusieurs messages de cet expéditeur, sans jamais en signaler un comme indésirable.",
+    "HISTORY_CONFIRMED_MAIL_PROFILE": "Tu as déjà validé ce type de courrier de la même identité vérifiée.",
+    # Heure, taille ou pays inhabituels, sur dix messages d'historique au moins.
+    "HISTORY_BEHAVIOR_DEVIATION": "L’heure, la taille ou le pays d’envoi de ce message s’écarte des habitudes de cet expéditeur.",
     "SENDER_DOMAIN_RECENT": "Le domaine de l’expéditeur a été créé récemment.",
     "SENDER_DOMAIN_ESTABLISHED": "Le domaine de l’expéditeur existe depuis des années.",
-    "TYPOSQUATTING": "Le domaine imite celui d’une marque connue.",
     "RSPAMD_MATERIAL_SYMBOL": "Le filtre antispam relève un signal défavorable précis.",
+    "RSPAMD_OBFUSCATION_SYMBOL": "L’objet ou l’expéditeur du message est encodé de façon inhabituelle, un procédé qui sert souvent à tromper les filtres.",
     "RSPAMD_HIGH_SCORE": "Le filtre antispam trouve ce message très inhabituel.",
     "RSPAMD_LOW_SCORE": "Le filtre antispam ne relève rien d’inhabituel.",
     "RSPAMD_NO_REPUTATION_HIT": "Aucune liste de mauvaise réputation ne signale ce message.",
@@ -268,26 +304,369 @@ def _dit_la_marque(facts: dict) -> str:
     return phrase + (f", alors que {marque} écrit depuis {officiels}." if officiels else ".")
 
 
-def _dit_l_organisation(facts: dict) -> str:
-    """L'organisation revendiquée, ses sites trouvés, et d'où vient le message."""
+def _dit_le_deguisement(facts: dict) -> str:
+    """Le nom tel qu'il est écrit, ce qu'on y lit, et qui il imite."""
+    nom = str(facts.get("display_name") or "").strip()
+    imite = str(facts.get("imite") or "").strip()
     organisation = str(facts.get("claimed_organisation") or "").strip()
-    domaine = str(facts.get("from_apex") or "").strip()
-    officiels = _domaines(facts)
-    if not organisation or not domaine or not officiels:
+    if not nom or not imite or not organisation:
         return ""
     return (
-        f"{organisation} publie sur {officiels} ; ce message vient de {domaine}."
+        f"Le nom affiché « {nom} » se lit « {imite} », comme {organisation} "
+        "que le message annonce, mais il ne l’écrit pas : des lettres sosies "
+        "y remplacent les vraies."
     )
+
+
+def _dit_le_domaine_sosie(facts: dict) -> str:
+    """Les deux domaines, celui qui écrit et celui qu'il imite.
+
+    Le message peut ne rien annoncer : « Le nom annonce » dirait un nom qu'il
+    n'a pas écrit. L'organisation n'est citée que pour dire à qui appartient
+    le domaine imité, selon la recherche.
+    """
+    domaine = str(facts.get("from_domain") or facts.get("from_apex") or "").strip()
+    imite = str(facts.get("imite") or "").strip()
+    organisation = str(facts.get("imitated_organisation") or "").strip()
+    if not domaine or not imite:
+        return ""
+    phrase = f"L’adresse d’envoi {domaine} se lit comme {imite}"
+    if organisation:
+        phrase += f", domaine de {organisation}"
+    return phrase + ", mais ne l’écrit pas : des caractères sosies y remplacent les vrais."
+
+
+def _dit_l_adresse_authentique(facts: dict) -> str:
+    """Ce que l'authentification prouve, et la question qu'elle laisse ouverte.
+
+    Le domaine a bien écrit ; reste à savoir s'il est bien l'organisation que
+    le nom affiche. Quand le nom reprend le domaine, la question ne se pose
+    pas en ces termes et l'on demande seulement qui est derrière.
+    """
+    from sentimail_v3.code.identity_relation import obvious_relation
+
+    domaine = str(facts.get("from_apex") or "").strip()
+    if not domaine:
+        return ""
+    organisation = str(facts.get("claimed_organisation") or "").strip()
+    debut = f"L’adresse d’envoi est authentique : {domaine} a bien écrit ce message."
+    if organisation and not obvious_relation(organisation, domaine):
+        return f"{debut} Reste à savoir si {domaine} est bien {organisation}."
+    return f"{debut} Reste à savoir qui est derrière {domaine}."
+
+
+def _dit_l_organisation(facts: dict) -> str:
+    """L'organisation revendiquée, d'où vient le message, et d'où elle écrit.
+
+    Même tournure que pour une marque imitée : « le nom annonce X, mais le
+    message a été envoyé depuis Y, alors que X écrit depuis Z ». Un lecteur
+    qui ne sait pas ce qu'est un domaine lit tout de même que Y n'est pas Z.
+    """
+    organisation = str(facts.get("claimed_organisation") or "").strip()
+    domaine = str(facts.get("from_apex") or "").strip()
+    if not organisation or not domaine:
+        return ""
+    officiels = _domaines(facts)
+    phrase = f"Le nom annonce {organisation}, mais le message a été envoyé depuis {domaine}"
+    return phrase + (
+        f", alors que {organisation} écrit depuis {officiels}." if officiels else "."
+    )
+
+
+def _dit_l_identite_invérifiable(facts: dict) -> str:
+    """Ce qu'une authentification muette veut dire, en une phrase pour les trois.
+
+    DMARC, SPF et DKIM en temperror donnaient trois lignes qui disaient la
+    même chose avec des mots faux : « ne publie aucune règle » pour un DNS qui
+    ne répond pas. Une seule phrase, la même pour les trois contrôles, que la
+    liste ne répète pas.
+    """
+    domaine = str(facts.get("from_apex") or "").strip()
+    if not domaine:
+        return ""
+    resultat = str(facts.get("result") or "").strip().casefold()
+    if resultat in {"temperror", "permerror"}:
+        return (
+            f"Je n’ai pas pu vérifier que ce message vient bien de {domaine} : "
+            "son domaine ne répond pas aux contrôles d’identité."
+        )
+    return (
+        f"Rien ne permet de vérifier que ce message vient bien de {domaine} : "
+        "son domaine ne publie pas ce qu’il faut pour cela."
+    )
+
+
+# Les indices qui disent qui se présente et qui écrit réellement, du plus sûr
+# au moins sûr. Le premier trouvé fait la carte.
+_IDENTITY_CARD_CODES = (
+    "IDENTITY_CLAIMED_ORGANISATION_REFUTED",
+    "IDENTITY_BRAND_MISMATCH",
+    "IDENTITY_COUSIN_DOMAIN",
+    "IDENTITY_ASCII_LOOKALIKE",
+    "CORRELATION_BRAND_SPOOFING",
+    "IDENTITY_CLAIMED_ORGANISATION_UNRELATED",
+)
+
+
+def identity_card(rows: list[dict[str, object]]) -> dict[str, object] | None:
+    """Qui se présente, d'où le message est parti, d'où l'organisation écrit.
+
+    Trois lignes valent mieux qu'une phrase pour qui ne lit pas les adresses :
+    le nom annoncé, le domaine qui a réellement écrit, et celui qu'on
+    attendait. Rien n'est inventé : la carte ne se fait que sur un indice
+    d'identité observé, avec ses faits. Sans indice, pas de carte.
+    """
+    for code in _IDENTITY_CARD_CODES:
+        for row in rows:
+            if str(row.get("clue_code") or "") != code:
+                continue
+            facts = _as_dict(row.get("facts"))
+            nom = str(facts.get("claimed_organisation") or "").strip()
+            if not nom and facts.get("brand"):
+                nom = _nom_de_marque(facts.get("brand"))
+            apex = str(facts.get("from_apex") or "").strip()
+            if not nom or not apex:
+                continue
+            domaine = str(facts.get("from_domain") or "").strip() or apex
+            return {
+                "claimed": nom,
+                "from_domain": domaine,
+                "from_apex": apex,
+                "official": [str(value) for value in facts.get("official_apexes") or []][:2],
+            }
+    return None
+
+
+def identity_lines(card: object) -> list[str]:
+    """La carte en trois lignes de texte, pour l'avis sans mise en forme.
+
+    Une carte relue depuis la base peut être incomplète, et ce texte sert
+    jusque dans le dernier repli de la livraison, où lever une erreur ferait
+    perdre plus qu'une ligne. Sans nom ou sans domaine, il n'y a rien à écrire.
+    """
+    if not isinstance(card, dict):
+        return []
+    nom = str(card.get("claimed") or "").strip()
+    domaine = str(card.get("from_domain") or card.get("from_apex") or "").strip()
+    if not nom or not domaine:
+        return []
+    lignes = [f"Se présente comme : {nom}", f"Écrit depuis : {domaine}"]
+    officiels = [str(value) for value in card.get("official") or []]
+    if officiels:
+        lignes.append(f"{nom} écrit depuis : {' ou '.join(officiels)}")
+    return lignes
+
+
+def sender_addresses(
+    from_header: object, envelope_from: object, reply_to: object = None
+) -> list[str]:
+    """L'adresse que l'expéditeur affiche, et celle qu'il a réellement annoncée.
+
+    Le « De : » d'un message est déclaratif : son nom et son adresse s'écrivent
+    librement. L'adresse d'enveloppe est celle que le serveur d'envoi a donnée
+    pour lui-même, et l'adresse de réponse celle où ira une réponse. Les mettre
+    côte à côte est ce qui rend l'écart visible sans rien y connaître : un avis
+    qui ne recopie que le « De : » redit ce que l'expéditeur dit de lui-même.
+
+    L'enveloppe est toujours dite, même identique - son absence de la ligne
+    ferait croire qu'on ne l'a pas regardée. L'adresse de réponse ne paraît que
+    lorsqu'elle diffère, sinon elle n'apprend rien.
+    """
+    displayed = parseaddr(str(from_header or ""))[1]
+    envelope = parseaddr(str(envelope_from or ""))[1]
+    answer = parseaddr(str(reply_to or ""))[1]
+    lignes = []
+    differente = bool(displayed) and bool(envelope) and (
+        envelope.casefold() != displayed.casefold()
+    )
+    libelle = "Adresse d’enveloppe différente" if differente else "Adresse d’enveloppe"
+    lignes.append(f"{libelle} : {envelope or '(non disponible)'}")
+    if displayed and answer and answer.casefold() != displayed.casefold():
+        lignes.append(f"Adresse de réponse différente : {answer}")
+    return lignes
+
+
+def sender_lines(
+    from_header: object, envelope_from: object, reply_to: object = None
+) -> list[str]:
+    """Ce que l'expéditeur affiche, puis ce que son serveur a annoncé.
+
+    Les avis unitaires (douteux, indésirable) posent les deux adresses l'une
+    sous l'autre : l'affichée se recopie librement, l'enveloppe non. Le nom
+    affiché passe devant, parce que c'est lui que l'œil lit dans la boîte.
+    """
+    nom, affichee = parseaddr(str(from_header or ""))
+    lignes = [f"Nom affiché : {nom}"] if nom.strip() else []
+    lignes.append(f"Adresse affichée : {affichee or '(non disponible)'}")
+    return lignes + sender_addresses(from_header, envelope_from, reply_to)
+
+
+def gap_lines(card: object, gap: object) -> list[str]:
+    """L'écart entre l'annoncé et le réel, en lignes de texte brut.
+
+    Le même contenu et le même vocabulaire que l'encart de l'avis : lire la
+    version texte et la version mise en forme ne doit pas demander de traduire
+    « se présente comme » en « annoncé ».
+    """
+    lignes: list[str] = []
+    if isinstance(card, dict) and card.get("claimed") and card.get("from_apex"):
+        lignes.append(f"Annoncé : {card['claimed']}")
+        lignes.append(
+            f"Écrit depuis : {card.get('from_domain') or card['from_apex']}"
+        )
+        officiels = [str(value) for value in card.get("official") or []]
+        if officiels:
+            lignes.append(f"{card['claimed']} écrit depuis : {' ou '.join(officiels)}")
+    if isinstance(gap, dict) and gap.get("displayed"):
+        lignes.append(f"Affiché : {gap['displayed']}")
+        if gap.get("real"):
+            lignes.append(f"Réel : {gap['real']}")
+        if gap.get("reply_to"):
+            lignes.append(f"Réponse : {gap['reply_to']}")
+    return lignes
+
+
+def sender_gap(
+    from_header: object, envelope_from: object, reply_to: object = None
+) -> dict[str, str | None] | None:
+    """L'écart entre l'adresse que l'expéditeur affiche et celle qu'il a donnée.
+
+    Le « De : » d'un message est déclaratif ; l'adresse d'enveloppe est celle
+    que le serveur d'envoi a annoncée pour lui-même, et l'adresse de réponse
+    celle où partira une réponse. Quand elles coïncident, les répéter n'apprend
+    rien : la carte ne se fait que sur un écart réel, et c'est la comparaison
+    des deux lignes - pas une phrase - qui montre l'usurpation.
+    """
+    displayed = parseaddr(str(from_header or ""))[1]
+    envelope = parseaddr(str(envelope_from or ""))[1]
+    answer = parseaddr(str(reply_to or ""))[1]
+    if not displayed:
+        return None
+    reel = envelope if envelope and envelope.casefold() != displayed.casefold() else None
+    reponse = answer if answer and answer.casefold() != displayed.casefold() else None
+    if not reel and not reponse:
+        return None
+    return {"displayed": displayed, "real": reel, "reply_to": reponse}
+
+
+# Trois niveaux, pas un score : un chiffre invite à négocier le chiffre, là où
+# un mot et une couleur se lisent d'un coup d'œil, sur un téléphone, sans rien
+# connaître au sujet.
+_NIVEAUX = {
+    "danger": ("DANGEREUX", "#b91c1c"),
+    "doute": ("DOUTEUX", "#b45309"),
+    "sain": ("SAIN", "#15803d"),
+}
+
+
+def confidence_badge(classification: object, gaps: int = 0) -> dict[str, str]:
+    """L'indice de confiance : un niveau, un mot, une couleur, une icône.
+
+    Il remplace la motivation recopiée, la technique nommée et la liste des
+    vérifications inabouties : trois blocs qui disaient à trois endroits ce
+    qu'un lecteur voulait savoir en une ligne - dois-je m'en méfier.
+    """
+    verdict = str(classification or "").strip().casefold()
+    if verdict == "dangerous":
+        level = "danger"
+    elif verdict == "legitimate":
+        level = "sain"
+    else:
+        level = "doute"
+    word, color = _NIVEAUX[level]
+    count = max(int(gaps or 0), 0)
+    if not count:
+        detail = "aucun écart relevé"
+    else:
+        detail = f"{count} écart{'s' if count > 1 else ''} relevé{'s' if count > 1 else ''}"
+    return {
+        "level": level,
+        "word": word,
+        "color": color,
+        "detail": detail,
+        "cid": f"sm-indice-{level}",
+    }
+
+
+def _dit_les_identites(facts: dict) -> str:
+    """Les adresses constatées, sans inventer une identité usurpée."""
+    identity = facts.get("identity")
+    identity = identity if isinstance(identity, dict) else {}
+    claimed_name = str(identity.get("claimed_name") or "").strip()
+    displayed = str(identity.get("displayed_email") or "").strip()
+    technical = str(identity.get("technical_email") or "").strip()
+    reply_to = str(identity.get("reply_to_email") or "").strip()
+    parts = []
+    if claimed_name:
+        parts.append(f"identité annoncée : {claimed_name}")
+    if displayed:
+        parts.append(f"adresse affichée : {displayed}")
+    if technical:
+        parts.append(f"adresse technique : {technical}")
+    if reply_to and reply_to.casefold() not in {
+        displayed.casefold(),
+        technical.casefold(),
+    }:
+        parts.append(f"adresse de réponse : {reply_to}")
+    return ("Identités constatées : " + " ; ".join(parts) + ".") if parts else ""
+
+
+def _extrait(value: object, limite: int) -> str:
+    texte = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(texte) <= limite:
+        return texte
+    return texte[: limite - 1].rstrip(" ,;:-") + "…"
+
+
+def _dit_l_activite_comparee(facts: dict) -> str:
+    """Qui écrit, quel métier il publie et quel propos est comparé."""
+    activity = facts.get("activity")
+    activity = activity if isinstance(activity, dict) else facts
+    identity = facts.get("identity")
+    identity = identity if isinstance(identity, dict) else {}
+    name = str(
+        activity.get("claimed_name") or identity.get("claimed_name") or ""
+    ).strip()
+    address = str(identity.get("displayed_email") or "").strip()
+    apex = str(activity.get("sender_apex") or "").strip()
+    published = _extrait(activity.get("published_activity"), 180)
+    subject = _extrait(activity.get("message_subject"), 140)
+    actor = name or address or apex
+    if actor and address and address.casefold() != actor.casefold():
+        actor += f" ({address})"
+    parts = []
+    if published:
+        source = f" sur {apex}" if apex else ""
+        owner = f" par {actor}" if actor else ""
+        parts.append(f"Activité publiée{owner}{source} : « {published} ».")
+    elif actor and not identity:
+        parts.append(f"Expéditeur observé : {actor}.")
+    if subject:
+        parts.append(f"Objet comparé : « {subject} ».")
+    identities = _dit_les_identites(facts)
+    if identities:
+        parts.append(identities)
+    return " ".join(parts)
 
 
 # Ce qu'un grief doit dire en plus de lui-même, article par article. La phrase
 # toute faite nomme le grief ; celle-ci le rend vérifiable par le lecteur, qui
 # n'a plus à croire sur parole que le domaine n'est pas le bon.
 _PRECISIONS = {
+    "AUTH_DMARC_PASS": _dit_l_adresse_authentique,
     "IDENTITY_BRAND_MISMATCH": _dit_la_marque,
-    "IDENTITY_COUSIN_DOMAIN": _dit_la_marque,
+    "IDENTITY_COUSIN_DOMAIN": _dit_le_domaine_sosie,
     "IDENTITY_ASCII_LOOKALIKE": _dit_la_marque,
+    "IDENTITY_DISPLAY_NAME_DISGUISED": _dit_le_deguisement,
     "IDENTITY_CLAIMED_ORGANISATION_REFUTED": _dit_l_organisation,
+    "IDENTITY_CLAIMED_ORGANISATION_UNRELATED": _dit_l_organisation,
+    "AUTH_DMARC_INCONCLUSIVE": _dit_l_identite_invérifiable,
+    "AUTH_SPF_INCONCLUSIVE": _dit_l_identite_invérifiable,
+    "AUTH_DKIM_INCONCLUSIVE": _dit_l_identite_invérifiable,
+    "SENDER_ACTIVITY_INCOHERENT": _dit_l_activite_comparee,
+    "SENDER_ACTIVITY_COHERENT": _dit_l_activite_comparee,
+    "CORRELATION_COMPROMISED_SENDER": _dit_l_activite_comparee,
+    "CORRELATION_SPOOFED_UNRELATED_SENDER": _dit_l_activite_comparee,
 }
 
 
@@ -296,9 +675,16 @@ _PRECISIONS = {
 # seconde en mieux. Elles la remplacent donc.
 _AUTONOMES = frozenset(
     {
+        "AUTH_DMARC_PASS",
         "IDENTITY_BRAND_MISMATCH",
         "IDENTITY_COUSIN_DOMAIN",
         "IDENTITY_ASCII_LOOKALIKE",
+        "IDENTITY_DISPLAY_NAME_DISGUISED",
+        "IDENTITY_CLAIMED_ORGANISATION_REFUTED",
+        "IDENTITY_CLAIMED_ORGANISATION_UNRELATED",
+        "AUTH_DMARC_INCONCLUSIVE",
+        "AUTH_SPF_INCONCLUSIVE",
+        "AUTH_DKIM_INCONCLUSIVE",
     }
 )
 
@@ -336,6 +722,9 @@ def plain_clue(
     """
     if clue_code in _OPERATIONAL:
         return None
+    if _as_dict(facts).get("text_scope") == "quoted_or_combined":
+        known = _PLAIN.get(clue_code) or statement
+        return "Dans le texte cité ou mêlé à la réponse : " + known[:1].lower() + known[1:]
     known = _PLAIN.get(clue_code)
     if known:
         precision = _precision(clue_code, facts)
@@ -473,11 +862,30 @@ def short_conclusion(
     return " ".join(retenues).strip()
 
 
+# Les échecs que le hook d'authentification émet réellement : une signature
+# d'un autre domaine (AUTH_DKIM_UNALIGNED) en fait partie, un contrôle muet
+# à côté n'apprend rien de plus.
+_AUTH_FAILED = {"AUTH_DMARC_FAIL", "AUTH_SPF_FAIL", "AUTH_DKIM_FAIL", "AUTH_DKIM_UNALIGNED"}
+_AUTH_MUTE = {"AUTH_DMARC_INCONCLUSIVE", "AUTH_SPF_INCONCLUSIVE", "AUTH_DKIM_INCONCLUSIVE"}
+
+
+def _sans_controles_muets(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Quand un contrôle a échoué, dire qu'un autre n'a pas répondu n'ajoute rien.
+
+    « Le domaine ne le reconnaît pas » puis « rien ne permet de vérifier » se
+    lisaient comme deux griefs, et presque comme une contradiction.
+    """
+    codes = {str(row.get("clue_code") or "") for row in rows}
+    if not codes & _AUTH_FAILED:
+        return rows
+    return [row for row in rows if str(row.get("clue_code") or "") not in _AUTH_MUTE]
+
+
 def plain_points(rows: list[dict[str, object]], limit: int) -> list[str]:
     """Retient les indices les plus parlants, sans répéter la même idée."""
     seen: set[str] = set()
     points: list[str] = []
-    for row in rows:
+    for row in _sans_controles_muets(rows):
         sentence = plain_clue(
             str(row.get("clue_code") or ""),
             str(row.get("statement") or ""),
@@ -492,24 +900,228 @@ def plain_points(rows: list[dict[str, object]], limit: int) -> list[str]:
     return points
 
 
+# Le vocabulaire des avis : le grief, en une phrase qui se lit sans effort.
+# Ces formules-là remplacent la phrase toute faite quand celle-ci dit la même
+# chose en deux temps, ou quand plusieurs indices désignent un même reproche :
+# le lecteur d'un avis n'a pas à distinguer trois constats qui l'inquiètent
+# pour la même raison.
+_SHORT = {
+    "AUTH_DMARC_FAIL": "Usurpation possible : le domaine affiché ne reconnaît pas cet envoi.",
+    "AUTH_SPF_SOFTFAIL": "Envoi depuis un serveur que le domaine affiché n’a pas déclaré.",
+    "AUTH_SPF_FAIL": "Envoi depuis un serveur que le domaine affiché refuse.",
+    "AUTH_DKIM_INCONCLUSIVE": "Identité de l’expéditeur non vérifiable.",
+    "AUTH_DMARC_INCONCLUSIVE": "Identité de l’expéditeur non vérifiable.",
+    "AUTH_SPF_INCONCLUSIVE": "Identité de l’expéditeur non vérifiable.",
+    "IDENTITY_CLAIMED_ORGANISATION_REFUTED": "Usurpation possible : domaine étranger à l’organisation annoncée.",
+    "IDENTITY_CLAIMED_ORGANISATION_UNRELATED": "Usurpation possible : domaine étranger à l’organisation annoncée.",
+    "IDENTITY_BRAND_MISMATCH": "Usurpation possible : domaine étranger à l’organisation annoncée.",
+    "CORRELATION_BRAND_SPOOFING": "Usurpation possible : domaine étranger à l’organisation annoncée.",
+    "IDENTITY_DISPLAY_NAME_DISGUISED": "Nom affiché déguisé avec des lettres sosies.",
+    "IDENTITY_COUSIN_DOMAIN": "Adresse d’envoi qui imite un domaine officiel par des caractères sosies.",
+    "CORRELATION_COUSIN_DOMAIN_APPROACH": "Domaine sosie, récent ou qui renvoie les réponses ailleurs.",
+    "CORRELATION_UNAUTHENTICATED_PHISHING_HEURISTIC": "Hameçonnage soupçonné par le filtre, expéditeur non authentifié.",
+    "CONTENT_URGENCY": "Pression pour agir vite.",
+    "CONTENT_MIXED_SCRIPT": "Texte déguisé avec des lettres sosies.",
+    "CONTENT_INTRAWORD_NOISE": "Mots coupés à l’intérieur par des signes parasites.",
+    "CORRELATION_DISGUISED_UNKNOWN_SENDER": "Mots altérés, texte caché ou lettres sosies, et expéditeur inconnu dont personne ne répond.",
+    "CONTENT_OBFUSCATION": "Texte encodé ou caché de façon inhabituelle.",
+    "RSPAMD_OBFUSCATION_SYMBOL": "Texte encodé ou caché de façon inhabituelle.",
+    "CORRELATION_COMPROMISED_SENDER": "Contenu sans rapport avec l’activité publiée ; compte détourné possible.",
+    "CORRELATION_SPOOFED_UNRELATED_SENDER": "Adresse non authentifiée, d’un domaine sans rapport avec le message.",
+    "URL_FAKE_HUMAN_VERIFICATION": "Lien vers une fausse vérification « êtes-vous humain ».",
+    "URL_OPAQUE_LANDING": "Lien d’action vers une page vide sans script.",
+    "CORRELATION_BRAND_TRANSACTION_LURE": "Fausse facture probable : paiement au nom d’une marque, envoyé par un autre expéditeur.",
+    "CORRELATION_OPAQUE_TRANSACTION_LURE": "Faux reçu probable : paiement annoncé, expéditeur inconnu, page d’arrivée vide sans script.",
+    "SENDER_ACTIVITY_INCOHERENT": "Contenu sans rapport avec l’activité publiée.",
+}
+
+# Le courrier déjà rangé dans les indésirables se lit comme une fiche, pas
+# comme une démonstration. Les mêmes preuves y deviennent des libellés courts.
+# Les autres surfaces gardent les phrases de ``_SHORT`` : elles posent encore
+# une question, là où cet avis annonce une décision déjà appliquée.
+_TELEGRAPHIQUE = {
+    "AUTH_DMARC_FAIL": "Authentification : échec",
+    "AUTH_SPF_SOFTFAIL": "Serveur d’envoi : non déclaré",
+    "AUTH_SPF_FAIL": "Serveur d’envoi : refusé par le domaine",
+    "AUTH_DKIM_FAIL": "Signature de l’expéditeur : échec",
+    "AUTH_DKIM_UNALIGNED": "Signature de l’expéditeur : autre domaine",
+    "AUTH_DKIM_INCONCLUSIVE": "Signature de l’expéditeur : absente",
+    "AUTH_DMARC_INCONCLUSIVE": "Authentification : non vérifiable",
+    "AUTH_SPF_INCONCLUSIVE": "Serveur d’envoi : non vérifiable",
+    "IDENTITY_CLAIMED_ORGANISATION_REFUTED": "Identité : domaine sans rapport",
+    "IDENTITY_CLAIMED_ORGANISATION_UNRELATED": "Identité : domaine sans rapport",
+    "IDENTITY_BRAND_MISMATCH": "Identité : domaine sans rapport",
+    "CORRELATION_BRAND_SPOOFING": "Identité : usurpation probable",
+    "IDENTITY_DISPLAY_NAME_DISGUISED": "Identité : nom déguisé par des sosies",
+    "IDENTITY_COUSIN_DOMAIN": "Identité : domaine sosie d’un domaine officiel",
+    "CORRELATION_COUSIN_DOMAIN_APPROACH": "Identité : domaine sosie, récent ou réponses détournées",
+    "CORRELATION_UNAUTHENTICATED_PHISHING_HEURISTIC": "Filtre antispam : hameçonnage soupçonné, expéditeur non authentifié",
+    "CONTENT_URGENCY": "Contenu : pression pour agir vite",
+    "CONTENT_MIXED_SCRIPT": "Contenu : lettres sosies",
+    "CONTENT_INTRAWORD_NOISE": "Contenu : mots coupés par des signes",
+    "CORRELATION_DISGUISED_UNKNOWN_SENDER": "Déguisement : inconnu sans répondant",
+    "CONTENT_OBFUSCATION": "Contenu : encodage inhabituel",
+    "RSPAMD_OBFUSCATION_SYMBOL": "Contenu : encodage inhabituel",
+    "CORRELATION_COMPROMISED_SENDER": "Activité : sans rapport avec l’expéditeur",
+    "CORRELATION_SPOOFED_UNRELATED_SENDER": "Identité : adresse empruntée, métier sans rapport",
+    "URL_FAKE_HUMAN_VERIFICATION": "Lien : fausse vérification anti-robot",
+    "URL_OPAQUE_LANDING": "Lien : page d’arrivée vide sans script",
+    "CORRELATION_BRAND_TRANSACTION_LURE": "Fausse facture : marque empruntée, premier contact",
+    "CORRELATION_OPAQUE_TRANSACTION_LURE": "Faux reçu : paiement annoncé, page d’arrivée vide",
+    "SENDER_ACTIVITY_INCOHERENT": "Activité : sans rapport avec l’expéditeur",
+    "NATURE_UNVERIFIABLE_PROMOTIONAL_CLAIMS": "Promesses : non vérifiables",
+    "NATURE_SOLICITATION_WITHOUT_OPT_OUT": "Désinscription : absente",
+    "HEADERS_RECIPIENT_NOT_ADDRESSED": "Destinataire : copie cachée",
+}
+
+# Les indices qui disent tous « ce message se fait passer pour quelqu'un
+# d'autre ». Le plus fort suffit : les autres reformulent le même reproche.
+_USURPATION = frozenset(_IDENTITY_CARD_CODES) | {
+    "CORRELATION_COUSIN_DOMAIN_APPROACH",
+    "IDENTITY_DISPLAY_NAME_DISGUISED",
+}
+# L'adresse empruntée sans marque : le faisceau dit à la fois le défaut
+# d'authentification et le métier sans rapport. Il n'entre pas dans la carte
+# d'identité, qui compare un nom annoncé à ses domaines officiels.
+_ADRESSE_EMPRUNTEE = frozenset({"CORRELATION_SPOOFED_UNRELATED_SENDER"})
+
+# Un constat que son voisin dit déjà, en plus fort : le retenir allongerait la
+# liste sans rien apprendre. « Le domaine ne reconnaît pas cet envoi » couvre
+# « rien ne permet de vérifier » et le serveur mal déclaré ; « compte détourné
+# possible » couvre « contenu sans rapport avec l'activité ». Et quand une
+# usurpation est établie, l'échec d'authentification n'est plus un grief à
+# part : c'est par quoi elle se voit. Trois lignes disaient « ce n'est pas eux »
+# de trois façons ; une seule le dit, la plus explicite.
+_ABSORBES = {
+    "AUTH_SPF_SOFTFAIL": _AUTH_FAILED,
+    "AUTH_DKIM_INCONCLUSIVE": _AUTH_FAILED,
+    "AUTH_DMARC_INCONCLUSIVE": _AUTH_FAILED,
+    "AUTH_SPF_INCONCLUSIVE": _AUTH_FAILED,
+    "AUTH_DMARC_FAIL": _USURPATION | _ADRESSE_EMPRUNTEE,
+    "AUTH_SPF_FAIL": _USURPATION | _ADRESSE_EMPRUNTEE,
+    "AUTH_DKIM_FAIL": _USURPATION | _ADRESSE_EMPRUNTEE,
+    "AUTH_DKIM_UNALIGNED": _USURPATION | _ADRESSE_EMPRUNTEE,
+    "CORRELATION_BRAND_FIRST_CONTACT": _USURPATION,
+    "SENDER_ACTIVITY_INCOHERENT": frozenset(
+        {"CORRELATION_COMPROMISED_SENDER"} | _ADRESSE_EMPRUNTEE
+    ),
+    # Le faisceau dit le soupçon du filtre et le défaut d'identité à la fois.
+    "RSPAMD_PHISHING_HEURISTIC": frozenset(
+        {"CORRELATION_UNAUTHENTICATED_PHISHING_HEURISTIC"}
+    ),
+}
+
+
+def _une_phrase(value: str | None) -> str:
+    """La première phrase, seule : le grief sans ce qui le fonde."""
+    phrases = _sentences(value or "")
+    return phrases[0].strip() if phrases else ""
+
+
+def _en_telegramme(value: str) -> str:
+    """Donne une étiquette à une phrase qui n'a pas de libellé dédié."""
+    texte = value.strip().rstrip(". ")
+    if not texte:
+        return ""
+    for debut, etiquette in (
+        ("Le message ", "Message : "),
+        ("L’envoi ", "Envoi : "),
+        ("L'expéditeur ", "Expéditeur : "),
+        ("La sollicitation ", "Sollicitation : "),
+    ):
+        if texte.startswith(debut):
+            return etiquette + texte[len(debut) :]
+    return "Analyse : " + texte[:1].lower() + texte[1:]
+
+
+def short_points(
+    rows: list[dict[str, object]],
+    limit: int,
+    *,
+    deja_dits: frozenset[str] = frozenset(),
+    telegraphique: bool = False,
+) -> list[str]:
+    """Les mêmes indices que `plain_points`, mais un grief par ligne.
+
+    Un avis se lit sur un téléphone, entre deux choses. Le fondement d'un
+    grief - la page lue, l'objet comparé, les identités relevées - vaut
+    quand on enquête ; recopié dans la puce, il donnait dix lignes où le
+    reproche se perdait. Il reste au dossier, où il se consulte.
+
+    `deja_dits` désigne les indices qu'un autre bloc de l'avis montre déjà :
+    ils ne font pas de puce, mais comptent toujours pour l'absorption - sinon
+    retirer le plus fort ferait remonter celui qu'il couvrait.
+    """
+    codes = {str(row.get("clue_code") or "") for row in rows}
+    points: list[str] = []
+    for row in _sans_controles_muets(rows):
+        code = str(row.get("clue_code") or "")
+        if code in deja_dits:
+            continue
+        if _ABSORBES.get(code, frozenset()) & codes:
+            continue
+        # Sans les faits, `plain_clue` rend la phrase toute faite, et rien
+        # d'autre : c'est exactement le grief seul.
+        sentence = (
+            _TELEGRAPHIQUE.get(code) if telegraphique else _SHORT.get(code)
+        )
+        if _as_dict(row.get("facts")).get("text_scope") == "quoted_or_combined":
+            sentence = "Texte cité ou mêlé à la réponse : " + (
+                sentence or _une_phrase(_PLAIN.get(code) or str(row.get("statement") or ""))
+            )
+        if not sentence:
+            sentence = _une_phrase(
+                plain_clue(code, str(row.get("statement") or ""))
+            )
+            if telegraphique:
+                sentence = _en_telegramme(sentence)
+        if not sentence or sentence in points:
+            continue
+        points.append(sentence)
+        if len(points) >= limit:
+            break
+    return points
+
+
 def classification_reasons(
-    adverse_rows: list[dict[str, object]], rationale: object, limit: int = 5
+    adverse_rows: list[dict[str, object]],
+    rationale: object,
+    limit: int = 3,
+    *,
+    carte: object = None,
+    telegraphique: bool = False,
 ) -> list[str]:
     """Pourquoi un message est classé : ses indices adverses, sinon son juge.
 
     Un classement appris ou jugé sans indice matériel laissait l'avis muet
     (« Un faisceau d'indices concordants ») alors que la motivation du verdict
     existait en base. Elle vaut mieux qu'une formule creuse.
+
+    Quand la carte d'identité est dessinée, elle montre l'usurpation en trois
+    lignes que l'œil compare : la redire en toutes lettres juste dessous ne
+    fait pas un second grief, seulement une seconde lecture du même. Toute la
+    famille de l'usurpation se tait alors - le domaine sosie comme le domaine
+    étranger, la carte les montre pareillement - et l'avis n'a pas à se
+    rabattre sur la motivation du juge, puisque la carte explique déjà.
     """
-    points = plain_points(adverse_rows, limit)
-    if points:
+    points = short_points(
+        adverse_rows,
+        limit,
+        deja_dits=_USURPATION if carte else frozenset(),
+        telegraphique=telegraphique,
+    )
+    if points or carte:
         return points
-    return plain_points([{"clue_code": "", "statement": str(rationale or "")}], 1)
+    return short_points(
+        [{"clue_code": "", "statement": str(rationale or "")}],
+        1,
+        telegraphique=telegraphique,
+    )
 
 
 def plain_limits(rows: list[dict[str, object]], limit: int) -> list[str]:
     """Ce qui n'a pas pu être vérifié, et rien d'autre."""
-    return plain_points(
+    return short_points(
         [
             row
             for row in rows

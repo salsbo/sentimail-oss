@@ -31,6 +31,13 @@ class Settings:
     deepseek_verdict_model: str
     deepseek_assistant_model: str
     deepseek_timeout_seconds: int
+    # Durée totale d'un appel au fournisseur distant. Le délai httpx borne
+    # chaque lecture, pas l'appel : un serveur qui envoie un octet toutes les
+    # 180 s tient la ligne indéfiniment (901 s le 14 septembre 2026).
+    remote_llm_deadline_seconds: int
+    # Le palier économique répond en 7 s au 95e centile : un Flash suspendu
+    # ne doit pas coûter le budget de Pro avant le repli.
+    economy_llm_deadline_seconds: int
     verdict_interval_seconds: int
     verdict_not_before: str | None
     decision_mode: bool
@@ -68,12 +75,26 @@ class Settings:
     digest_enabled: bool
     digest_interval_hours: int
     digest_minimum_cases: int
+    digest_quiet_hours: int
     local_llm_url: str
     caretaker_interval_hours: int
     console_url: str
     knowledge_path: str
     knowledge_embedding_url: str
     knowledge_embedding_model: str
+    assistant_question_deadline_seconds: int = 120
+    deep_analysis_deadline_seconds: int = 240
+    url_analysis_deadline_seconds: int = 90
+    url_analysis_concurrency: int = 2
+    deep_hook_deadline_seconds: int = 45
+    investigator_llm_attempt_seconds: int = 15
+    gemini_decisions_enabled: bool = False
+    gemini_decisions_url: str = (
+        "https://generativelanguage.googleapis.com/v1beta/decisions"
+    )
+    gemini_decisions_model: str = "gemini-decision-1"
+    gemini_decisions_timeout_seconds: float = 10.0
+    gemini_api_key_file: str | None = None
 
 
 def _secret(name: str) -> str:
@@ -117,6 +138,15 @@ def _operators(brut: str) -> tuple[str, tuple[str, ...]]:
 
 def load_settings() -> Settings:
     return Settings(
+        assistant_question_deadline_seconds=max(1, int(os.environ.get("ASSISTANT_QUESTION_DEADLINE_SECONDS", "120"))),
+        deep_analysis_deadline_seconds=max(1, int(os.environ.get("DEEP_ANALYSIS_DEADLINE_SECONDS", "240"))),
+        url_analysis_deadline_seconds=max(1, int(os.environ.get("URL_ANALYSIS_DEADLINE_SECONDS", "90"))),
+        url_analysis_concurrency=max(1, min(4, int(os.environ.get("URL_ANALYSIS_CONCURRENCY", "2")))),
+        deep_hook_deadline_seconds=max(1, int(os.environ.get("DEEP_HOOK_DEADLINE_SECONDS", "45"))),
+        # Relevé du 12 novembre 2026 sur `llm_attempt_events` : 4 898 appels
+        # d'enquêteurs, 7 réponses au-delà de 15 s (29 s au plus), 89 appels
+        # restés sans réponse jusqu'au délai de l'enquêteur.
+        investigator_llm_attempt_seconds=max(1, int(os.environ.get("INVESTIGATOR_LLM_ATTEMPT_SECONDS", "15"))),
         database_url=_database_url(),
         smtp_host=os.environ.get("SMTP_HOST", "0.0.0.0"),
         smtp_port=int(os.environ.get("SMTP_PORT", "2525")),
@@ -180,6 +210,15 @@ def load_settings() -> Settings:
         deepseek_timeout_seconds=int(
             os.environ.get("DEEPSEEK_TIMEOUT_SECONDS", "180")
         ),
+        # Sur 30 jours : Pro p95 15 s, maximum 26 s ; Flash p95 7 s. Le budget
+        # laisse une marge large et reste loin du seuil de retard de dix
+        # minutes, même avec Flash puis Pro en cascade.
+        remote_llm_deadline_seconds=int(
+            os.environ.get("REMOTE_LLM_DEADLINE_SECONDS", "120")
+        ),
+        economy_llm_deadline_seconds=int(
+            os.environ.get("ECONOMY_LLM_DEADLINE_SECONDS", "30")
+        ),
         verdict_interval_seconds=int(
             os.environ.get("VERDICT_INTERVAL_SECONDS", "5")
         ),
@@ -202,7 +241,7 @@ def load_settings() -> Settings:
             "PROVIDER_SECRETS_DIR", "/run/sentinel-provider-secrets"
         ),
         anthropic_model=os.environ.get(
-            "ANTHROPIC_MODEL", "claude-sonnet-4-5"
+            "ANTHROPIC_MODEL", "claude-sonnet-5-5"
         ),
         openai_model=os.environ.get("OPENAI_MODEL", "gpt-5.4"),
         assistant_llm_hourly_limit=int(
@@ -258,7 +297,10 @@ def load_settings() -> Settings:
             os.environ.get("HOLD_LIFECYCLE_INTERVAL_SECONDS", "3600")
         ),
         raw_eml_key_file=os.environ.get("RAW_EML_KEY_FILE") or None,
-        digest_enabled=os.environ.get("DIGEST_ENABLED", "true").lower() == "true",
+        # Coupé par décision du mainteneur du 15 octobre 2026 : un courrier ne
+        # demande jamais une position sur plusieurs messages. Les relances
+        # partent une par dossier (hold_lifecycle.remind_stale_holds).
+        digest_enabled=os.environ.get("DIGEST_ENABLED", "false").lower() == "true",
         # Même moteur local que les embeddings : un seul point à joindre.
         local_llm_url=os.environ.get(
             "LOCAL_LLM_URL", os.environ.get("KNOWLEDGE_EMBEDDING_URL", "")
@@ -278,4 +320,23 @@ def load_settings() -> Settings:
         ),
         digest_interval_hours=int(os.environ.get("DIGEST_INTERVAL_HOURS", "24")),
         digest_minimum_cases=int(os.environ.get("DIGEST_MINIMUM_CASES", "2")),
+        # Le temps laissé à un avis unitaire avant que le récapitulatif ne le
+        # rappelle. Sans lui, un avis parti depuis un quart d'heure était
+        # redemandé : il n'avait pas été ignoré, il n'avait pas été ouvert.
+        digest_quiet_hours=int(os.environ.get("DIGEST_QUIET_HOURS", "12")),
+        gemini_decisions_enabled=os.environ.get(
+            "GEMINI_DECISIONS_ENABLED", "false"
+        ).lower()
+        == "true",
+        gemini_decisions_url=os.environ.get(
+            "GEMINI_DECISIONS_URL",
+            "https://generativelanguage.googleapis.com/v1beta/decisions",
+        ),
+        gemini_decisions_model=os.environ.get(
+            "GEMINI_DECISIONS_MODEL", "gemini-decision-1"
+        ),
+        gemini_decisions_timeout_seconds=max(
+            1.0, float(os.environ.get("GEMINI_DECISIONS_TIMEOUT_SECONDS", "10.0"))
+        ),
+        gemini_api_key_file=os.environ.get("GEMINI_API_KEY_FILE") or None,
     )

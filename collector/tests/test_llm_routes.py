@@ -17,8 +17,7 @@ class RoleMappingTests(unittest.TestCase):
         self.assertEqual(_provider_role("conversation"), "conversation")
 
     def test_tout_le_reste_va_a_la_carte_verdict(self) -> None:
-        for role in ("verdict", "requested_action", "identity_claim",
-                     "activity_coherence", None):
+        for role in ("verdict", "requested_action", "sender_relation", None):
             self.assertEqual(_provider_role(role), "verdict")
 
 

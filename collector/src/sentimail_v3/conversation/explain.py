@@ -18,6 +18,12 @@ from sentimail_v3.conversation.conversation import clue_illustration
 
 
 async def dossier(pool: asyncpg.Pool[Any], selector: str) -> str:
+    escaped_selector = (
+        selector.casefold()
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
     message = await pool.fetchrow(
         """
         SELECT m.id::text AS id, m.subject, m.from_header, m.envelope_from,
@@ -26,11 +32,11 @@ async def dossier(pool: asyncpg.Pool[Any], selector: str) -> str:
                i.favorable_points, i.adverse_points
         FROM messages m
         LEFT JOIN investigations i ON i.message_id=m.id
-        WHERE m.id::text LIKE $1 || '%'
+        WHERE m.id::text LIKE $1 || '%' ESCAPE '\\'
         ORDER BY i.started_at DESC NULLS LAST
         LIMIT 1
         """,
-        selector.casefold(),
+        escaped_selector,
     )
     if message is None:
         return f"Aucun message ne correspond à « {selector} »."

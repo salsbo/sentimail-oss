@@ -11,11 +11,13 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import asyncpg
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import (
     HTMLResponse,
@@ -26,24 +28,35 @@ from starlette.responses import (
 )
 from starlette.routing import Route
 
-from . import pages, queries
+from . import classifier, classifier_review, pages, queries
 from .config import (
     ConfigurationInvalide,
     Settings,
     identity_environment_defaults,
     load_settings,
 )
-from .http_guard import OrigineRefusee, check_same_origin, client_ip, parse_form
+from .http_guard import (
+    CorpsTropGrand,
+    MAX_FORM_BODY_BYTES,
+    OrigineRefusee,
+    check_content_length,
+    check_same_origin,
+    check_trusted_host,
+    client_ip,
+    parse_form,
+)
 from .naming import (
     SaisieInvalide,
     clamp_limit,
     normalize_address_list,
     normalize_admin_email,
     normalize_base_url,
+    normalize_client_name,
     normalize_email_address,
     normalize_fqdn,
     normalize_hostile_network,
     normalize_identifier,
+    normalize_local_role,
     normalize_model_name,
     normalize_preset,
     normalize_quota,
@@ -84,7 +97,8 @@ async def accueil(request: Request) -> Response:
 
 async def domaines(request: Request) -> Response:
     lignes = await _fetch(request, queries.list_domains())
-    corps = pages.page_domaines(lignes)
+    clients = await _fetch(request, queries.list_clients())
+    corps = pages.page_domaines(lignes, clients)
     return HTMLResponse(pages.document("Domaines", "/domaines", corps, _avis(request)))
 
 
@@ -168,6 +182,46 @@ async def apprentissage(request: Request) -> Response:
     )
 
 
+async def classifieur(request: Request) -> Response:
+    state = await _fetch(request, classifier.status_query())
+    activity = await _fetch(request, classifier.activity_query())
+    reasons = await _fetch(request, classifier.reasons_query())
+    body = classifier.page(state[0] if state else {}, activity[0] if activity else {}, reasons)
+    lifecycle = await _fetch(request, classifier_review.lifecycle_query())
+    body += classifier_review.lifecycle_page(lifecycle[0] if lifecycle else {})
+    return HTMLResponse(pages.document("Classifieur local", "/classifieur", body))
+
+
+async def classifier_reviews(request: Request) -> Response:
+    rows = await _fetch(request, classifier_review.queue_query())
+    return HTMLResponse(pages.document("Revue de sécurité", "/classifieur", classifier_review.queue_page(rows)))
+
+
+async def classifier_review_detail(request: Request) -> Response:
+    identifier = request.path_params["identifier"]
+    rows = await _fetch(request, classifier_review.sample_query(identifier))
+    if not rows:
+        return PlainTextResponse("Revue introuvable", status_code=404)
+    if request.method == "POST":
+        fields, caller = await _lire_formulaire(request)
+        label = fields.get("label", "")
+        if label not in classifier_review.REASONS or fields.get("reviewed") != "yes":
+            return PlainTextResponse("Une qualification après examen est requise.", status_code=400)
+        if label == "legitimate" and classifier_review.review_content(rows[0])[1]:
+            return PlainTextResponse("Les pièces incomplètes ne permettent pas de confirmer un message légitime.", status_code=400)
+        async with request.app.state.pool.acquire() as connection, connection.transaction():
+            soumission = queries.submit_classifier_review(
+                identifier, label, classifier_review.REASONS[label], "admin:" + caller
+            )
+            changed = await connection.fetchval(soumission.sql, *soumission.params)
+            if changed is None:
+                return PlainTextResponse("Revue déjà soumise ou contenu expiré.", status_code=409)
+            await _tracer(connection, action="admin.classifier_review_submitted", target=str(identifier),
+                          appelant=caller, request=request, details={"label": label})
+        return RedirectResponse("/classifieur/revues", status_code=303)
+    return HTMLResponse(pages.document("Revue de sécurité", "/classifieur", classifier_review.sample_page(rows[0])))
+
+
 MAX_ECARTS = 200
 
 
@@ -239,7 +293,8 @@ async def aller(request: Request) -> Response:
 
 
 async def sante(request: Request) -> Response:
-    await request.app.state.pool.fetchval("SELECT 1")
+    requete = queries.health_check()
+    await request.app.state.pool.fetchval(requete.sql, *requete.params)
     return PlainTextResponse("ok")
 
 
@@ -253,10 +308,8 @@ async def sante_pipeline(request: Request) -> Response:
     réussi, 503 quand un message n'entre plus. Un état non encore mesuré n'est
     pas une panne - la sonde vient peut-être de démarrer.
     """
-    row = await request.app.state.pool.fetchrow(
-        "SELECT details, observed_at FROM operational_status "
-        "WHERE component='sentimail-v3'"
-    )
+    requete = queries.pipeline_health()
+    row = await request.app.state.pool.fetchrow(requete.sql, *requete.params)
     details = (row["details"] if row else None) or {}
     if isinstance(details, str):
         details = json.loads(details)
@@ -267,6 +320,45 @@ async def sante_pipeline(request: Request) -> Response:
         "observed_at": row["observed_at"].isoformat() if row else None,
     }
     return JSONResponse(body, status_code=503 if status == "down" else 200)
+
+
+# Un superviseur qui ne relève plus rien depuis ce délai est tenu pour muet :
+# son dernier « ok » ne dit plus rien du présent.
+SUPERVISEUR_MUET_APRES = timedelta(minutes=5)
+
+
+async def sante_superviseur(request: Request) -> Response:
+    """Le verdict du superviseur, sous la forme que la sonde centrale consomme.
+
+    `/sante/pipeline` ne passe en échec que si un message n'entre plus. Un
+    juge qui traîne, une file en retard, un avis non parti laissaient la sonde
+    de supervision verte : seule la lettre de MAIA portait l'alerte, et si le relais
+    de sortie tombe, personne ne la voit. Ici « ok » vaut vert ; tout autre
+    état vaut rouge avec ses causes. Toujours en 200 : la sonde `json_health`
+    ne lit le JSON que sous 400.
+    """
+    requete = queries.supervisor_health()
+    row = await request.app.state.pool.fetchrow(requete.sql, *requete.params)
+    if row is None:
+        return JSONResponse({"status": "unknown", "reasons": "aucun relevé du superviseur"})
+    details = row["details"] or {}
+    if isinstance(details, str):
+        details = json.loads(details)
+    observed_at = row["observed_at"]
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    silence = datetime.now(timezone.utc) - observed_at
+    if silence > SUPERVISEUR_MUET_APRES:
+        minutes = max(1, round(silence.total_seconds() / 60))
+        return JSONResponse(
+            {"status": "down", "reasons": f"superviseur muet depuis {minutes} min"}
+        )
+    status = str(row["status"])
+    body: dict[str, str] = {"status": status}
+    if status != "ok":
+        raisons = [str(code) for code in details.get("reasons") or []]
+        body["reasons"] = ", ".join(raisons) or "cause non précisée"
+    return JSONResponse(body)
 
 
 async def reglages(request: Request) -> Response:
@@ -317,11 +409,33 @@ async def reglages(request: Request) -> Response:
 # --- Modifications ----------------------------------------------------------
 
 
+async def _lire_corps_borne(
+    request: Request, max_bytes: int = MAX_FORM_BODY_BYTES
+) -> bytes:
+    """Lit le corps de la requête sans dépasser ``max_bytes``."""
+    check_content_length(request.headers, max_bytes)
+    stream = getattr(request, "stream", None)
+    if callable(stream):
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in stream():
+            total += len(chunk)
+            if total > max_bytes:
+                raise CorpsTropGrand("Le formulaire envoyé est trop volumineux.")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    corps = await request.body()
+    if len(corps) > max_bytes:
+        raise CorpsTropGrand("Le formulaire envoyé est trop volumineux.")
+    return corps
+
+
 async def _lire_formulaire(request: Request) -> tuple[dict[str, str], str]:
     """Vérifie l'origine, puis renvoie le formulaire et l'IP de l'appelant."""
     settings = _settings(request)
     check_same_origin(request.headers, settings.trusted_origins)
-    champs = parse_form(request.headers.get("content-type"), await request.body())
+    corps = await _lire_corps_borne(request)
+    champs = parse_form(request.headers.get("content-type"), corps)
     appelant = client_ip(
         request.client.host if request.client else None,
         request.headers,
@@ -353,12 +467,15 @@ async def ajouter_domaine(request: Request) -> Response:
     champs, appelant = await _lire_formulaire(request)
     fqdn = normalize_fqdn(champs.get("fqdn"))
     admin_email = normalize_admin_email(champs.get("admin_email"))
+    client_id = (
+        normalize_identifier(champs.get("client")) if champs.get("client") else None
+    )
 
     async with (
         request.app.state.pool.acquire() as connection,
         connection.transaction(),
     ):
-        insertion = queries.insert_domain(fqdn, admin_email)
+        insertion = queries.insert_domain(fqdn, admin_email, client_id)
         ligne = await connection.fetchrow(insertion.sql, *insertion.params)
         if ligne is None:
             return _retour("domaine_existant")
@@ -370,10 +487,59 @@ async def ajouter_domaine(request: Request) -> Response:
             target=fqdn,
             appelant=appelant,
             request=request,
-            details={"status": "pending", "admin_email": admin_email},
+            details={
+                "status": "pending",
+                "admin_email": admin_email,
+                "client_id": client_id,
+            },
         )
     logger.info("domaine ajouté fqdn=%s par=%s", fqdn, appelant)
     return _retour("domaine_ajoute")
+
+
+async def ajouter_client(request: Request) -> Response:
+    champs, appelant = await _lire_formulaire(request)
+    name = normalize_client_name(champs.get("name"))
+    async with (
+        request.app.state.pool.acquire() as connection,
+        connection.transaction(),
+    ):
+        insertion = queries.insert_client(name)
+        ligne = await connection.fetchrow(insertion.sql, *insertion.params)
+        if ligne is None:
+            return _retour("client_existant")
+        await _tracer(
+            connection,
+            action="admin.client_added",
+            target=name,
+            appelant=appelant,
+            request=request,
+            details={"client_id": str(ligne["id"])},
+        )
+    return _retour("client_ajoute")
+
+
+async def rattacher_domaine_client(request: Request) -> Response:
+    champs, appelant = await _lire_formulaire(request)
+    domain_id = normalize_identifier(champs.get("domaine"))
+    client_id = normalize_identifier(champs.get("client"))
+    async with (
+        request.app.state.pool.acquire() as connection,
+        connection.transaction(),
+    ):
+        mutation = queries.assign_domain_client(domain_id, client_id)
+        ligne = await connection.fetchrow(mutation.sql, *mutation.params)
+        if ligne is None:
+            return _retour("domaine_inconnu")
+        await _tracer(
+            connection,
+            action="admin.domain_client_assigned",
+            target=str(ligne["fqdn"]),
+            appelant=appelant,
+            request=request,
+            details={"domain_id": domain_id, "client_id": client_id},
+        )
+    return _retour("domaine_rattache")
 
 
 async def activer_domaine(request: Request) -> Response:
@@ -541,7 +707,7 @@ async def enregistrer_identite(request: Request) -> Response:
 
 async def enregistrer_modele(request: Request) -> Response:
     champs, appelant = await _lire_formulaire(request)
-    role = normalize_role(champs.get("role"))
+    role = normalize_local_role(champs.get("role"))
     modele = normalize_model_name(champs.get("modele"))
     actif = str(champs.get("etat") or "").strip() == "local"
     async with (
@@ -549,7 +715,7 @@ async def enregistrer_modele(request: Request) -> Response:
         connection.transaction(),
     ):
         mutation = queries.set_local_routing(role, modele, actif)
-        ligne = await connection.fetchrow(mutation.sql, *mutation.params)
+        await connection.fetchrow(mutation.sql, *mutation.params)
         await _tracer(
             connection,
             action="admin.local_model_changed",
@@ -585,10 +751,8 @@ async def _changer_etat(
             # requête ne touche aucune ligne, comme pour un domaine absent.
             # Les deux refus n'ont pas le même remède, ils ne se disent pas
             # avec la même phrase.
-            connu = await connection.fetchval(
-                "SELECT verified_at IS NULL FROM domains WHERE id = $1",
-                identifiant,
-            )
+            verification = queries.is_domain_unverified(identifiant)
+            connu = await connection.fetchval(verification.sql, *verification.params)
             return _retour(
                 "domaine_non_verifie" if connu else "domaine_inconnu"
             )
@@ -674,6 +838,61 @@ async def supprimer_source(request: Request) -> Response:
     return _retour("source_supprimee", chemin="/sources")
 
 
+SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
+    (
+        "Content-Security-Policy",
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    ),
+    ("X-Frame-Options", "DENY"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("Cache-Control", "no-store"),
+)
+
+
+class _SecurityMiddleware:
+    """En-têtes de sécurité et filtrage de l'en-tête Host."""
+
+    def __init__(self, app: Any, *, settings: Settings) -> None:
+        self.app = app
+        self.settings = settings
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        try:
+            check_trusted_host(
+                request.headers,
+                self.settings.trusted_origins,
+                path=request.url.path,
+                peer=request.client.host if request.client else None,
+            )
+        except OrigineRefusee as exc:
+            response = await erreur_origine(request, exc)
+            for name, value in SECURITY_HEADERS:
+                response.headers.setdefault(name, value)
+            await response(scope, receive, send)
+            return
+
+        async def send_with_headers(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                raw_headers: list[tuple[bytes, bytes]] = list(
+                    message.get("headers", [])
+                )
+                present = {k.lower() for k, _ in raw_headers}
+                for name, value in SECURITY_HEADERS:
+                    key = name.lower().encode("latin-1")
+                    if key not in present:
+                        raw_headers.append((key, value.encode("latin-1")))
+                message = {**message, "headers": raw_headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 async def erreur_saisie(request: Request, exc: Exception) -> Response:
     return HTMLResponse(pages.page_erreur("Saisie refusée", str(exc)), status_code=400)
 
@@ -688,12 +907,25 @@ async def erreur_origine(request: Request, exc: Exception) -> Response:
     return HTMLResponse(pages.page_erreur("Requête refusée", str(exc)), status_code=403)
 
 
+async def erreur_corps_trop_grand(request: Request, exc: Exception) -> Response:
+    logger.warning(
+        "corps de requête trop volumineux chemin=%r pair=%r",
+        request.url.path,
+        request.client.host if request.client else None,
+    )
+    return HTMLResponse(
+        pages.page_erreur("Requête trop volumineuse", str(exc)), status_code=413
+    )
+
+
 # --- Assemblage -------------------------------------------------------------
 
 routes = [
     Route("/", accueil),
     Route("/domaines", domaines),
     Route("/domaines/ajouter", ajouter_domaine, methods=["POST"]),
+    Route("/domaines/clients/ajouter", ajouter_client, methods=["POST"]),
+    Route("/domaines/rattacher", rattacher_domaine_client, methods=["POST"]),
     Route("/domaines/activer", activer_domaine, methods=["POST"]),
     Route("/domaines/suspendre", suspendre_domaine, methods=["POST"]),
     Route("/etat", etat),
@@ -703,8 +935,12 @@ routes = [
     Route("/ecarts", ecarts),
     Route("/ecarts/traiter", traiter_ecart, methods=["POST"]),
     Route("/apprentissage", apprentissage),
+    Route("/classifieur", classifieur),
+    Route("/classifieur/revues", classifier_reviews),
+    Route("/classifieur/revues/{identifier:int}", classifier_review_detail, methods=["GET", "POST"]),
     Route("/sante", sante),
     Route("/sante/pipeline", sante_pipeline),
+    Route("/sante/superviseur", sante_superviseur),
     Route("/sources", sources),
     Route("/sources/ajouter", ajouter_source, methods=["POST"]),
     Route("/sources/supprimer", supprimer_source, methods=["POST"]),
@@ -727,14 +963,18 @@ def create_app(settings: Settings) -> Starlette:
         finally:
             await pool.close()
 
-    return Starlette(
+    app = Starlette(
         routes=routes,
         lifespan=lifespan,
+        middleware=[Middleware(_SecurityMiddleware, settings=settings)],
         exception_handlers={
             SaisieInvalide: erreur_saisie,
             OrigineRefusee: erreur_origine,
+            CorpsTropGrand: erreur_corps_trop_grand,
         },
     )
+    app.state.settings = settings
+    return app
 
 
 def main() -> None:

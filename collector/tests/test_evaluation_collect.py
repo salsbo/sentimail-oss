@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sentimail_v3.supervision import evaluation_report as report
@@ -12,12 +13,20 @@ class _Pool:
     """Retient la requête et rend les lignes qu'on lui donne."""
 
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
-        self.rows = rows or []
+        events = {DELIVER: "original_delivered", ASK: "review_notice_delivered",
+                  JUNK: "original_filed_as_junk"}
+        self.rows = [
+            {"first_event_type": events[row["outcome"]], "case_id": "case",
+             "delivery_status": "delivered", "truth": row.get("truth")}
+            if "outcome" in row else row for row in (rows or [])
+        ]
         self.queries: list[str] = []
+        self.arguments: list[tuple[Any, ...]] = []
         self.written: list[tuple[Any, ...]] = []
 
     async def fetch(self, query: str, *args: Any) -> list[dict[str, Any]]:
         self.queries.append(query)
+        self.arguments.append(args)
         return self.rows
 
     async def execute(self, query: str, *args: Any) -> str:
@@ -27,41 +36,49 @@ class _Pool:
 
 
 class RequeteTests(unittest.IsolatedAsyncioTestCase):
-    """L'issue se reconstruit depuis les événements, jamais depuis l'état.
-
-    `delivery_cases.original_delivery_allowed` est mis à jour APRÈS la réponse
-    de l'utilisateur : il raconte l'état final, pas la décision du moment. Une
-    mesure bâtie dessus dirait qu'un message retenu puis libéré avait été livré
-    d'emblée, et le taux de sollicitation tomberait à zéro. Seuls les
-    événements de livraison sont immuables.
-    """
-
-    async def test_la_requete_lit_les_evenements_de_livraison(self) -> None:
+    async def test_les_deux_bornes_sont_liees_et_republiees(self) -> None:
         pool = _Pool()
-        await report.collect(pool, days=30)  # type: ignore[arg-type]
-        sql = pool.queries[0]
-        self.assertIn("delivery_events", sql)
-        self.assertIn("review_notice_delivered", sql)
-        self.assertIn("original_filed_as_junk", sql)
+        end = datetime(2026, 10, 30, 13, 50, tzinfo=timezone.utc)
+        result = await report.collect(pool, days=7, as_of=end)  # type: ignore[arg-type]
+        self.assertEqual(pool.arguments[0], (end - timedelta(days=7), end))
+        self.assertEqual(result["window_end_utc"], end.isoformat())
+        self.assertEqual(result["window_start_utc"], (end-timedelta(days=7)).isoformat())
 
-    async def test_la_requete_n_utilise_pas_l_etat_mutable(self) -> None:
+    async def test_une_fenetre_invalide_ne_lance_pas_de_requete(self) -> None:
         pool = _Pool()
-        await report.collect(pool, days=30)  # type: ignore[arg-type]
-        sql = pool.queries[0]
-        self.assertNotIn("original_delivery_allowed", sql)
+        for days in (0, -1, True):
+            with self.assertRaises(ValueError):
+                await report.collect(pool, days=days)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            await report.collect(pool, as_of=datetime(2026, 10, 30))  # type: ignore[arg-type]
+        self.assertEqual(pool.queries, [])
 
-    async def test_seule_la_verite_humaine_est_retenue(self) -> None:
-        # Un jugement de modèle n'établit rien : le mesurer contre lui-même
-        # produirait un accord parfait et vide de sens.
-        pool = _Pool()
-        await report.collect(pool, days=30)  # type: ignore[arg-type]
-        sql = pool.queries[0]
-        self.assertIn("is_ground_truth", sql)
 
-    async def test_la_fenetre_est_un_parametre_lie(self) -> None:
-        pool = _Pool()
-        await report.collect(pool, days=7)  # type: ignore[arg-type]
-        self.assertIn("$1", pool.queries[0])
+class PremieresIssuesTests(unittest.TestCase):
+    def test_une_retenue_reste_une_sollicitation_apres_abandon(self) -> None:
+        row = {"first_event_type": "review_notice_delivered", "case_state": "ignored",
+               "delivery_status": "held", "case_id": "case", "truth": None}
+        end = datetime.now(timezone.utc)
+        result = report.assemble([row], days=30, start=end-timedelta(days=30), end=end)
+        self.assertEqual(result["matrix"]["rows"][ASK]["unknown"], 1)
+        self.assertEqual(result["population"]["ignored_with_notice"], 1)
+
+    def test_une_livraison_exige_sa_preuve(self) -> None:
+        self.assertEqual(report.first_outcome({"delivery_status": "delivered"}), "unconfirmed")
+        self.assertEqual(report.first_outcome({"delivery_status": "analyzing"}), "pending")
+
+    def test_les_exclusions_ne_notent_pas_une_qualification_existante(self) -> None:
+        end = datetime.now(timezone.utc)
+        rows = [{"delivery_status": state, "truth": "spam"}
+                for state in ("suppressed", "undeliverable", "consumed", "captured")]
+        result = report.assemble(rows, days=30, start=end-timedelta(days=30), end=end)
+        self.assertEqual(result["population"]["captured"], 4)
+        self.assertEqual(result["population"]["protected"], 3)
+        self.assertEqual(result["executions"]["suppressed"], 1)
+        self.assertEqual(result["executions"]["undeliverable"], 1)
+        self.assertEqual(result["executions"]["pending"], 1)
+        self.assertEqual(result["matrix"]["total"], 0)
+        self.assertEqual(result["utility"]["scored"], 0)
 
 
 class AssemblageTests(unittest.IsolatedAsyncioTestCase):

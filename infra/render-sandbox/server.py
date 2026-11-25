@@ -15,10 +15,12 @@ from pyzbar.pyzbar import decode as decode_barcodes
 
 MAX_HTML_CHARS = 1_000_000
 # Hauteur maximale de la capture. Le `max-height` CSS borne le peint mais pas
-# `scrollHeight` : une capture pleine page suit la taille de contenu et peut
-# atteindre des dizaines de milliers de pixels de blanc sur un corps dégradé
-# (HTML doublement encodé, tables mutilées). L'image est donc rognée après coup.
+# `scrollHeight` : le rectangle est borné avant la capture, pour éviter de
+# peindre et encoder une longue image dont le bas serait immédiatement jeté.
 MAX_CAPTURE_HEIGHT = 1_200
+MAX_IMAGE_PIXELS = 20_000_000
+RENDER_TIMEOUT_SECONDS = 20.0
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 _DANGEROUS_CSS = re.compile(
     r"url\s*\([^)]*\)|@import[^;]*;?|expression\s*\([^)]*\)|javascript\s*:",
     re.IGNORECASE,
@@ -111,20 +113,6 @@ def _sanitized_html(source: str) -> str:
     return str(soup)
 
 
-def _truncated(png: bytes) -> bytes:
-    # Le rognage se fait sur l'image plutôt qu'au clip Playwright : le clip est
-    # intersecté avec le viewport, il ne sait pas capturer entre la hauteur du
-    # viewport et le plafond.
-    image = Image.open(io.BytesIO(png))
-    if image.height <= MAX_CAPTURE_HEIGHT:
-        return png
-    output = io.BytesIO()
-    image.crop((0, 0, image.width, MAX_CAPTURE_HEIGHT)).save(
-        output, format="PNG", optimize=True
-    )
-    return output.getvalue()
-
-
 def _mask_qr_codes(png: bytes) -> bytes:
     image = Image.open(io.BytesIO(png)).convert("RGB")
     draw = ImageDraw.Draw(image)
@@ -171,29 +159,35 @@ async def health() -> dict[str, str]:
 async def render(payload: RenderIn) -> Response:
     if state.browser is None:
         raise HTTPException(status_code=503, detail="renderer unavailable")
-    sanitized = _sanitized_html(payload.html)
-    async with _render_slots:
-        context = await state.browser.new_context(
-            viewport={"width": payload.width, "height": 900},
-            device_scale_factor=1,
-            java_script_enabled=False,
-        )
-        page = await context.new_page()
-        await page.route("**/*", lambda route: route.abort())
-        try:
-            await page.set_content(sanitized, wait_until="domcontentloaded", timeout=5_000)
-            png = await page.screenshot(
-                type="png",
-                full_page=True,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"render failed: {type(exc).__name__}") from exc
-        finally:
-            await context.close()
-    def _finalized(capture: bytes) -> bytes:
-        return _mask_qr_codes(_truncated(capture))
-
-    return Response(content=await asyncio.to_thread(_finalized, png), media_type="image/png")
+    try:
+        async with asyncio.timeout(RENDER_TIMEOUT_SECONDS):
+            async with _render_slots:
+                sanitized = await asyncio.to_thread(_sanitized_html, payload.html)
+                context = await state.browser.new_context(
+                    viewport={"width": payload.width, "height": 900},
+                    device_scale_factor=1,
+                    java_script_enabled=False,
+                )
+                try:
+                    page = await context.new_page()
+                    await page.route("**/*", lambda route: route.abort())
+                    await page.set_content(sanitized, wait_until="domcontentloaded", timeout=5_000)
+                    # full_page permet au clip de dépasser le viewport sans le changer
+                    # (vh et media queries restent identiques). Chromium ne capture que
+                    # ce rectangle, pas une pleine page à découper après encodage.
+                    png = await page.screenshot(
+                        type="png",
+                        full_page=True,
+                        clip={"x": 0, "y": 0, "width": payload.width, "height": MAX_CAPTURE_HEIGHT},
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=422, detail=f"render failed: {type(exc).__name__}") from exc
+                finally:
+                    await context.close()
+            masked = await asyncio.to_thread(_mask_qr_codes, png)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="render timeout") from exc
+    return Response(content=masked, media_type="image/png")
 
 
 MAX_THUMBNAIL_SOURCE_BYTES = 10 * 1024 * 1024
@@ -234,8 +228,25 @@ def _downscale(png: bytes, width: int) -> tuple[bytes, str]:
 
 @app.post("/thumbnail")
 async def thumbnail(request: Request, width: int = Query(default=640, ge=240, le=1_200)) -> Response:
-    png = await request.body()
-    if not png or len(png) > MAX_THUMBNAIL_SOURCE_BYTES:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="en-tete Content-Length invalide") from exc
+        if declared_size <= 0 or declared_size > MAX_THUMBNAIL_SOURCE_BYTES:
+            raise HTTPException(status_code=413, detail="image absente ou trop lourde")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_THUMBNAIL_SOURCE_BYTES:
+            raise HTTPException(status_code=413, detail="image absente ou trop lourde")
+        chunks.append(chunk)
+    png = b"".join(chunks)
+    if not png:
         raise HTTPException(status_code=413, detail="image absente ou trop lourde")
     try:
         reduite, media_type = await asyncio.to_thread(_downscale, png, width)

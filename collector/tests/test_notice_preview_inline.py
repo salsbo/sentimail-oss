@@ -16,6 +16,9 @@ class _Pool:
         self._avec_capture = avec_capture
 
     async def fetchrow(self, query, *args):
+        if "instance_identity" in str(query):
+            # Pas d'identité posée en base : celle des réglages sert.
+            return None
         return {
             "id": 1,
             "action_id": "11111111-1111-1111-1111-111111111111",
@@ -62,16 +65,25 @@ async def _envoyer(avec_capture: bool):
         envois.append(message)
         return {}
 
-    settings = SimpleNamespace(
+    with patch("sentimail_v3.conversation.assistant.aiosmtplib.send", new=_capture):
+        await _send_outbox(_Pool(avec_capture), _reglages())  # type: ignore[arg-type]
+    assert envois, "aucun message envoyé"
+    return envois[0]
+
+
+def _reglages() -> SimpleNamespace:
+    from sentimail_v3.identity import reset_cache
+
+    reset_cache()
+    return SimpleNamespace(
         assistant_token_secret="secret",
         action_address="maia@sentinel.mondomaine.example",
+        action_aliases=(),
+        assistant_sender="MAIA <maia@mondomaine.example>",
+        probe_recipient="sonde@mondomaine.example",
         relay_host="relay",
         relay_port=25,
     )
-    with patch("sentimail_v3.conversation.assistant.aiosmtplib.send", new=_capture):
-        await _send_outbox(_Pool(avec_capture), settings)  # type: ignore[arg-type]
-    assert envois, "aucun message envoyé"
-    return envois[0]
 
 
 class CaptureIntegreeTests(unittest.IsolatedAsyncioTestCase):
@@ -119,3 +131,51 @@ class CaptureIntegreeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PoolAvecMiniature(_Pool):
+    """La miniature dans le corps, la capture pleine en pièce jointe."""
+
+    async def fetchrow(self, query, *args):
+        item = await super().fetchrow(query, *args)
+        if item is None:
+            return None
+        item["inline_content"] = b"\xff\xd8\xff" + b"m" * 16
+        item["inline_content_type"] = "image/jpeg"
+        item["inline_filename"] = "apercu-email.jpg"
+        return item
+
+
+class CapturePleineJointeTests(unittest.IsolatedAsyncioTestCase):
+    """La miniature sert à reconnaître ; pour lire, il faut l'image entière.
+
+    Demande du 6 septembre 2026 : pouvoir agrandir la capture. Une image
+    rattachée au corps ne s'ouvre pas en grand dans tous les clients ; la
+    capture pleine repart donc en pièce jointe, à côté de la miniature.
+    """
+
+    async def _envoyer_avec_miniature(self):
+        from sentimail_v3.conversation.assistant import _send_outbox
+
+        envois: list[object] = []
+
+        async def _capture(message, **kwargs):
+            envois.append(message)
+            return {}
+
+        with patch("sentimail_v3.conversation.assistant.aiosmtplib.send", new=_capture):
+            await _send_outbox(_PoolAvecMiniature(True), _reglages())  # type: ignore[arg-type]
+        return envois[0]
+
+    async def test_la_miniature_est_dans_le_corps_et_la_capture_en_piece_jointe(self) -> None:
+        message = await self._envoyer_avec_miniature()
+        inline = [p for p in message.walk() if p.get("Content-ID") == f"<{PREVIEW_CID}>"]
+        self.assertEqual(len(inline), 1)
+        self.assertEqual(inline[0].get_content_type(), "image/jpeg")
+        jointes = [
+            p for p in message.walk()
+            if p.get_content_disposition() == "attachment" and p.get_content_type() == "image/png"
+        ]
+        self.assertEqual(len(jointes), 1)
+        self.assertEqual(jointes[0].get_filename(), "message-en-grand.png")
+        self.assertEqual(jointes[0].get_payload(decode=True), PNG)

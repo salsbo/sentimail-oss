@@ -4,13 +4,20 @@ import base64
 import binascii
 import re
 import unicodedata
+from dataclasses import replace
 from typing import ClassVar
 
 from sentimail_v3.observation.dossier.hook import EvidenceHook
+from sentimail_v3.observation.dossier.hooks.bruit_dans_les_mots import mots_bruites
+from sentimail_v3.observation.dossier.hooks.hidden_text import (
+    est_du_salting,
+    mots_caches_inedits,
+    split_visible_hidden,
+)
 from sentimail_v3.observation.dossier.hooks.nature import is_unsolicited_style
-from sentimail_v3.observation.dossier.hooks.hidden_text import split_visible_hidden
 from sentimail_v3.observation.dossier.hooks.visible_text import visible_html_text
 from sentimail_v3.observation.dossier.models import Clue, InvestigationContext
+from sentimail_v3.observation.message_parts import message_parts
 
 _URGENCY = re.compile(
     r"\b(urgent|imm[ée]diat|derni[eè]re chance|dans les \d+ (?:minutes|heures)|"
@@ -28,19 +35,39 @@ _COERCION = re.compile(
     r"compte (?:suspendu|bloqu[ée])|p[ée]nalit[ée]|sanction|imm[ée]diatement)\b",
     re.IGNORECASE,
 )
+# « one-time » seul disait la finalité : « one-time purchase », « one-time
+# fee » faisaient d'une réclame un envoi de code, avec l'indice favorable et la
+# dispense de contrôle qui vont avec (Herz P1, 3 septembre 2026). Le mot ne
+# vaut qu'accolé à ce qu'il qualifie : un code, un lien, un secret.
 _ONE_TIME_PURPOSE = re.compile(
-    r"\b(lien s[ée]curis[ée]|secure link|magic link|usage unique|one[- ]time|otp|"
+    r"\b(lien s[ée]curis[ée]|secure link|magic link|usage unique|"
+    r"one[- ]time (?:code|link|password|passcode|pin|token|login|sign[- ]?in)|otp|"
     r"code de v[ée]rification|verification code|code de connexion|sign[- ]in link)\b",
     re.IGNORECASE,
 )
 _ACCOUNT_SECURITY = re.compile(
-    r"\b(r[ée]initialis(?:er|ation)|reset (?:your )?password|v[ée]rifier (?:votre|ton) compte|"
+    r"\b(r[ée]initialis(?:er|ation)|reset (?:your )?password|"
+    r"v[ée]rifi(?:er|e|ez) (?:votre|ton) compte|"
     r"verify (?:your )?account|connexion|login|sign[ -]?in|2fa|mfa)\b",
     re.IGNORECASE,
 )
 _FINANCIAL_TRANSFER = re.compile(
-    r"\b(iban|rib|virement|wire transfer|sepa|bitcoin|btc|ethereum|eth|usdt|"
+    r"\b(virement|wire transfer|sepa|bitcoin|btc|ethereum|eth|usdt|"
     r"crypto(?:monnaie|currency)?|wallet address|adresse (?:de )?portefeuille)\b",
+    re.IGNORECASE,
+)
+_BANK_DETAILS = re.compile(
+    r"\b(iban|rib|coordonn[ée]es bancaires|bank (?:account|details)|"
+    r"wallet address|adresse (?:de )?portefeuille)\b", re.IGNORECASE,
+)
+# Le nom d'une donnée ne demande aucun mouvement d'argent. Le hook relève
+# seulement les formulations explicites ; l'enquêteur ACT-001 lit le sens.
+_TRANSFER_REQUEST = re.compile(
+    r"\b(?:effectue[rz]|faites|faire|proc[ée]de[rz]|envoye[rz]|r[ée]alise[rz])\b"
+    r"[^.\n!?]{0,70}\b(?:virement|transfert)\b|"
+    r"\b(?:vire[rz]|verse[rz]|transf[ée]re[rz]|send|transfer|wire)\b"
+    r"[^.\n!?]{0,70}\b(?:argent|euros?|fonds|montant|money|funds|bitcoin|btc|usdt|\d+)\b|"
+    r"\b(?:make|send)\b[^.\n!?]{0,40}\b(?:wire transfer|bank transfer)\b",
     re.IGNORECASE,
 )
 # Le chantage ne demande pas, il menace : aucune formule de politesse à
@@ -117,7 +144,7 @@ _ACTION_PATTERNS = {
         r"\b(connectez-vous|connexion|login|sign[ -]?in|authentif)\b",
         re.IGNORECASE,
     ),
-    "transfer_money": _FINANCIAL_TRANSFER,
+    "transfer_money": _TRANSFER_REQUEST,
     "pay": _PAYMENT,
 }
 _SENSITIVE_PATTERNS = {
@@ -127,7 +154,7 @@ _SENSITIVE_PATTERNS = {
         r"verification code|security code)\b",
         re.IGNORECASE,
     ),
-    "bank_account": _FINANCIAL_TRANSFER,
+    "bank_account": _BANK_DETAILS,
     "payment_card": re.compile(
         r"\b(carte bancaire|num[ée]ro de carte|cvv|cvc|credit card|card number)\b",
         re.IGNORECASE,
@@ -147,14 +174,6 @@ _HIDDEN_HTML = re.compile(
 )
 _ZERO_WIDTH = {"\u200b", "\u200c", "\u200d", "\u2060", "\ufeff"}
 
-# D\u00e9coupage en mots pour comparer vocabulaire visible et vocabulaire cach\u00e9
-# (CONTENT-013) : \w+ Unicode, insensible \u00e0 la casse.
-_WORD_RE = re.compile(r"\w+", re.UNICODE)
-
-
-def _word_set(sample: str) -> set[str]:
-    return {mot.casefold() for mot in _WORD_RE.findall(sample)}
-
 # Un message qui s'adresse \u00e0 un syst\u00e8me d'analyse, jamais au lecteur : c'est
 # une injection de prompt. Les motifs sont ceux des campagnes r\u00e9elles - en
 # anglais comme en fran\u00e7ais - et n'ont aucune raison d'exister dans du courrier
@@ -169,7 +188,14 @@ _PROMPT_INJECTION = re.compile(
     r"l[ée]gitime|non[ -]spam|sans\s+risque|inoffensi)"
     r"|LLM[_ ]?IGNORE|</?(?:system|assistant|user)>|"
     r"(?:^|\n)\s*(?:system|assistant|user)\s*:\s|"
-    r"you\s+are\s+(?:a|an|now)\s+|tu\s+es\s+(?:un|une|maintenant)\s+|"
+    # « you are a … » ne compte que s'il attribue un rôle de machine :
+    # « you are a helpful assistant » colle, « you are a registered member »
+    # d'un pied de page ne colle plus (25 pieds de page marqués à tort).
+    r"you\s+are\s+(?:a|an|now)\b[^.\n]{0,30}?(?:assistant|a\.?i\.?\b|model|"
+    r"llm|gpt|system|filter|classifier|moderator|chat\s?bot|bot\b|helpful|"
+    r"developer\s+mode|jailbroken)|"
+    r"tu\s+es\s+(?:un|une|maintenant)\b[^.\n]{0,30}?(?:assistant|ia\b|"
+    r"mod[èe]le|syst[èe]me|filtre|classifieur|robot|mod[ée]rateur|serviable)|"
     r"as\s+an?\s+ai\b|en\s+tant\s+qu[e']\s+(?:ia|intelligence)",
     re.IGNORECASE,
 )
@@ -178,12 +204,19 @@ _PROMPT_INJECTION = re.compile(
 def _message_purpose(sample: str) -> str:
     if _FINANCIAL_TRANSFER.search(sample):
         return "financial_transfer"
-    if _PAYMENT.search(sample):
-        return "payment"
+    # Renommer le contexte bancaire ne doit pas ouvrir la voie rapide d'un
+    # code à usage unique auquel seraient mêlées des coordonnées bancaires.
+    if _BANK_DETAILS.search(sample):
+        return "payment" if _PAYMENT.search(sample) else "bank_details"
     if _ONE_TIME_PURPOSE.search(sample):
         return "one_time_authentication"
     if _ACCOUNT_SECURITY.search(sample):
         return "account_security"
+    # Les gabarits transactionnels portent souvent dans leur pied de page des
+    # liens vers les paiements ou remboursements. Une finalité explicite de
+    # compte ou de code prime donc sur ce vocabulaire générique.
+    if _PAYMENT.search(sample):
+        return "payment"
     if _DELIVERY.search(sample):
         return "parcel_delivery"
     return "unknown"
@@ -312,7 +345,7 @@ def _mixed_script_words(sample: str) -> list[dict[str, object]]:
 
 class ContentHook(EvidenceHook):
     name: ClassVar[str] = "content"
-    version: ClassVar[str] = "2.0.0"
+    version: ClassVar[str] = "2.4.0"
 
     async def observe(
         self, context: InvestigationContext
@@ -326,6 +359,15 @@ class ContentHook(EvidenceHook):
         # injection zero-width au milieu du texte.
         subject_visible = subject.removeprefix("\ufeff")
         sample = f"{subject_visible}\n{text}\n{visible_html[:100_000]}"
+        current, quoted = message_parts(text, html)
+        # Les deux parties MIME restent examinées : une version HTML adverse
+        # ne doit pas disparaître derrière une version texte innocente.
+        html_current, html_quoted = message_parts(None, html)
+        current_sample = f"{subject_visible}\n{current}\n{html_current}"
+        quoted_present = bool(quoted or html_quoted)
+        current_sensitive = _sensitive_context(current_sample)[1]
+        current_urgency = bool(_URGENCY.search(current_sample))
+        current_transfer = bool(_TRANSFER_REQUEST.search(current_sample))
         urgency = len(_URGENCY.findall(sample))
         purpose = _message_purpose(sample)
         mentioned_sensitive, requested_sensitive = _sensitive_context(sample)
@@ -451,7 +493,7 @@ class ContentHook(EvidenceHook):
             and actions
             and (
                 (requested_sensitive and not expected_one_time_input)
-                or purpose == "financial_transfer"
+                or "transfer_money" in action_types
             )
         ):
             clues.append(
@@ -497,14 +539,50 @@ class ContentHook(EvidenceHook):
                     {"source": "unicode:from+subject+body"},
                 )
             )
+        # Un mot coupé à l'intérieur par un signe parasite (« com´mands »,
+        # « A′̍meli ») se lit comme le mot ordinaire et ne se cherche plus. Dans
+        # l'objet ou le nom affiché, un seul suffit : ils sont courts et se
+        # lisent d'un coup d'œil. Dans le corps il en faut quatre, pour qu'une
+        # apostrophe tapée de travers n'accuse personne.
+        bruit_entete = mots_bruites(f"{message.get('from_header') or ''}\n{subject_visible}")
+        mots_corps = sorted(
+            {
+                str(releve["word"])
+                for releve in mots_bruites(text) + mots_bruites(visible_html[:100_000])
+            }
+        )
+        if bruit_entete or len(mots_corps) >= 4:
+            exemples = [str(releve["word"]) for releve in bruit_entete] + mots_corps
+            total = len(bruit_entete) + len(mots_corps)
+            clues.append(
+                Clue(
+                    "CONTENT-017",
+                    "CONTENT_INTRAWORD_NOISE",
+                    "adverse",
+                    min(80, 60 + 3 * total),
+                    0.9,
+                    "Des mots sont coupés à l’intérieur par des signes parasites "
+                    "(accent aigu, prime, marque combinante) : ils se lisent "
+                    "normalement mais ne se retrouvent plus par une recherche. "
+                    "Exemples : " + ", ".join(exemples[:5]) + ".",
+                    {
+                        "words": exemples[:10],
+                        "in_header": bool(bruit_entete),
+                        "total": total,
+                    },
+                    {"source": "unicode:from+subject+body"},
+                )
+            )
         # Texte masqué par CSS inline : séparé du visible, il ne fausse plus la
         # lecture, et son volume trahit le « salting ». Un preheader légitime
         # est court et unique ; on ne compte que le masquage substantiel, et
         # significatif par rapport au texte réellement lu.
         texte_visible, texte_cache = split_visible_hidden(html)
         # Injection de prompt : le message s'adresse au filtre, souvent dans du
-        # texte masqué. On scanne l'ensemble - sujet, visible, caché - et on
-        # pèse plus lourd quand le motif est caché.
+        # texte masqué, parfois en clair (préheader, pied de page noyé). On
+        # scanne l'ensemble - sujet, visible, caché - et on pèse plus lourd
+        # quand le motif est caché. Le motif est étroit (rôle de machine, ordre
+        # de classement) : un pied de page ordinaire n'y tombe pas.
         injection_zone = f"{subject_visible}\n{text}\n{texte_visible}\n{texte_cache}"
         injection = _PROMPT_INJECTION.search(injection_zone)
         if injection:
@@ -529,13 +607,11 @@ class ContentHook(EvidenceHook):
         # légitimement de grands blocs qui DUPLIQUENT le texte visible : ce
         # n'est pas du salting. Le salting introduit du vocabulaire absent du
         # visible. On ne mesure donc que la part inédite du texte caché,
-        # mot par mot (\w+, casefold), contre le même seuil.
-        vocabulaire_visible = _word_set(f"{texte_visible}\n{text}")
-        mots_caches_inedits = [
-            mot for mot in _WORD_RE.findall(texte_cache) if mot.casefold() not in vocabulaire_visible
-        ]
-        novel_chars = sum(len(mot) for mot in mots_caches_inedits)
-        if novel_chars >= 200 and novel_chars / visible_chars >= 0.2:
+        # mot par mot (\w+, casefold), contre le HTML rendu seul : le text/plain
+        # n'est pas lu, et une arnaque y a répété en clair son texte caché
+        # pour effacer cet inédit (M-96852d, 30 octobre 2026).
+        _, _, novel_chars = mots_caches_inedits(html)
+        if est_du_salting(novel_chars, visible_chars):
             clues.append(
                 Clue(
                     "CONTENT-013",
@@ -633,6 +709,36 @@ class ContentHook(EvidenceHook):
                     {"source": "visible-subject+body"},
                 )
             )
+        if purpose in {"financial_transfer", "payment", "bank_details"}:
+            # Un message qui parle d'argent le dit au dossier, même sans rien
+            # demander. Le 16 septembre 2026, ce fait dormait dans les faits
+            # de travail et le juge a écrit « aucun indice » sur un faux reçu.
+            # Neutre : un vrai reçu est un contexte financier lui aussi ; c'est
+            # la convergence avec le reste qui distingue.
+            clues.append(
+                Clue(
+                    "CONTENT-015",
+                    "CONTENT_FINANCIAL_CONTEXT",
+                    "neutral",
+                    0,
+                    0.8,
+                    "Le message parle d’un paiement, d’un reçu, d’un abonnement ou de coordonnées bancaires"
+                    + (
+                        " sans rien demander."
+                        if not requested_sensitive and urgency_kind == "none"
+                        and "transfer_money" not in action_types
+                        else "."
+                    ),
+                    {
+                        "purpose": purpose,
+                        "action_types": action_types,
+                        "sensitive_categories_mentioned": mentioned_sensitive,
+                        "sensitive_categories_requested": requested_sensitive,
+                        "urgency_kind": urgency_kind,
+                    },
+                    {"source": "visible-subject+body"},
+                )
+            )
         if purpose == "one_time_authentication" and not requested_sensitive:
             clues.append(
                 Clue(
@@ -676,6 +782,41 @@ class ContentHook(EvidenceHook):
                     {"source": "html-structure"},
                 )
             )
+        if quoted_present:
+            # La charge reste entière, même citée : un fraudeur peut ranger
+            # sa demande dans une fausse conversation. On précise sa place,
+            # sans prétendre que le destinataire a écrit les lignes citées.
+            current_matches = {
+                "CONTENT_URGENCY": current_urgency,
+                "CONTENT_SENSITIVE_REQUEST": bool(current_sensitive),
+                "CONTENT_SOCIAL_ENGINEERING_COMBINATION": bool(
+                    current_urgency and (current_sensitive or current_transfer)
+                ),
+                "CONTENT_FINANCIAL_CONTEXT": _message_purpose(current_sample)
+                in {"financial_transfer", "payment", "bank_details"},
+            }
+            clues = [
+                replace(
+                    clue,
+                    facts={
+                        **clue.facts,
+                        "text_scope": "current_message" if current_matches[clue.clue_code]
+                        else "quoted_or_combined",
+                    },
+                    statement=clue.statement if current_matches[clue.clue_code]
+                    else "Constat dans le fil cité ou dans sa combinaison avec le texte actuel : "
+                    + clue.statement,
+                ) if clue.clue_code in current_matches else clue
+                for clue in clues
+            ]
+            clues.append(Clue(
+                "CONTENT-016", "CONTENT_QUOTED_THREAD", "neutral", 0, 0.9,
+                "Le corps contient du texte cité, distinct du texte actuel ; "
+                "la citation ne prouve pas un échange antérieur authentifié.",
+                {"current_text": current[:1600], "quoted_text": (quoted or html_quoted)[:1600],
+                 "thread_authenticated": False},
+                {"source": "body:quote_presentation"},
+            ))
         return clues, {
             "urgency_matches": urgency,
             "action_matches": actions,

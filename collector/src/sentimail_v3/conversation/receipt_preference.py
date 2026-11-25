@@ -66,7 +66,12 @@ def parse_receipt_toggle(text: str) -> bool | None:
 
 
 async def get_receipt_enabled(pool: asyncpg.Pool[Any], participant: str) -> bool:
-    """L'état du réglage ; activé par défaut, comme avant son existence."""
+    """L'état du réglage ; désactivé par défaut.
+
+    Une réponse à MAIA est prise en compte par défaut : la confirmer par un
+    courrier de plus n'apprend rien (décision du mainteneur du 25 septembre 2026).
+    Seuls ceux qui l'ont demandé reçoivent l'accusé.
+    """
     value = await pool.fetchval(
         """
         SELECT (value)::text::boolean FROM participant_preferences
@@ -75,7 +80,7 @@ async def get_receipt_enabled(pool: asyncpg.Pool[Any], participant: str) -> bool
         participant,
         PREFERENCE_NAME,
     )
-    return True if value is None else bool(value)
+    return False if value is None else bool(value)
 
 
 async def set_receipt_enabled(

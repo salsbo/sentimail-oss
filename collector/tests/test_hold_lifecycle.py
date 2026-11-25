@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import os
 import unittest
+import uuid
 from types import SimpleNamespace
 
 import asyncpg
-from sentimail_v3.execution.hold_lifecycle import remind_stale_holds, settle_expired_holds
+from sentimail_v3.execution.hold_lifecycle import (
+    abandon_participant_holds,
+    remind_stale_holds,
+    run_hold_lifecycle,
+    settle_expired_holds,
+)
 from sentimail_v3.observation.storage import Store
 from sentimail_v3.judgment.verdict_engine import (
     JudgmentContradiction,
@@ -90,6 +96,8 @@ class HoldLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             hold_decision_after_days=7,
             assistant_sender="MAIA <maia@example.org>",
             action_address="maia@example.org",
+            action_aliases=(),
+            probe_recipient="",
             authorized_user_address="user@example.org",
             assistant_token_secret="x" * 32,
             relay_host="relay.invalid",
@@ -102,9 +110,17 @@ class HoldLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await self.pool.close()
 
-    async def _held_case(self, age_days: int, classification: str) -> str:
+    async def _held_case(
+        self, age_days: int, classification: str, participant: str | None = None
+    ) -> str:
+        participant = participant or f"hold-{age_days}-{classification}@example.org"
+        # Un Message-ID par dossier : la capture reconnaît un même message
+        # reçu deux fois pour le même destinataire et rend le dossier existant.
+        raw = RAW.replace(
+            b"<sample@sender.example>", f"<{uuid.uuid4()}@sender.example>".encode()
+        )
         result = await Store(self.pool).capture(
-            RAW, "bounce@sender.example", [f"hold-{age_days}-{classification}@example.org"], SMTP
+            raw, "bounce@sender.example", [participant], SMTP
         )
         self.created.append(result.message_id)
         await self.pool.execute(
@@ -130,7 +146,7 @@ class HoldLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             VALUES ($1,$2,'awaiting_user')
             """,
             case_id,
-            f"hold-{age_days}-{classification}@example.org",
+            participant,
         )
         await self.pool.execute(
             """
@@ -168,6 +184,71 @@ class HoldLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             "held",
         )
+
+    async def _courriers(self, message_ids: list[str]) -> list[int]:
+        return [
+            int(await self.pool.fetchval(
+                """
+                SELECT count(*) FROM assistant_outbox ao
+                JOIN smtp_actions sa ON sa.id=ao.action_id
+                JOIN delivery_cases dc ON dc.id=sa.case_id
+                WHERE dc.message_id=$1::uuid
+                """,
+                message_id,
+            ))
+            for message_id in message_ids
+        ]
+
+    async def test_trois_retenues_font_trois_courriers(self) -> None:
+        """Décision du 15 octobre 2026 : jamais un bulletin pour plusieurs messages."""
+        participant = "trois-retenues@example.org"
+        ids = [await self._held_case(5, "suspect", participant) for _ in range(3)]
+        settings = SimpleNamespace(**vars(self.settings), digest_enabled=False)
+        await run_hold_lifecycle(self.pool, settings)
+        self.assertEqual(await self._courriers(ids), [1, 1, 1])
+
+    async def test_un_destinataire_qui_refuse_les_relances_n_en_recoit_aucune(self) -> None:
+        participant = "sans-relance@example.org"
+        message_id = await self._held_case(5, "suspect", participant)
+        await self.pool.execute(
+            """
+            INSERT INTO participant_preferences (participant_email, name, value)
+            VALUES ($1, 'hold_reminders_enabled', 'false'::jsonb)
+            ON CONFLICT (participant_email, name) DO UPDATE SET value='false'::jsonb
+            """,
+            participant,
+        )
+        try:
+            await remind_stale_holds(self.pool, self.settings)
+            self.assertEqual(await self._courriers([message_id]), [0])
+        finally:
+            await self.pool.execute(
+                "DELETE FROM participant_preferences WHERE participant_email=$1",
+                participant,
+            )
+
+    async def test_vider_la_file_d_un_destinataire_abandonne_sans_courrier(self) -> None:
+        participant = "file-videe@example.org"
+        siens = [await self._held_case(age, "suspect", participant) for age in (0, 4)]
+        autre = await self._held_case(4, "suspect", "autre-file@example.org")
+        self.assertEqual(
+            await abandon_participant_holds(self.pool, "File-Videe@example.org"), 2
+        )
+        for message_id in siens:
+            etat = await self._etat(message_id)
+            self.assertEqual(etat["state"], "ignored")
+            self.assertEqual(etat["delivery_status"], "held")
+        self.assertEqual((await self._etat(autre))["state"], "awaiting_reply")
+        self.assertEqual(await self._courriers(siens), [0, 0])
+        raisons = await self.pool.fetch(
+            """
+            SELECT payload->>'reason' AS reason FROM audit_log
+            WHERE action='hold.ignored_without_reply'
+              AND payload->>'message_id' = ANY($1::text[])
+            """,
+            siens,
+        )
+        self.assertEqual({row["reason"] for row in raisons}, {"operator_cleared_queue"})
 
     async def test_a_recent_hold_is_left_alone(self) -> None:
         await self._held_case(1, "suspect")
@@ -253,11 +334,9 @@ class HoldLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await settle_expired_holds(self.pool, self.settings)
         for table, colonne in (
             ("labels", "message_id"),
-            ("training_samples", None),
+            ("training_samples", "message_id"),
         ):
             with self.subTest(table=table):
-                if colonne is None:
-                    continue
                 self.assertEqual(
                     await self.pool.fetchval(
                         f"SELECT count(*) FROM {table} WHERE {colonne}=$1::uuid",
@@ -311,11 +390,16 @@ class HoldLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await settle_expired_holds(self.pool, self.settings), 0)
         self.assertEqual((await self._etat(message_id))["state"], "awaiting_reply")
 
-    async def test_an_ignored_case_leaves_the_measurement(self) -> None:
-        """Un dossier zappé ne compte ni en réussite, ni en échec, ni au total."""
+    async def test_an_ignored_case_keeps_its_unlabelled_solicitation(self) -> None:
+        """Le silence ne retire pas un avis envoyé et ne crée aucun label."""
         from sentimail_v3.supervision.evaluation_report import collect
 
         message_id = await self._held_case(10, "suspect")
+        await self.pool.execute(
+            """INSERT INTO delivery_events(case_id,event_type)
+               SELECT id,'review_notice_delivered' FROM delivery_cases
+               WHERE message_id=$1::uuid""", message_id,
+        )
         avant = await collect(self.pool)
         self.assertGreaterEqual(
             sum(ligne["total"] for ligne in avant["coverage"].values()),
@@ -324,15 +408,16 @@ class HoldLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await settle_expired_holds(self.pool, self.settings)
         apres = await collect(self.pool)
-        # La couverture est rendue par issue, et l'issue se reconstruit depuis
-        # les événements de livraison : peu importe dans laquelle il tombait,
-        # il ne doit plus être compté dans aucune.
         def total(rapport: dict) -> int:
             return sum(
                 ligne["total"] for ligne in rapport["coverage"].values()
             )
 
-        self.assertEqual(total(apres), total(avant) - 1, message_id)
+        self.assertEqual(total(apres), total(avant), message_id)
+        self.assertEqual(apres["matrix"]["rows"]["ask_user"]["labelled"],
+                         avant["matrix"]["rows"]["ask_user"]["labelled"])
+        self.assertEqual(apres["population"]["ignored_with_notice"],
+                         avant["population"]["ignored_with_notice"] + 1)
 
 
 if __name__ == "__main__":

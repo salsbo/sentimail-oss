@@ -14,7 +14,13 @@ DOMAINE = {
     "verified_at": datetime(2026, 8, 12, 9, 30, tzinfo=timezone.utc),
     "created_at": datetime(2026, 8, 12, 9, 0, tzinfo=timezone.utc),
     "updated_at": datetime(2026, 8, 12, 9, 30, tzinfo=timezone.utc),
+    "client_id": "b2b2e0f0-0000-4000-8000-000000000001",
+    "client_name": "Mon client",
 }
+
+CLIENTS = [
+    {"id": DOMAINE["client_id"], "name": "Mon client", "domain_count": 1}
+]
 
 
 class RenduTests(unittest.TestCase):
@@ -27,6 +33,13 @@ class RenduTests(unittest.TestCase):
         html = pages.page_domaines([DOMAINE])
         self.assertIn("_sentimail.mondomaine.example", html)
         self.assertIn("jeton-affiche-factice", html)
+
+    def test_le_domaine_peut_etre_rattache_a_un_client(self) -> None:
+        html = pages.page_domaines([DOMAINE], CLIENTS)
+        self.assertIn('action="/domaines/rattacher"', html)
+        self.assertIn('name="client"', html)
+        self.assertIn("Mon client", html)
+        self.assertIn('action="/domaines/clients/ajouter"', html)
 
     def test_les_modifications_passent_par_un_formulaire_post(self) -> None:
         html = pages.page_domaines([DOMAINE])
@@ -97,10 +110,6 @@ class RenduTests(unittest.TestCase):
         self.assertIn("file d&#x27;attente", html)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 QUOTAS = {
     "id": "a2a2e0f0-0000-4000-8000-000000000001",
     "fqdn": "mondomaine.example",
@@ -135,6 +144,7 @@ class ReglagesTests(unittest.TestCase):
         # Le libellé est échappé à l'affichage, comme tout ce qui est écrit.
         self.assertIn("Échanges avec l&#x27;utilisateur", html)
         self.assertIn("Confier au local", html)
+        self.assertIn("Analyses auxiliaires", html)
 
     def test_un_role_servi_en_local_propose_le_retour_au_distant(self) -> None:
         html = pages.page_reglages([QUOTAS], ROUTAGE)
@@ -412,3 +422,26 @@ class PageReglagesIdentiteTests(unittest.TestCase):
         piege = {**LIGNE_IDENTITE, "action_address": '"><script>alert(1)</script>'}
         html = pages.page_reglages_identite(piege, VALEURS_ENV)
         self.assertNotIn("<script>alert(1)</script>", html)
+
+
+class PageEcartsTests(unittest.TestCase):
+    def test_une_direction_inconnue_est_echappee(self) -> None:
+        ecart = {
+            "id": "e2e2e0f0-0000-4000-8000-000000000001",
+            "created_at": datetime(2026, 8, 22, 9, 0, tzinfo=timezone.utc),
+            "participant_email": "operateur@mondomaine.example",
+            "sender_normalized": "expediteur@autre.example",
+            "subject": "Test",
+            "model_classification": "legitimate",
+            "model_confidence": 0.85,
+            "human_label": "spam",
+            "direction": "<script>alert(1)</script>",
+            "acknowledged_at": None,
+        }
+        html = pages.page_ecarts([], [ecart], vue_traites=False)
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+
+
+if __name__ == "__main__":
+    unittest.main()

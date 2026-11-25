@@ -1,4 +1,7 @@
-"""Le courrier d'entretien ne part que pour du grave non acquitté.
+"""Le courrier d'entretien ne part que pour une anomalie d'exploitation.
+
+Règle du 13 septembre 2026 : un verdict humain s'applique, personne ne
+repasse derrière. Un écart, même une vraie erreur, ne fait plus de courrier.
 
 Les désaccords devenaient un courrier à chaque glissement de la fenêtre de
 sept jours, y compris pour des prudences qui ne demandent rien. Ils vivent
@@ -59,9 +62,9 @@ class CourrierTests(unittest.TestCase):
         etat = _etat(demande_au_lieu_de_classer=3, demande_au_lieu_de_livrer=12)
         self.assertFalse(mail_worthy(etat))
 
-    def test_une_erreur_ouverte_produit_un_courrier(self) -> None:
-        self.assertTrue(mail_worthy(_etat(laisse_passer=1)))
-        self.assertTrue(mail_worthy(_etat(erreur_de_qualification=1)))
+    def test_une_vraie_erreur_ne_produit_pas_de_courrier(self) -> None:
+        self.assertFalse(mail_worthy(_etat(laisse_passer=1)))
+        self.assertFalse(mail_worthy(_etat(erreur_de_qualification=1)))
 
     def test_une_erreur_acquittee_ne_produit_plus_de_courrier(self) -> None:
         # L'écart existe toujours dans les mesures 7 j, mais il est traité :
@@ -74,10 +77,16 @@ class CourrierTests(unittest.TestCase):
         self.assertFalse(mail_worthy(etat))
 
     def test_un_compteur_d_anomalie_produit_un_courrier(self) -> None:
-        for compteur in ("retenues_sans_avis", "dossiers_coinces",
-                         "livraisons_differees", "alertes_amorties_24h"):
+        for compteur in (
+            "retenues_sans_avis",
+            "dossiers_coinces",
+            "livraisons_differees",
+        ):
             with self.subTest(compteur=compteur):
                 self.assertTrue(mail_worthy(_etat(**{compteur: 1})))
+
+    def test_des_alertes_regroupees_seules_ne_produisent_pas_de_courrier(self) -> None:
+        self.assertFalse(mail_worthy(_etat(alertes_amorties_24h=9)))
 
 
 class DiagnosticTests(unittest.TestCase):
@@ -147,6 +156,38 @@ class LettreEcartsTests(unittest.TestCase):
                        ecarts_url="https://console.example/ecarts")
         self.assertIn("https://console.example/ecarts", rendu.text)
         self.assertIn("https://console.example/ecarts", rendu.html)
+
+    def test_une_vraie_erreur_ne_demande_ni_revue_ni_acquittement(self) -> None:
+        etat = _etat(laisse_passer=1, sens_des_desaccords_7j={"laisse_passer": 1})
+        rendu = lettre(etat, {"diagnosis": ""}, {},
+                       ecarts_url="https://console.example/ecarts")
+        for texte in (rendu.text, rendu.html, rendu.subject):
+            self.assertNotIn("acquitte", texte)
+            self.assertNotIn("examine", texte)
+            self.assertNotIn("intervention requise", texte)
+        self.assertIn("aucune action n’est requise", rendu.text + rendu.html)
+
+
+class EnregistrementTests(unittest.TestCase):
+    """L'écart naît clos par le verdict humain."""
+
+    def test_l_ecart_est_clos_des_sa_creation(self) -> None:
+        import inspect
+
+        from sentimail_v3.supervision import discrepancies
+
+        source = inspect.getsource(discrepancies.record)
+        self.assertIn("acknowledged_at, acknowledged_by", source)
+        self.assertIn("HUMAN_VERDICT", source)
+        self.assertIn("WHERE acknowledged_at IS NULL", source)
+        self.assertEqual("verdict_humain", discrepancies.HUMAN_VERDICT)
+
+    def test_l_etat_ne_porte_plus_d_ecarts_a_traiter(self) -> None:
+        import inspect
+
+        from sentimail_v3.supervision import caretaker
+
+        self.assertNotIn("ecarts_non_traites", inspect.getsource(caretaker))
 
     def test_sans_url_la_lettre_reste_muette_sur_la_console(self) -> None:
         rendu = lettre(_etat(), {"diagnosis": ""}, {})

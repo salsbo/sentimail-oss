@@ -37,6 +37,15 @@ OPEN_STATUSES = [
     "deferred",
     "release_pending",
 ]
+# Un abandon ferme la conversation sans livrer l'original : son état SMTP
+# reste held. Il ne faut pas le conserver comme une retenue encore libérable.
+RETENTION_ELIGIBLE_SQL = """(
+    NOT (m.delivery_status = ANY($2::text[]))
+    OR (m.delivery_status='held' AND EXISTS (
+        SELECT 1 FROM delivery_cases dc
+        WHERE dc.message_id=m.id AND dc.state='ignored'
+    ))
+)"""
 MINIMUM_REDACT_DAYS = 7
 TECHNICAL_AUDIT_ACTIONS = ["investigation.created", "verdict.proposed"]
 
@@ -73,18 +82,36 @@ async def _expired_message_ids(
     )
     rows = await connection.fetch(
         f"""
-        SELECT id FROM messages
-        WHERE captured_at < now() - ($1 * interval '1 day')
-          AND NOT (delivery_status = ANY($2::text[]))
+        SELECT m.id,m.delivery_status FROM messages m
+        WHERE m.captured_at < now() - ($1 * interval '1 day')
+          AND {RETENTION_ELIGIBLE_SQL}
           AND {clause}
         ORDER BY captured_at
         LIMIT $3
+        FOR UPDATE OF m SKIP LOCKED
         """,
         days,
         OPEN_STATUSES,
         batch,
     )
-    return [row["id"] for row in rows]
+    held = [row["id"] for row in rows if row["delivery_status"] == "held"]
+    locked_holds = set()
+    if held:
+        # La livraison réserve aussi le message puis le dossier. Si un autre
+        # chemin tient déjà le dossier, attendre ici pourrait former un cycle
+        # de verrous : ce dossier attendra simplement la prochaine passe.
+        locked_holds = {
+            row["message_id"] for row in await connection.fetch(
+                """SELECT message_id FROM delivery_cases
+                   WHERE message_id=ANY($1::uuid[]) AND state='ignored'
+                   FOR UPDATE SKIP LOCKED""",
+                held,
+            )
+        }
+    return [
+        row["id"] for row in rows
+        if row["delivery_status"] != "held" or row["id"] in locked_holds
+    ]
 
 
 async def redact_expired(
@@ -100,12 +127,14 @@ async def redact_expired(
             await connection.execute(
                 """
                 UPDATE messages
-                SET raw_eml=NULL, body_text=NULL, body_html=NULL, redacted_at=now()
+                SET raw_eml=NULL, body_text=NULL, body_html=NULL,
+                    facts=facts-'visible_content', redacted_at=now()
                 WHERE id = ANY($1::uuid[])
                 """,
                 ids,
             )
         )
+        await connection.execute("DELETE FROM observation_cache WHERE message_id=ANY($1::uuid[])", ids)
         counts["mime_parts"] = _rows(
             await connection.execute(
                 """
@@ -161,10 +190,12 @@ async def redact_expired_conversations(
             await connection.execute(
                 """
                 UPDATE assistant_outbox
-                SET body_text='', attachment_content=NULL
+                SET body_text='', body_html=NULL, attachment_content=NULL,
+                    inline_content=NULL
                 WHERE created_at < now() - ($1 * interval '1 day')
                   AND status='sent'
-                  AND (body_text <> '' OR attachment_content IS NOT NULL)
+                  AND (body_text <> '' OR coalesce(body_html,'') <> ''
+                       OR attachment_content IS NOT NULL OR inline_content IS NOT NULL)
                 """,
                 days,
             )
@@ -205,6 +236,10 @@ async def delete_expired(
                     "DELETE FROM messages WHERE id = ANY($1::uuid[])", ids
                 )
             )
+        await connection.execute("DELETE FROM observation_cache WHERE expires_at <= now()")
+        await connection.execute(
+            "DELETE FROM llm_attempt_events WHERE created_at < now()-($1*interval '1 day')", days
+        )
         counts["llm_events"] = _rows(
             await connection.execute(
                 """

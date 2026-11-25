@@ -35,10 +35,10 @@ class EncodageMailtoTests(unittest.TestCase):
                 self.assertNotIn("+", corps)
 
     def test_l_avis_indesirable_est_encode_pareil(self) -> None:
-        for lettre in ("A", "C"):
-            with self.subTest(lettre=lettre):
-                corps = _corps_tel_que_lu(junk_choice_links("maia@mondomaine.example")[lettre])
-                self.assertNotIn("+", corps)
+        corps = _corps_tel_que_lu(
+            junk_choice_links("maia@mondomaine.example")["A"]
+        )
+        self.assertNotIn("+", corps)
 
     def test_le_refus_est_lu_comme_un_refus_et_non_une_livraison(self) -> None:
         corps = _corps_tel_que_lu(choice_links("maia@mondomaine.example")["B"])
@@ -56,16 +56,6 @@ class EncodageMailtoTests(unittest.TestCase):
         corps = _corps_tel_que_lu(junk_choice_links("maia@mondomaine.example")["A"])
         verdict = evaluate_directive(corps, {"requested_action": "release_original"})
         self.assertEqual(verdict["explicit_action"], "release_original")
-
-    def test_le_pied_de_page_de_signalement_est_encode_pareil(self) -> None:
-        from types import SimpleNamespace
-
-        from sentimail_v3.execution.delivery import _feedback_mailto
-
-        lien = _feedback_mailto(
-            SimpleNamespace(action_address="maia@mondomaine.example"), "JETON"
-        )
-        self.assertNotIn("+", _corps_tel_que_lu(lien))
 
     def test_les_accents_restent_lisibles(self) -> None:
         # Les corps sont des phrases rédigées : leurs accents doivent survivre

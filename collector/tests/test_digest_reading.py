@@ -100,3 +100,67 @@ class ReferenceRetrouveeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SequenceTests(unittest.TestCase):
+    """Sur téléphone, cocher est pénible : une suite de lettres, dans l'ordre
+    des dossiers, décide les uns après les autres. A et B seulement : un C
+    appelle une explication, qu'une suite ne porte pas."""
+
+    def _lire(self, texte: str, taille: int = 5):
+        return read_reply(texte, texte, REFERENCE, mapping_size=taille)
+
+    def test_une_suite_collee_decide_dans_l_ordre(self) -> None:
+        lecture = self._lire("ABAAB")
+        self.assertEqual(
+            [(d.number, d.choice) for d in lecture.decisions],
+            [(1, "A"), (2, "B"), (3, "A"), (4, "A"), (5, "B")],
+        )
+        self.assertTrue(lecture.sequence)
+
+    def test_les_separateurs_et_les_minuscules_passent(self) -> None:
+        for texte in ("a, b, a", "A B A", "A\nB\nA", "a-b-a", "A ; B ; A"):
+            with self.subTest(texte=texte):
+                lecture = self._lire(texte)
+                self.assertEqual(
+                    [(d.number, d.choice) for d in lecture.decisions],
+                    [(1, "A"), (2, "B"), (3, "A")],
+                )
+
+    def test_une_suite_plus_courte_decide_les_premiers(self) -> None:
+        lecture = self._lire("AB")
+        self.assertEqual([(d.number, d.choice) for d in lecture.decisions], [(1, "A"), (2, "B")])
+
+    def test_une_suite_plus_longue_ne_decide_rien_et_le_dit(self) -> None:
+        lecture = self._lire("ABAAB", taille=3)
+        self.assertEqual(lecture.decisions, [])
+        self.assertFalse(lecture.sequence)
+        self.assertIn("5 lettres", lecture.note)
+        self.assertIn("3 message", lecture.note)
+
+    def test_un_c_n_entre_pas_dans_une_suite(self) -> None:
+        lecture = self._lire("ABC")
+        self.assertEqual(lecture.decisions, [])
+        self.assertFalse(lecture.sequence)
+        self.assertEqual(lecture.note, "")
+
+    def test_un_mot_en_plus_n_est_pas_une_suite(self) -> None:
+        lecture = self._lire("AB merci")
+        self.assertEqual(lecture.decisions, [])
+        self.assertFalse(lecture.sequence)
+
+    def test_une_lettre_seule_n_est_pas_une_suite(self) -> None:
+        """Une lettre quand plusieurs attendent : on ignore de quoi elle parle."""
+        lecture = self._lire("A")
+        self.assertEqual(lecture.decisions, [])
+        self.assertFalse(lecture.sequence)
+
+    def test_les_croix_l_emportent_sur_la_suite(self) -> None:
+        lecture = read_reply("BA", "BA\n" + CITATION, REFERENCE, mapping_size=3)
+        self.assertEqual([(d.number, d.choice) for d in lecture.decisions], [(1, "A"), (2, "B")])
+        self.assertFalse(lecture.sequence)
+
+    def test_le_couple_ecrit_l_emporte_sur_la_suite(self) -> None:
+        lecture = self._lire("1 B\nAB")
+        self.assertEqual([(d.number, d.choice) for d in lecture.decisions], [(1, "B")])
+        self.assertFalse(lecture.sequence)

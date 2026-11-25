@@ -9,9 +9,10 @@ réponse, et l'exploitant a reçu un reproche sur une réponse qu'il n'avait pas
 
 from __future__ import annotations
 
+import json
 import unittest
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from sentimail_v3.conversation import assistant
 from sentimail_v3.identity import reset_cache
@@ -54,15 +55,23 @@ class _Async:
 
 
 class _Pool:
-    def __init__(self, dossiers: dict[str, dict[str, Any]], auteur: str = AUTEUR):
+    def __init__(
+        self,
+        dossiers: dict[str, dict[str, Any]],
+        auteur: str = AUTEUR,
+        accuse: bool | None = None,
+    ):
         self._dossiers = dossiers
         self._auteur = auteur
+        self._accuse = accuse
         self.connection = _Connection()
         self.remaining_args: tuple[Any, ...] = ()
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
         if "participant_email FROM conversations" in sql:
             return self._auteur or None
+        if "participant_preferences" in sql:
+            return self._accuse
         if "count(*)" in sql:
             self.remaining_args = args
             return 0
@@ -97,6 +106,18 @@ BULLETIN_VIERGE = (
     "1. Premium Watch... Premium Band???\n[ ] A [ ] B [ ] C :\n\n"
     "2. New Dress. Fall Arrivals\n[ ] A [ ] B [ ] C :\n\nMerci !\n"
 )
+
+
+DOSSIER_A_MOI = {
+    "uuid-1": {
+        "subject": "Facture",
+        "from_header": "compta@exemple.fr",
+        "envelope_from": "compta@exemple.fr",
+        "delivery_status": "held",
+        "case_id": "33333333-3333-3333-3333-333333333333",
+        "participant_email": "",
+    }
+}
 
 
 class AccuseSuitLAuteurTests(unittest.IsolatedAsyncioTestCase):
@@ -135,6 +156,18 @@ class AccuseSuitLAuteurTests(unittest.IsolatedAsyncioTestCase):
         # queue_response(conversation_id, case_id, participant, ...)
         self.assertEqual(envois[0][2], AUTEUR)
 
+    async def test_une_suite_vise_les_numeros_du_lot_et_non_ceux_du_premier_lot(self):
+        pool = _Pool({
+            "uuid-4": {"subject": "Quatrième dossier", "participant_email": ""},
+            "uuid-5": {"subject": "Cinquième dossier", "participant_email": ""},
+        })
+        with patch.object(assistant, "_apply_single_decision", AsyncMock()) as apply:
+            await self._repondre(pool, _message("AB"), {"5": "uuid-5", "4": "uuid-4"})
+        self.assertEqual(
+            [(call.args[2], call.args[4].number, call.args[4].choice) for call in apply.call_args_list],
+            [("uuid-4", 4, "A"), ("uuid-5", 5, "B")],
+        )
+
     async def test_le_decompte_restant_porte_sur_l_auteur(self) -> None:
         pool = _Pool({})
         await self._repondre(
@@ -168,6 +201,64 @@ class AccuseSuitLAuteurTests(unittest.IsolatedAsyncioTestCase):
         corps = envois[0][6]
         self.assertNotIn("Facture", corps)
         self.assertIn("ne correspondent à rien", corps)
+
+    # Une décision lue sans doute est prise en compte : MAIA ne le redit pas.
+    async def test_une_decision_claire_ne_declenche_aucun_courrier(self) -> None:
+        pool = _Pool(DOSSIER_A_MOI)
+        with patch.object(assistant, "_apply_single_decision", AsyncMock()) as apply:
+            envois = await self._repondre(pool, _message("1 B"), {"1": "uuid-1"})
+        self.assertEqual(apply.await_count, 1)
+        self.assertEqual(envois, [])
+
+    async def test_l_accuse_demande_est_envoye(self) -> None:
+        pool = _Pool(DOSSIER_A_MOI, accuse=True)
+        with patch.object(assistant, "_apply_single_decision", AsyncMock()):
+            envois = await self._repondre(pool, _message("1 B"), {"1": "uuid-1"})
+        self.assertEqual(len(envois), 1)
+        self.assertIn("C’est noté", envois[0][6])
+
+    async def test_une_phrase_sur_un_dossier_dangereux_est_redemandee(self) -> None:
+        # Le verdict seul suffit désormais : sans preuve matérielle, un message
+        # classé dangereux n'est pas livré sur une phrase comprise par le modèle.
+        dossier = {**DOSSIER_A_MOI["uuid-1"], "assessed_classification": "dangerous"}
+        pool = _Pool({"uuid-1": dossier})
+        envois: list[Any] = []
+
+        async def _queue(connection, *args, **kwargs):
+            envois.append(args)
+
+        async def _modele(*_: Any, **__: Any):
+            return [assistant.DigestDecision(1, "A", "", True)], None
+
+        with (
+            patch.object(assistant, "queue_response", _queue),
+            patch.object(assistant, "_understand_digest_reply", _modele),
+            patch.object(assistant, "_apply_single_decision", AsyncMock()) as apply,
+        ):
+            await assistant._process_digest_reply(
+                pool,
+                None,
+                _Settings(),
+                _message("le premier est bon"),
+                {"1": "uuid-1"},
+                "D-e96119",
+            )
+        apply.assert_not_awaited()
+        self.assertIn("classe dangereux", envois[0][6])
+        self.assertIn("« 1 A »", envois[0][6])
+        audit = next(
+            args[0]
+            for sql, args in pool.connection.executed
+            if "digest.decisions_applied" in sql
+        )
+        self.assertEqual(json.loads(audit)["needs_confirmation"], [1])
+
+    async def test_une_lettre_ecrite_sur_un_dossier_dangereux_livre(self) -> None:
+        dossier = {**DOSSIER_A_MOI["uuid-1"], "assessed_classification": "dangerous"}
+        pool = _Pool({"uuid-1": dossier})
+        with patch.object(assistant, "_apply_single_decision", AsyncMock()) as apply:
+            await self._repondre(pool, _message("1 A"), {"1": "uuid-1"})
+        apply.assert_awaited_once()
 
 
 if __name__ == "__main__":

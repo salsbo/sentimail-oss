@@ -16,11 +16,12 @@ hors de la zone de saisie est la seule façon de la soustraire au regard.
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 from sentimail_v3.conversation.action_tokens import ACTION_MARKER_RE
+from sentimail_v3.conversation.assistant import _preformatted_choice
 from sentimail_v3.conversation.directive_policy import evaluate_directive
+from sentimail_v3.conversation.directive_receipt import _links as receipt_links
 from sentimail_v3.conversation.junk_notice import (
     JUNK_TOKEN_PLACEHOLDER,
     junk_choice_links,
@@ -29,7 +30,6 @@ from sentimail_v3.conversation.review_notice import (
     ACTION_TOKEN_PLACEHOLDER,
     choice_links,
 )
-from sentimail_v3.execution.delivery import _feedback_links
 
 ADRESSE = "maia@sentinel.mondomaine.example"
 JETON = "j" * 43
@@ -42,13 +42,12 @@ def _champs(lien: str) -> dict[str, str]:
 
 def _surfaces() -> dict[str, tuple[dict[str, str], str]]:
     """Chaque surface, ses liens et le marqueur qu'elle emploie."""
-    reglages = SimpleNamespace(action_address=ADRESSE)
     return {
         "avis retenu": (choice_links(ADRESSE), ACTION_TOKEN_PLACEHOLDER),
         "avis classé": (junk_choice_links(ADRESSE), JUNK_TOKEN_PLACEHOLDER),
-        "message livré": (
-            _feedback_links(reglages, JETON),  # type: ignore[arg-type]
-            f"S3-ACTION:{JETON}",
+        "accusé de directive": (
+            receipt_links(ADRESSE, True),
+            ACTION_TOKEN_PLACEHOLDER,
         ),
     }
 
@@ -112,8 +111,9 @@ class InterpretationConserveeTests(unittest.TestCase):
     """Les phrases restent lues sans modèle, comme les lettres l'étaient."""
 
     def test_les_acceptations_demandent_la_livraison(self) -> None:
-        for surface in ("avis retenu", "avis classé"):
-            liens, _ = _surfaces()[surface]
+        for surface, (liens, _) in _surfaces().items():
+            if "A" not in liens:
+                continue
             with self.subTest(surface=surface):
                 corps = _champs(liens["A"])["body"]
                 verdict = evaluate_directive(
@@ -122,6 +122,7 @@ class InterpretationConserveeTests(unittest.TestCase):
                 self.assertEqual(verdict["explicit_action"], "release_original")
                 self.assertEqual(verdict["explicit_classification"], "legitimate")
                 self.assertEqual(verdict["conflicts"], [])
+                self.assertEqual(_preformatted_choice(corps)[0], "A")
 
     def test_les_refus_bloquent_les_prochains(self) -> None:
         # L'avis d'indésirable n'offre pas de B : le classement est acquis.
@@ -136,9 +137,12 @@ class InterpretationConserveeTests(unittest.TestCase):
                 self.assertEqual(verdict["explicit_action"], "suppress_future")
                 self.assertEqual(verdict["explicit_classification"], "spam")
                 self.assertEqual(verdict["conflicts"], [])
+                self.assertEqual(_preformatted_choice(corps)[0], "B")
 
     def test_autre_chose_ne_decide_rien(self) -> None:
         for surface, (liens, _) in _surfaces().items():
+            if "C" not in liens:
+                continue
             with self.subTest(surface=surface):
                 corps = _champs(liens["C"])["body"]
                 verdict = evaluate_directive(
@@ -146,6 +150,28 @@ class InterpretationConserveeTests(unittest.TestCase):
                 )
                 self.assertIsNone(verdict["explicit_action"])
                 self.assertIsNone(verdict["explicit_classification"])
+                self.assertEqual(_preformatted_choice(corps), ("C_TEXT", ""))
+
+    def test_le_texte_ajoute_a_c_est_seul_envoye_au_llm(self) -> None:
+        corps = _champs(_surfaces()["avis retenu"][0]["C"])["body"]
+        corps = corps.replace(
+            "Tapez ici vos demandes ou remarques",
+            "Ce message vient de mon comptable, mais ne le livre pas encore.",
+        )
+        self.assertEqual(
+            _preformatted_choice(corps),
+            (
+                "C_TEXT",
+                "Ce message vient de mon comptable, mais ne le livre pas encore.",
+            ),
+        )
+
+    def test_une_phrase_contradictoire_ne_devient_jamais_un_choix(self) -> None:
+        self.assertIsNone(
+            _preformatted_choice(
+                "Ce message est légitime, mais ne le livre pas et bloque les prochains."
+            )[0]
+        )
 
 
 if __name__ == "__main__":

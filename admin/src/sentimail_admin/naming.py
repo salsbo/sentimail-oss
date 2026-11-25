@@ -10,9 +10,9 @@ un domaine enrôlé qui ne protège personne.
 from __future__ import annotations
 
 import ipaddress
-
 import uuid
 from email.utils import parseaddr
+from urllib.parse import urlparse
 
 from .presets import PRESETS
 
@@ -121,6 +121,18 @@ def normalize_identifier(raw: object) -> str:
         raise SaisieInvalide("Domaine inconnu.") from error
 
 
+def normalize_client_name(raw: object) -> str:
+    """Nom d'organisation affiché dans la console, sans contenu de contrôle."""
+    value = " ".join(str(raw or "").strip().split())
+    if not value:
+        raise SaisieInvalide("Indiquez un nom de client.")
+    if len(value) > 120:
+        raise SaisieInvalide("Ce nom de client est trop long.")
+    if any(ord(character) < 32 for character in value):
+        raise SaisieInvalide("Ce nom de client contient un caractère de contrôle.")
+    return value
+
+
 def clamp_limit(raw: object, *, default: int, maximum: int) -> int:
     """Nombre de lignes demandé, ramené dans une plage tenable."""
     try:
@@ -181,20 +193,45 @@ def normalize_role(raw: object) -> str:
     return value
 
 
+def normalize_local_role(raw: object) -> str:
+    """Les rôles qu'Ollama peut servir, dont l'analyse non contraignante."""
+    value = str(raw or "").strip().lower()
+    if value not in {"conversation", "analysis", "verdict"}:
+        raise SaisieInvalide("Rôle local inconnu.")
+    return value
+
+
 def normalize_base_url(raw: object) -> str:
     """L'adresse où part le courrier vers le moteur : http(s) uniquement.
 
     Un fournisseur nommé n'existe plus dans la configuration : c'est cette URL
     qui dit où part le courrier, telle que ``llm_role_providers`` la retient.
-    Elle refuse tout schéma qui n'est pas web, et tout espace interne.
+    Elle exige un schéma http(s), un hôte non vide, aucun caractère blanc ou de
+    contrôle, aucun identifiant embarqué et un port valide s'il est présent.
     """
     value = str(raw or "").strip()
     if not value:
         raise SaisieInvalide("Indiquez l'adresse du moteur.")
-    if any(character.isspace() for character in value):
-        raise SaisieInvalide("Cette adresse ne peut pas contenir d'espace.")
-    if not value.startswith(("http://", "https://")):
+    if any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in value
+    ):
+        raise SaisieInvalide(
+            "Cette adresse ne peut pas contenir d'espace ni de caractère de contrôle."
+        )
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
         raise SaisieInvalide("Cette adresse doit commencer par http:// ou https://.")
+    if parsed.username is not None or parsed.password is not None:
+        raise SaisieInvalide("Cette adresse ne doit pas contenir d'identifiants.")
+    if not parsed.hostname:
+        raise SaisieInvalide("Cette adresse doit contenir un nom d'hôte valide.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise SaisieInvalide("Le port de cette adresse est invalide.") from exc
+    if port is not None and not (1 <= port <= 65535):
+        raise SaisieInvalide("Le port de cette adresse est invalide.")
     return value
 
 

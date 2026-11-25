@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +13,9 @@ from sentimail_v3.observation.dossier import run_hooks
 from sentimail_v3.observation.dossier.models import HookResult, InvestigationContext
 from sentimail_v3.observation.entities import extract_entities
 from sentimail_v3.observation.parser import ParsedMessage, parse_message
+from sentimail_v3.observation.visible_content import build_visible_content
+from sentimail_v3.postgres_values import pg_json, pg_jsonsafe, pg_text
+from sentimail_v3.supervision.core_rollout import generation_for_capture
 
 
 @dataclass(frozen=True)
@@ -23,7 +26,7 @@ class CaptureResult:
 
 
 def _json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    return pg_json(value)
 
 
 def _raw_facts(raw: bytes) -> dict[str, object]:
@@ -93,7 +96,9 @@ class Store:
             )
         )
         key = ingest_key(raw, sender, recipients)
-        message_values = parsed.message
+        # Les vues SQL ne peuvent pas contenir NUL. L'EML, les empreintes et
+        # les mesures ci-dessus gardent les octets observés, sans modification.
+        message_values = pg_jsonsafe(parsed.message)
 
         async with self.pool.acquire() as connection, connection.transaction():
             row = await connection.fetchrow(
@@ -124,13 +129,13 @@ class Store:
                 key,
                 smtp.get("peer_ip"),
                 smtp.get("peer_port"),
-                smtp.get("helo"),
-                smtp.get("protocol"),
+                pg_text(smtp.get("helo")),
+                pg_text(smtp.get("protocol")),
                 _json(smtp.get("tls") or {}),
                 smtp.get("authenticated"),
-                sender,
-                recipients,
-                list(smtp.get("mail_options") or []),
+                pg_text(sender),
+                pg_jsonsafe(recipients),
+                pg_jsonsafe(list(smtp.get("mail_options") or [])),
                 _json(smtp.get("rcpt_options") or {}),
                 stored_raw,
                 encryption,
@@ -166,7 +171,9 @@ class Store:
                     )
                 ],
                 _json(message_values["parser_defects"]),
-                _json(parsed.facts),
+                _json({**parsed.facts, "visible_content": build_visible_content(
+                    message_values.get("body_text"), message_values.get("body_html")
+                )}),
             )
             assert row is not None
             result = CaptureResult(
@@ -180,6 +187,25 @@ class Store:
                 )
                 await self._insert_investigation(
                     connection, result.message_id, hook_results
+                )
+                # La génération ne dépend que de la configuration qualifiée,
+                # jamais du correspondant. Le savepoint protège la capture
+                # durable si la supervision de bascule devient indisponible.
+                generation = "legacy"
+                try:
+                    async with connection.transaction():
+                        async with asyncio.timeout(1):
+                            generation = await generation_for_capture(connection, result.message_id)
+                except Exception as exc:
+                    await connection.execute(
+                        "INSERT INTO audit_log(actor,action,payload) "
+                        "VALUES('capture','core.generation_fallback',$1::jsonb)",
+                        _json({"message_id": result.message_id, "error_type": type(exc).__name__}),
+                    )
+                await connection.execute(
+                    "UPDATE messages SET engine_generation=$2,engine_generation_assigned_at=now() "
+                    "WHERE id=$1::uuid AND engine_generation_assigned_at IS NULL",
+                    result.message_id, generation,
                 )
             return result
 
@@ -197,7 +223,7 @@ class Store:
                 value_decoded, value_sha256, value_length, is_trace, is_security
             ) VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             """,
-            [(message_id, *row.values()) for row in parsed.headers],
+            [(message_id, *pg_jsonsafe(row).values()) for row in parsed.headers],
         )
         await connection.executemany(
             """
@@ -219,7 +245,7 @@ class Store:
                     _json(row["parameters"]),
                     _json(row["defects"]),
                 )
-                for row in parsed.parts
+                for row in pg_jsonsafe(parsed.parts)
             ],
         )
         await connection.executemany(
@@ -239,7 +265,7 @@ class Store:
                     row["value_normalized"],
                     _json(row["attributes"]),
                 )
-                for row in entities
+                for row in pg_jsonsafe(entities)
             ],
         )
 
@@ -248,7 +274,8 @@ class Store:
 
         Les en-têtes, parties MIME et entités sont issus du même EML : ils ne
         changent pas et ne sont pas retouchés. Seule l'observation, qui dépend
-        du code des hooks, est refaite.
+        du code des hooks, est refaite. Un verdict accepté interdit ce rejeu.
+        Une vue lisible absente peut être ajoutée tant que l'original existe.
         """
         row = await self.pool.fetchrow(
             """
@@ -273,6 +300,30 @@ class Store:
             )
         )
         async with self.pool.acquire() as connection, connection.transaction():
+            # Un rejeu ne ressuscite pas le contenu purgé pendant l'observation
+            # et ne remplace jamais une décision déjà acceptée.
+            available = await connection.fetchrow(
+                "SELECT raw_eml FROM messages WHERE id=$1::uuid FOR UPDATE", message_id
+            )
+            if available is None or available["raw_eml"] is None:
+                return False
+            await connection.fetch(
+                "SELECT id FROM investigations WHERE message_id=$1::uuid FOR UPDATE", message_id
+            )
+            if await connection.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM verdicts v JOIN investigations i
+                   ON i.id=v.investigation_id WHERE i.message_id=$1::uuid AND v.is_binding)""",
+                message_id,
+            ):
+                return False
+            await connection.execute(
+                """UPDATE messages SET facts=jsonb_set(facts,'{visible_content}',$2::jsonb)
+                   WHERE id=$1::uuid AND NOT (facts ? 'visible_content')""",
+                message_id,
+                _json(build_visible_content(
+                    parsed.message.get("body_text"), parsed.message.get("body_html")
+                )),
+            )
             await connection.execute(
                 "DELETE FROM investigations WHERE message_id=$1::uuid", message_id
             )
@@ -374,14 +425,14 @@ class Store:
                 RETURNING id
                 """,
                 investigation_id,
-                result.hook_name,
-                result.hook_version,
+                pg_text(result.hook_name),
+                pg_text(result.hook_version),
                 run_order,
-                result.status,
+                pg_text(result.status),
                 result.duration_ms,
                 _json(result.facts),
-                result.error_type,
-                result.error_detail,
+                pg_text(result.error_type),
+                pg_text(result.error_detail),
             )
             for ordinal, clue in enumerate(result.clues):
                 article = articles.get(clue.article_code)
@@ -402,12 +453,12 @@ class Store:
                     investigation_id,
                     hook_run_id,
                     article["id"] if article is not None else None,
-                    clue.article_code,
-                    clue.clue_code,
-                    clue.direction,
+                    pg_text(clue.article_code),
+                    pg_text(clue.clue_code),
+                    pg_text(clue.direction),
                     clue.strength,
                     clue.confidence,
-                    clue.statement,
+                    pg_text(clue.statement),
                     _json(clue.facts),
                     _json(clue.provenance),
                     _json(snapshot),
@@ -486,4 +537,4 @@ class Store:
             )
 
     async def mark_deferred(self, message_id: str, error: str) -> None:
-        await move(self.pool, message_id, DEFERRED, error=error[:2000])
+        await move(self.pool, message_id, DEFERRED, error=pg_text(error[:2000]))

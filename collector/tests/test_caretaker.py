@@ -2,9 +2,43 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
+from unittest.mock import patch
 
 from sentimail_v3.supervision import caretaker
 from sentimail_v3.supervision.caretaker import SAFE_ACTIONS, execute, worth_reporting
+
+
+class ReparationDesRetenuesTests(unittest.IsolatedAsyncioTestCase):
+    """La réparation d'une retenue orpheline reçoit la file des avis.
+
+    Depuis que `reconcile_one_review_hold` exige la file qui remet l'avis en
+    route, le caretaker l'appelait sans elle : TypeError à chaque passage,
+    « caretaker.error » au journal, rien de réparé (prod des 9 et 10
+    septembre 2026). Le worker de verdict faisait le travail à sa place.
+    """
+
+    async def test_la_reparation_recoit_la_file_d_invitations(self) -> None:
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        file = SimpleNamespace(queue_invitation=AsyncMock(return_value=True))
+        reparer = AsyncMock(side_effect=[True, False])
+        with (
+            patch.object(caretaker, "_invitation_queue", AsyncMock(return_value=file)),
+            patch.object(caretaker, "reconcile_one_review_hold", reparer),
+        ):
+            outcome = await execute(None, None, ["reconcile_review_holds"])
+        self.assertEqual({"reconcile_review_holds": 1}, outcome)
+        reparer.assert_awaited_with(None, None, file)
+
+    def test_la_signature_reelle_accepte_ce_que_le_caretaker_envoie(self) -> None:
+        # Le doublon de sécurité : si la signature change encore, ce test
+        # tombe avant la production.
+        import inspect
+
+        from sentimail_v3.execution.review_guard import reconcile_one_review_hold
+
+        inspect.signature(reconcile_one_review_hold).bind(None, None, None)
 
 
 class GardeFousTests(unittest.IsolatedAsyncioTestCase):
@@ -32,7 +66,13 @@ class GardeFousTests(unittest.IsolatedAsyncioTestCase):
 
             from sentimail_v3.config import load_settings
 
-            settings = replace(load_settings(), provider_secrets_dir="/nonexistent")
+            with patch.dict(
+                "os.environ",
+                {"DATABASE_URL": "postgresql://test:test@127.0.0.1:9/test"},
+            ):
+                settings = replace(
+                    load_settings(), provider_secrets_dir="/nonexistent"
+                )
             verdict = await caretaker.diagnose(None, None, settings, {})
         finally:
             caretaker.provider_chat_json = original
@@ -52,7 +92,13 @@ class GardeFousTests(unittest.IsolatedAsyncioTestCase):
 
             from sentimail_v3.config import load_settings
 
-            settings = replace(load_settings(), provider_secrets_dir="/nonexistent")
+            with patch.dict(
+                "os.environ",
+                {"DATABASE_URL": "postgresql://test:test@127.0.0.1:9/test"},
+            ):
+                settings = replace(
+                    load_settings(), provider_secrets_dir="/nonexistent"
+                )
             verdict = await caretaker.diagnose(None, None, settings, {})
         finally:
             caretaker.provider_chat_json = original

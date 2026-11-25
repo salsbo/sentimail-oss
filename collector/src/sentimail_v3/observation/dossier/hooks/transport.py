@@ -12,6 +12,14 @@ from sentimail_v3.observation.dossier.models import Clue, InvestigationContext
 
 _IP = re.compile(r"\[([0-9a-f:.]+)\]", re.IGNORECASE)
 
+# Deux relais qui se passent un message tamponnent chacun l'heure. Leurs
+# horloges ne sont jamais parfaitement synchronisées : un décalage de quelques
+# secondes vers l'arrière est banal, pas une falsification. On tolère jusqu'à
+# une minute avant de compter une incohérence. Une vraie chaîne fabriquée se
+# trahit par des sauts bien plus grands (M-6b35d8, Huawei : 31 s entre deux
+# serveurs internes, horloge en retard, pas une fraude).
+_CHRONOLOGY_TOLERANCE_SECONDS = 60
+
 
 class TransportHook(EvidenceHook):
     name: ClassVar[str] = "transport"
@@ -55,7 +63,10 @@ class TransportHook(EvidenceHook):
                     {"source": "header:received"},
                 )
             )
-        chronology_errors = sum(newer < older for newer, older in pairwise(dates))
+        chronology_errors = sum(
+            (older - newer).total_seconds() > _CHRONOLOGY_TOLERANCE_SECONDS
+            for newer, older in pairwise(dates)
+        )
         if chronology_errors:
             clues.append(
                 Clue(

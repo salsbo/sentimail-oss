@@ -3,12 +3,8 @@ from __future__ import annotations
 import re
 import unittest
 
-from sentimail_v3.conversation.choice_answers import (
-    GRIS,
-    ROUGE,
-    VERT,
-    render_choices,
-)
+from sentimail_v3.conversation.choice_answers import render_choices
+from sentimail_v3.conversation.choice_registry import GRIS, ROUGE, VERT
 
 CHOIX = (
     ("A", "Livre-le-moi", "C’était une erreur", VERT),
@@ -32,13 +28,18 @@ class FormeDuBoutonTests(unittest.TestCase):
 
     def test_chaque_lettre_porte_sa_couleur_de_fond(self) -> None:
         rendu = render_choices(CHOIX, LIENS)
-        for lettre, couleur in (("A", VERT), ("B", ROUGE), ("C", GRIS)):
+        attendus = {
+            "A": f"background:{VERT}",
+            "B": "color:#b91c1c;background:#ffffff;border:1px solid #fecaca",
+            "C": "color:#334155;background:#ffffff;border:1px solid #cbd5e1",
+        }
+        for lettre, style in attendus.items():
             with self.subTest(lettre=lettre):
                 bloc = re.search(
                     r'data-choice="%s"(.*?)</a>' % lettre, rendu, re.S
                 )
                 self.assertIsNotNone(bloc)
-                self.assertIn(f"background:{couleur}", bloc.group(0))
+                self.assertIn(style, bloc.group(0))
 
     def test_la_lettre_est_dans_le_bouton(self) -> None:
         rendu = render_choices(CHOIX, LIENS)
@@ -50,9 +51,11 @@ class FormeDuBoutonTests(unittest.TestCase):
                 self.assertIn(f">{lettre}<", bloc)
 
     def test_le_texte_du_bouton_est_blanc(self) -> None:
-        # Du texte sombre sur un fond vert ou rouge ne se lit pas.
+        # A est plein (texte blanc), B et C sont en contour lisible sur fond blanc.
         rendu = render_choices(CHOIX, LIENS)
-        self.assertEqual(rendu.count("color:#ffffff"), 3)
+        self.assertEqual(rendu.count("color:#ffffff"), 1)
+        self.assertIn("color:#b91c1c", rendu)
+        self.assertIn("color:#334155", rendu)
 
     def test_les_boutons_restent_petits(self) -> None:
         # « tout petits » : au plus 13px de texte, au plus 8px de marge interne.
@@ -67,6 +70,13 @@ class FormeDuBoutonTests(unittest.TestCase):
         rendu = render_choices(CHOIX, LIENS)
         self.assertNotIn("display:block", rendu)
         self.assertEqual(rendu.count("display:inline-block"), 3)
+
+    def test_deux_boutons_ne_se_touchent_jamais(self) -> None:
+        # Sans séparateur dans la source, un client qui jette la marge affiche
+        # « B · Non sollicitéC · Autre chose ».
+        rendu = render_choices(CHOIX, LIENS)
+        self.assertNotIn("</a><a ", rendu)
+        self.assertEqual(rendu.count("</a>&nbsp;<a "), len(CHOIX) - 1)
 
     def test_le_soulignement_disparait(self) -> None:
         # Un bouton souligné se lit comme un lien mal rendu.
@@ -108,34 +118,37 @@ class GarantiesConserveesTests(unittest.TestCase):
 
 
 class LesTroisSurfacesTests(unittest.TestCase):
-    """La même forme aux trois endroits qui demandent une réponse."""
+    """Chaque surface ne propose que les gestes encore utiles."""
 
     def test_le_gris_remplace_le_noir_partout(self) -> None:
-        from sentimail_v3.conversation import junk_notice, review_notice
-        from sentimail_v3.execution import delivery
+        from sentimail_v3.conversation.choice_registry import choice_presentations
 
         self.assertEqual(
-            [choix[-1] for choix in review_notice._CHOICES], [VERT, ROUGE, GRIS]
+            [choix.color for choix in choice_presentations("review")],
+            [VERT, ROUGE, GRIS],
         )
         self.assertEqual(
-            [choix[-1] for choix in junk_notice._CHOICES], [VERT, GRIS]
-        )
-        self.assertEqual(
-            [choix[-1] for choix in delivery._FEEDBACK_CHOICES][-1], GRIS
+            [choix.color for choix in choice_presentations("junk")], [VERT]
         )
 
     def test_le_jeu_de_boutons_suit_la_situation(self) -> None:
-        """Livré -> B et C ; doute -> A, B et C ; indésirable -> A et C.
+        """Doute -> A, B et C ; indésirable -> A ; livré -> aucun bouton.
 
-        Un message livré n'a pas de « livre-le-moi » ; un classement acquis
-        n'a pas de « bien classé » ; seul le doute offre les trois gestes.
+        Un classement acquis n'a qu'un geste utile, sa récupération ; seul le
+        doute offre les trois. Un message livré n'en porte aucun : écrits dans
+        son corps, ils repartaient chez l'expéditeur dans chaque réponse citée.
         """
-        from sentimail_v3.conversation import junk_notice, review_notice
-        from sentimail_v3.execution import delivery
+        from sentimail_v3.conversation.choice_registry import choice_presentations
 
-        self.assertEqual([c[0] for c in review_notice._CHOICES], ["A", "B", "C"])
-        self.assertEqual([c[0] for c in junk_notice._CHOICES], ["A", "C"])
-        self.assertEqual([c[0] for c in delivery._FEEDBACK_CHOICES], ["B", "C"])
+        self.assertEqual(
+            [choice.letter for choice in choice_presentations("review")],
+            ["A", "B", "C"],
+        )
+        self.assertEqual(
+            [choice.letter for choice in choice_presentations("junk")], ["A"]
+        )
+        with self.assertRaises(ValueError):
+            choice_presentations("delivered")
 
 
 if __name__ == "__main__":

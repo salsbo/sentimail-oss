@@ -77,7 +77,7 @@ class RunDeepHooksTests(unittest.IsolatedAsyncioTestCase):
 class RegistryTests(unittest.TestCase):
     def test_le_registre_est_la_source_unique(self) -> None:
         noms = [hook.name for hook in DEEP_HOOKS]
-        self.assertIn("activity_coherence", noms)
+        self.assertIn("sender_relation", noms)
         self.assertEqual(len(noms), len(set(noms)), "deux hooks de même nom")
 
     def test_chaque_hook_porte_une_version(self) -> None:
@@ -105,7 +105,7 @@ class TracageTests(unittest.IsolatedAsyncioTestCase):
 
         pool = _Pool()
         resultats = [
-            DeepHookResult("activity_coherence", "1.0.0", "ok", 12.0,
+            DeepHookResult("sender_relation", "1.0.0", "ok", 12.0,
                            clues=[], facts={"asked": True}),
             DeepHookResult("autre", "1.0.0", "error", 3.0,
                            error_type="TimeoutError", error_detail="trop long"),
@@ -116,7 +116,7 @@ class TracageTests(unittest.IsolatedAsyncioTestCase):
         inscrits = [a for q, a in pool.ecrits if "hook_runs" in q]
         self.assertEqual(len(inscrits), 2)
         noms = {v for args in inscrits for v in args if isinstance(v, str)}
-        self.assertIn("activity_coherence", noms)
+        self.assertIn("sender_relation", noms)
         self.assertIn("TimeoutError", noms)
 
 
@@ -135,3 +135,23 @@ class RequestedActionHookTests(unittest.IsolatedAsyncioTestCase):
         clues, facts = await RequestedActionHook().observe(contexte)
         self.assertEqual(clues, [])
         self.assertFalse(facts.get("asked"))
+
+    async def test_un_code_fourni_ne_devient_pas_une_demande_de_le_communiquer(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from sentimail_v3.observation.deep_hooks import RequestedActionHook
+
+        contexte = _Contexte()
+        contexte.subject = "Voici le code que vous avez demandé"
+        contexte.body = (
+            "Le code de vérification de votre nouvel appareil est le suivant : "
+            "123456. Ce code expirera dans 15 minutes. Vérifier cet appareil."
+        )
+        reponse = '{"actions": ["mfa_code_disclosure"], "explication": "x"}'
+        with patch(
+            "sentimail_v3.llm.provider_chat_json",
+            new=AsyncMock(return_value=(reponse, {})),
+        ):
+            clues, facts = await RequestedActionHook().observe(contexte)
+        self.assertEqual(clues, [])
+        self.assertTrue(facts["mfa_code_disclosure_unconfirmed"])

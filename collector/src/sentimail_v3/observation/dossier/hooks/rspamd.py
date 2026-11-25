@@ -23,11 +23,23 @@ _REPUTATION_FRAGMENTS = (
     "DBL",
 )
 _WEAK_TRANSACTIONAL_ARTIFACTS = {"FORGED_SENDER"}
+# Des déguisements que Rspamd relève et que personne ne lisait : un objet ou
+# un expéditeur encodés en base64 sans raison (« C I C » l'était, pour passer
+# les filtres de mots). C'est un procédé, pas un accident d'encodage - et sans
+# indice, il n'entrait ni au jugement ni à l'apprentissage (M-490357,
+# 6 septembre 2026).
+#
+# ZERO_FONT n'en fait plus partie (13 septembre 2026). Le texte en taille zéro
+# est le texte d'aperçu des gabarits d'envoi : sur 147 messages marqués, la
+# quasi-totalité étaient authentifiés et ordinaires, et un code Dashlane
+# restait retenu pour cette seule charge. Le texte caché qui trompe se mesure
+# par CONTENT_HIDDEN_TEXT_SALTING, sur son contenu, pas sur sa présence.
+_OBFUSCATION = {"SUBJ_EXCESS_BASE64", "FROM_EXCESS_BASE64"}
 
 
 class RspamdHook(EvidenceHook):
     name: ClassVar[str] = "rspamd"
-    version: ClassVar[str] = "1.2.0"
+    version: ClassVar[str] = "1.3.0"
 
     async def observe(
         self, context: InvestigationContext
@@ -72,7 +84,28 @@ class RspamdHook(EvidenceHook):
         phishing_heuristics = sorted(
             name for name, points in symbols.items() if points > 0 and "PHISH" in name
         )
+        obfuscation = sorted(
+            name for name, points in symbols.items() if points > 0 and name in _OBFUSCATION
+        )
         clues: list[Clue] = []
+        if obfuscation:
+            clues.append(
+                Clue(
+                    "RSPAMD-009",
+                    "RSPAMD_OBFUSCATION_SYMBOL",
+                    "adverse",
+                    35,
+                    0.9,
+                    "Rspamd relève un déguisement : "
+                    + ", ".join(obfuscation)
+                    + ".",
+                    {
+                        "symbols": obfuscation,
+                        "symbol_scores": {name: symbols[name] for name in obfuscation},
+                    },
+                    {"source": "header:x-spamd-result"},
+                )
+            )
         if material:
             clues.append(
                 Clue(

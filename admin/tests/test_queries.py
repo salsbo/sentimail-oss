@@ -30,14 +30,34 @@ class RequetesDomaineTests(unittest.TestCase):
 
     def test_un_domaine_ajoute_naît_en_attente(self) -> None:
         requete = queries.insert_domain("mondomaine.example", "operateur@mondomaine.example")
-        self.assertEqual(requete.params, ("mondomaine.example", "operateur@mondomaine.example"))
+        self.assertEqual(
+            requete.params,
+            ("mondomaine.example", "operateur@mondomaine.example", None),
+        )
         self.assertIn("'pending'", requete.sql)
         self.assertIn("ON CONFLICT (fqdn) DO NOTHING", requete.sql)
         self.assertIn("RETURNING", requete.sql)
 
     def test_le_contact_facultatif_reste_nul(self) -> None:
         requete = queries.insert_domain("mondomaine.example", None)
-        self.assertEqual(requete.params, ("mondomaine.example", None))
+        self.assertEqual(requete.params, ("mondomaine.example", None, None))
+
+    def test_un_domaine_peut_rejoindre_un_client_existant(self) -> None:
+        requete = queries.insert_domain("mondomaine.example", None, "client-id")
+        self.assertEqual(requete.params[2], "client-id")
+        self.assertIn("client_id", requete.sql)
+
+    def test_le_rattachement_est_parametre_et_borne(self) -> None:
+        requete = queries.assign_domain_client("domain-id", "client-id")
+        self.assertEqual(requete.params, ("domain-id", "client-id"))
+        self.assertIn("FROM clients", requete.sql)
+        self.assertIn("d.id=$1", requete.sql)
+
+    def test_les_clients_sont_listes_avec_leur_nombre_de_domaines(self) -> None:
+        requete = queries.list_clients()
+        self.assertEqual(requete.params, ())
+        self.assertIn("LEFT JOIN domains", requete.sql)
+        self.assertIn("domain_count", requete.sql)
 
     def test_les_valeurs_ne_sont_jamais_interpolees(self) -> None:
         fqdn = "exemple'; DROP TABLE domains; --"
@@ -105,7 +125,7 @@ class RequetesLectureTests(unittest.TestCase):
 
     def test_les_regles_sont_filtrees_par_destinataire(self) -> None:
         requete = queries.participant_policies("operateur@mondomaine.example")
-        self.assertIn("lower(participant_email) = $1", requete.sql)
+        self.assertIn("sentimail_same_client(participant_email,$1)", requete.sql)
         # 682 règles ne se lisent pas : la requête filtre et borne.
         self.assertIn("ILIKE", requete.sql)
         self.assertIn("LIMIT $3", requete.sql)
@@ -113,7 +133,7 @@ class RequetesLectureTests(unittest.TestCase):
 
     def test_les_retours_sont_filtres_et_bornes(self) -> None:
         requete = queries.participant_labels("operateur@mondomaine.example", 200)
-        self.assertIn("lower(participant_email) = $1", requete.sql)
+        self.assertIn("sentimail_same_client(participant_email,$1)", requete.sql)
         self.assertIn("LIMIT $2", requete.sql)
         self.assertEqual(requete.params, ("operateur@mondomaine.example", 200))
         for interdite in COLONNES_INTERDITES:
@@ -177,10 +197,6 @@ class TraceDesModificationsTests(unittest.TestCase):
         self.assertEqual(
             self._payload(requete)["target"], "'; DROP TABLE audit_log; --"
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class MesureTests(unittest.TestCase):
@@ -309,3 +325,7 @@ class RequetesIdentiteInstanceTests(unittest.TestCase):
                 "admin_console:100.64.0.1",
             ),
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

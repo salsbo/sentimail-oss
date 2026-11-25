@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import unittest
 from types import SimpleNamespace
@@ -119,6 +120,149 @@ class RetentionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(row["raw_eml"])
         self.assertIsNone(row["redacted_at"])
+
+    async def test_un_abandon_est_purge_sans_toucher_une_retenue_active(self) -> None:
+        from sentimail_v3.execution.retention import OPEN_STATUSES, RETENTION_ELIGIBLE_SQL
+
+        abandon = await self._aged_message(400, "held")
+        actif = await self._aged_message(401, "held")
+        await self.pool.execute(
+            "UPDATE delivery_cases SET state='ignored' WHERE message_id=$1::uuid",
+            abandon,
+        )
+        await self.pool.execute(
+            "UPDATE delivery_cases SET state='awaiting_reply' WHERE message_id=$1::uuid",
+            actif,
+        )
+        # La sonde et la purge partagent exactement les mêmes dossiers éligibles.
+        overdue = await self.pool.fetchval(
+            f"""SELECT count(*) FROM messages m
+                WHERE m.id=ANY($3::uuid[]) AND m.redacted_at IS NULL
+                  AND m.captured_at < now()-(($1+2)*interval '1 day')
+                  AND {RETENTION_ELIGIBLE_SQL}""",
+            30, OPEN_STATUSES, [abandon, actif],
+        )
+        self.assertEqual(overdue, 1)
+        await redact_expired(self.pool, 30, 100)
+        self.assertIsNone(await self.pool.fetchval(
+            "SELECT raw_eml FROM messages WHERE id=$1::uuid", abandon
+        ))
+        self.assertIsNotNone(await self.pool.fetchval(
+            "SELECT raw_eml FROM messages WHERE id=$1::uuid", actif
+        ))
+        await delete_expired(self.pool, 180, 100)
+        self.assertFalse(await self.pool.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id=$1::uuid)", abandon
+        ))
+        self.assertTrue(await self.pool.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id=$1::uuid)", actif
+        ))
+
+    async def test_une_liberation_reservee_conserve_son_original(self) -> None:
+        message = await self._aged_message(400, "held")
+        await self.pool.execute(
+            "UPDATE delivery_cases SET state='ignored' WHERE message_id=$1::uuid", message
+        )
+        async with self.pool.acquire() as release_connection, release_connection.transaction():
+            # Même réservation que release_original, gardée ouverte pendant la
+            # passe de rétention pour exposer l'ancien état encore visible.
+            await release_connection.fetchrow(
+                """SELECT m.id FROM messages m
+                   JOIN delivery_cases dc ON dc.message_id=m.id
+                   WHERE m.id=$1::uuid FOR UPDATE OF m,dc""", message
+            )
+            await release_connection.execute(
+                "UPDATE messages SET delivery_status='release_pending' WHERE id=$1::uuid", message
+            )
+            await release_connection.execute(
+                "UPDATE delivery_cases SET state='release_requested' WHERE message_id=$1::uuid", message
+            )
+            await asyncio.wait_for(redact_expired(self.pool, 30, 100), timeout=2)
+        row = await self.pool.fetchrow(
+            "SELECT raw_eml,redacted_at,delivery_status FROM messages WHERE id=$1::uuid", message
+        )
+        self.assertEqual(row["delivery_status"], "release_pending")
+        self.assertIsNotNone(row["raw_eml"])
+        self.assertIsNone(row["redacted_at"])
+
+    async def test_un_dossier_verrouille_ne_cree_pas_de_cycle_de_verrous(self) -> None:
+        message = await self._aged_message(400, "held")
+        await self.pool.execute(
+            "UPDATE delivery_cases SET state='ignored' WHERE message_id=$1::uuid", message
+        )
+        case_reserved = asyncio.Event()
+        retention_finished = asyncio.Event()
+
+        async def reserve_release() -> None:
+            async with self.pool.acquire() as connection, connection.transaction():
+                # Un autre chemin peut modifier le dossier avant le message.
+                # La rétention doit le sauter, sans attendre son second verrou.
+                await connection.execute(
+                    "UPDATE delivery_cases SET state='release_requested' WHERE message_id=$1::uuid", message
+                )
+                case_reserved.set()
+                await retention_finished.wait()
+                await connection.execute(
+                    "UPDATE messages SET delivery_status='release_pending' WHERE id=$1::uuid", message
+                )
+
+        release = asyncio.create_task(reserve_release())
+        try:
+            await asyncio.wait_for(case_reserved.wait(), timeout=2)
+            await asyncio.wait_for(redact_expired(self.pool, 30, 100), timeout=2)
+        finally:
+            retention_finished.set()
+            await asyncio.wait_for(release, timeout=2)
+        row = await self.pool.fetchrow(
+            "SELECT raw_eml,redacted_at,delivery_status FROM messages WHERE id=$1::uuid", message
+        )
+        self.assertEqual(row["delivery_status"], "release_pending")
+        self.assertIsNotNone(row["raw_eml"])
+        self.assertIsNone(row["redacted_at"])
+
+    async def test_un_message_termine_sans_dossier_reste_purgeable(self) -> None:
+        message = await self._aged_message(400, "delivered")
+        await self.pool.execute(
+            "DELETE FROM delivery_cases WHERE message_id=$1::uuid", message
+        )
+        await redact_expired(self.pool, 30, 100)
+        self.assertIsNone(await self.pool.fetchval(
+            "SELECT raw_eml FROM messages WHERE id=$1::uuid", message
+        ))
+        await delete_expired(self.pool, 180, 100)
+        self.assertFalse(await self.pool.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id=$1::uuid)", message
+        ))
+
+    async def test_toutes_les_copies_envoyees_sont_purgees_pas_les_avis_a_envoyer(self) -> None:
+        conversation = await self.pool.fetchval(
+            """INSERT INTO conversations(participant_email,status)
+               VALUES('retention-outbox@example.org','closed') RETURNING id::text"""
+        )
+        self.created_conversations.append(conversation)
+        ids = []
+        for statut in ("sent", "pending"):
+            ids.append(await self.pool.fetchval(
+                """INSERT INTO assistant_outbox(
+                     conversation_id,recipient,sender,reply_to,subject,body_text,
+                     body_html,attachment_content,inline_content,status,created_at)
+                   VALUES($1::uuid,'recipient@example.org','maia@example.org',
+                     'maia@example.org','Avis','', '<p>Copie du message</p>',
+                     NULL,$2,$3,now()-interval '40 days') RETURNING id""",
+                conversation, b"miniature", statut,
+            ))
+        await redact_expired_conversations(self.pool, 30)
+        for identifiant, envoye in zip(ids, (True, False)):
+            row = await self.pool.fetchrow(
+                "SELECT body_html,inline_content FROM assistant_outbox WHERE id=$1",
+                identifiant,
+            )
+            self.assertEqual(row["body_html"] is None, envoye)
+            self.assertEqual(row["inline_content"] is None, envoye)
+        # Même une ancienne ligne dont le texte et l'annexe étaient déjà vides
+        # doit être dégonflée. Le second passage ne doit plus la modifier.
+        counts = await redact_expired_conversations(self.pool, 30)
+        self.assertEqual(counts["assistant_outbox"], 0)
 
     async def test_content_is_redacted_then_deleted_while_the_rule_survives(
         self,

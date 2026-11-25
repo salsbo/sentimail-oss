@@ -17,6 +17,7 @@ from sentimail_v3.conversation.conversation import ConversationStore
 from sentimail_v3.observation.deep_analysis import _history
 from sentimail_v3.observation.dossier.pipeline import build_hooks
 from sentimail_v3.execution.outbox import queue_response as _queue_response
+from sentimail_v3.execution.delivery import suppress_original
 from sentimail_v3.conversation.provider_setup import ProviderSetup
 from sentimail_v3.code.rulebook import (
     apply_rule_request,
@@ -24,7 +25,9 @@ from sentimail_v3.code.rulebook import (
     validate_rule_request,
 )
 from sentimail_v3.observation.storage import Store
+from sentimail_v3.observation.enricher import _save as save_enrichment
 from sentimail_v3.code.tenancy import forget_cache
+from sentimail_v3.code.reference import reference
 from sentimail_v3.judgment.verdict_engine import _claim
 from test_parser import RAW
 
@@ -46,6 +49,144 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         await self.pool.close()
+
+    async def test_capture_url_longue_et_rattachement_enrichissement(self) -> None:
+        # Un jeton peu compressible reproduit le dépassement réel du B-tree,
+        # contrairement à une simple répétition du même caractère.
+        token = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(180))
+        url = f"https://suivi.example.net/clic?token={token}"
+        raw = (
+            "From: contact@sender.example\r\n"
+            "To: user@example.org\r\n"
+            "Subject: Lien long\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            f"{url}\r\n"
+        ).encode()
+        store = Store(self.pool)
+        smtp = {"peer_ip": "127.0.0.1", "protocol": "ESMTP"}
+        first = await store.capture(
+            raw, "contact@sender.example", ["user@example.org"], smtp
+        )
+        try:
+            second = await store.capture(
+                raw, "contact@sender.example", ["user@example.org"], smtp
+            )
+            self.assertFalse(second.inserted)
+            self.assertEqual(first.message_id, second.message_id)
+            self.assertEqual(
+                await self.pool.fetchval(
+                    "SELECT value_normalized FROM entities "
+                    "WHERE message_id=$1::uuid AND entity_type='url' LIMIT 1",
+                    first.message_id,
+                ),
+                url,
+            )
+            await save_enrichment(self.pool, "domain", "suivi.example.net", "ok", {})
+            rows = await self.pool.fetch(
+                "SELECT entity_type, value_normalized, enrichment_id FROM entities "
+                "WHERE message_id=$1::uuid",
+                first.message_id,
+            )
+            target = [
+                r for r in rows if r["entity_type"] == "domain"
+                and r["value_normalized"] == "suivi.example.net"
+            ]
+            self.assertTrue(target)
+            self.assertTrue(all(r["enrichment_id"] is not None for r in target))
+            self.assertTrue(
+                all(r["enrichment_id"] is None for r in rows if r not in target)
+            )
+        finally:
+            await self.pool.execute(
+                "DELETE FROM messages WHERE id=$1::uuid", first.message_id
+            )
+
+    async def test_reponse_sans_bouton_se_rattache_au_message_livre(self) -> None:
+        store = Store(self.pool)
+        smtp = {
+            "peer_ip": "172.20.0.8",
+            "peer_port": 25,
+            "helo": "mx.example",
+            "protocol": "ESMTP",
+            "tls": {},
+            "authenticated": False,
+            "mail_options": [],
+            "rcpt_options": {},
+        }
+        livre = await store.capture(
+            b"From: Offres <offres@vendeur.example>\r\n"
+            b"To: autre@example.org\r\n"
+            b"Subject: Offre du jour\r\n"
+            b"Message-ID: <Offre-1@vendeur.example>\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            b"Bonjour\r\n",
+            "offres@vendeur.example",
+            ["autre@example.org"],
+            smtp,
+        )
+        await store.mark_delivered(livre.message_id)
+        conversations = ConversationStore(
+            self.pool,
+            "kitt@sentinel.example",
+            "KITT Sentinel <kitt@sentinel.example>",
+        )
+        # Un tiers qui cite le même identifiant n'ouvre rien : il n'est pas
+        # protégé, et le message ne lui a pas été livré.
+        tiers = await store.capture(
+            b"From: Offres <offres@vendeur.example>\r\n"
+            b"To: KITT <kitt@sentinel.example>\r\n"
+            b"Subject: Re: Offre du jour\r\n"
+            b"Message-ID: <tiers-1@vendeur.example>\r\n"
+            b"In-Reply-To: <Offre-1@vendeur.example>\r\n\r\n"
+            b"B\r\n",
+            "offres@vendeur.example",
+            ["kitt@sentinel.example"],
+            smtp,
+        )
+        self.assertEqual(
+            await conversations.record_inbound(tiers.message_id), "rejected_sender"
+        )
+        reponse = await store.capture(
+            b"From: Autre <autre@example.org>\r\n"
+            b"To: KITT <kitt@sentinel.example>\r\n"
+            b"Subject: Re: Offre du jour\r\n"
+            b"Message-ID: <reponse-1@example.org>\r\n"
+            b"In-Reply-To: offre-1@vendeur.example\r\n"
+            b"References: <Offre-1@vendeur.example>\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            b"B\r\n\r\n> S3-ACTION:ancien-jeton-cite-1234567890abcdef\r\n"
+            b"> S3-ACTION:autre-jeton-cite-1234567890abcdef\r\n",
+            "autre@example.org",
+            ["kitt@sentinel.example"],
+            smtp,
+        )
+        self.assertEqual(
+            await conversations.record_inbound(reponse.message_id),
+            "confirmation_sent",
+        )
+        rattachement = await self.pool.fetchrow(
+            """
+            SELECT c.case_id, dc.message_id::text AS cible, c.participant_email
+            FROM conversation_messages cm
+            JOIN conversations c ON c.id=cm.conversation_id
+            JOIN delivery_cases dc ON dc.id=c.case_id
+            WHERE cm.message_id=$1::uuid
+            """,
+            reponse.message_id,
+        )
+        self.assertIsNotNone(rattachement)
+        self.assertEqual(rattachement["cible"], livre.message_id)
+        courrier = await self.pool.fetchval(
+            """
+            SELECT ao.body_text FROM assistant_outbox ao
+            JOIN smtp_actions sa ON sa.id=ao.action_id
+            WHERE sa.context->>'confirm_message_id' IN (
+                SELECT id::text FROM conversation_messages WHERE message_id=$1::uuid
+            )
+            """,
+            reponse.message_id,
+        )
+        self.assertIn("« Offre du jour »", str(courrier))
 
     async def test_capture_is_complete_and_idempotent(self) -> None:
         store = Store(self.pool)
@@ -73,17 +214,24 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
         counts = await self.pool.fetchrow(
             """
             SELECT
-              (SELECT count(*) FROM messages) AS messages,
-              (SELECT count(*) FROM headers) AS headers,
-              (SELECT count(*) FROM mime_parts) AS parts,
-              (SELECT count(*) FROM entities) AS entities,
-              (SELECT count(*) FROM investigations) AS investigations,
-              (SELECT count(*) FROM hook_runs) AS hook_runs,
-              (SELECT count(*) FROM clues) AS clues,
-              (SELECT count(*) FROM verdicts) AS verdicts,
-              (SELECT count(*) FROM delivery_cases) AS delivery_cases,
-              (SELECT count(*) FROM delivery_events) AS delivery_events
-            """
+              (SELECT count(*) FROM messages WHERE id=$1::uuid) AS messages,
+              (SELECT count(*) FROM headers WHERE message_id=$1::uuid) AS headers,
+              (SELECT count(*) FROM mime_parts WHERE message_id=$1::uuid) AS parts,
+              (SELECT count(*) FROM entities WHERE message_id=$1::uuid) AS entities,
+              (SELECT count(*) FROM investigations WHERE message_id=$1::uuid)
+                AS investigations,
+              (SELECT count(*) FROM hook_runs hr JOIN investigations i
+                 ON i.id=hr.investigation_id WHERE i.message_id=$1::uuid) AS hook_runs,
+              (SELECT count(*) FROM clues c JOIN investigations i
+                 ON i.id=c.investigation_id WHERE i.message_id=$1::uuid) AS clues,
+              (SELECT count(*) FROM verdicts v JOIN investigations i
+                 ON i.id=v.investigation_id WHERE i.message_id=$1::uuid) AS verdicts,
+              (SELECT count(*) FROM delivery_cases WHERE message_id=$1::uuid)
+                AS delivery_cases,
+              (SELECT count(*) FROM delivery_events de JOIN delivery_cases dc
+                 ON dc.id=de.case_id WHERE dc.message_id=$1::uuid) AS delivery_events
+            """,
+            first.message_id,
         )
         self.assertEqual(counts["messages"], 1)
         self.assertGreater(counts["headers"], 8)
@@ -111,33 +259,36 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "KITT Sentinel <kitt@sentinel.example>",
             render_sandbox_url="http://renderer.invalid",
         )
-        with patch(
-            "sentimail_v3.conversation.conversation.screenshot",
-            new=AsyncMock(return_value=b"neutralized-preview"),
-        ):
-            self.assertTrue(await conversations.queue_invitation(first.message_id))
+        self.assertTrue(await conversations.queue_invitation(first.message_id))
         notice = await self.pool.fetchrow(
-            "SELECT preview_kind,preview_sha256 FROM review_notices"
+            """SELECT rn.preview_kind,rn.preview_sha256 FROM review_notices rn
+               JOIN delivery_cases dc ON dc.id=rn.case_id
+               WHERE dc.message_id=$1::uuid ORDER BY rn.created_at DESC LIMIT 1""",
+            first.message_id,
         )
-        self.assertEqual(notice["preview_kind"], "png")
-        self.assertEqual(
-            notice["preview_sha256"],
-            hashlib.sha256(b"neutralized-preview").hexdigest(),
-        )
+        self.assertEqual(notice["preview_kind"], "text")
+        self.assertIsNone(notice["preview_sha256"])
         invitation = await self.pool.fetchrow(
             """
-            SELECT body_text,body_html FROM assistant_outbox
-            WHERE subject LIKE '[SentiMail] Ton avis sur :%'
-            ORDER BY created_at DESC LIMIT 1
-            """
+            SELECT ao.body_text,ao.body_html,ao.attachment_content,ao.inline_content
+            FROM assistant_outbox ao
+            JOIN smtp_actions sa ON sa.id=ao.action_id
+            JOIN delivery_cases dc ON dc.id=sa.case_id
+            WHERE dc.message_id=$1::uuid
+              AND ao.subject LIKE '[SentiMail] Ton avis sur :%'
+            ORDER BY ao.created_at DESC LIMIT 1
+            """,
+            first.message_id,
         )
-        # L'avis s'adresse a un humain : il dit ce qui gene, ce qui rassure
-        # et ce qu'il faut faire, sans jargon judiciaire ni code interne.
-        self.assertIn("Ce qui me gêne", invitation["body_text"])
-        self.assertIn("Ce qui me rassure", invitation["body_text"])
-        self.assertIn("Ce que j’en conclus", invitation["body_text"])
+        # Le corps commence par la fiche utile et ne transporte plus la photo.
+        self.assertIn("Écarts relevés", invitation["body_text"])
         self.assertIn("Que veux-tu faire ?", invitation["body_text"])
-        self.assertIn("Ce qui me gêne", invitation["body_html"])
+        self.assertIn("Écarts relevés", invitation["body_html"])
+        self.assertNotIn("Objet :", invitation["body_text"])
+        self.assertNotIn("De :", invitation["body_text"])
+        self.assertNotIn("capture-email-neutralisee", invitation["body_html"])
+        self.assertIsNone(invitation["attachment_content"])
+        self.assertIsNone(invitation["inline_content"])
         for forbidden in (
             "PROCUREUR",
             "AVOCAT",
@@ -148,12 +299,20 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(forbidden, invitation["body_text"])
         self.assertNotRegex(invitation["body_text"], r"\b\d{1,3}\s*/\s*100\b")
+        # La référence lisible fait partie de l'avis. Quand son hexadécimal
+        # ne contient que des chiffres, l'interdiction des codes techniques
+        # la prenait à tort pour un code interne et échouait au hasard.
+        dossier_reference = reference("M", first.message_id)
+        self.assertIn(f"Dossier {dossier_reference}", invitation["body_text"])
         self.assertNotRegex(
-            invitation["body_text"], r"\b[A-Z][A-Z0-9]*(?:[-_.][A-Z0-9_]+)+\b"
+            invitation["body_text"].replace(dossier_reference, ""),
+            r"\b[A-Z][A-Z0-9]*(?:[-_.][A-Z0-9_]+)+\b",
         )
         action = await self.pool.fetchrow(
-            "SELECT id,case_id,context->>'conversation_id' AS conversation_id "
-            "FROM smtp_actions WHERE status='pending'"
+            """SELECT sa.id,sa.case_id,sa.context->>'conversation_id' AS conversation_id
+               FROM smtp_actions sa JOIN delivery_cases dc ON dc.id=sa.case_id
+               WHERE dc.message_id=$1::uuid AND sa.status='pending'""",
+            first.message_id,
         )
         token = "integration-action-token-1234567890"
         await self.pool.execute(
@@ -181,8 +340,9 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
             SELECT cm.user_text, cm.processing_status, m.delivery_status
             FROM conversation_messages cm
             JOIN messages m ON m.id=cm.message_id
-            WHERE cm.direction='inbound'
-            """
+            WHERE cm.direction='inbound' AND cm.message_id=$1::uuid
+            """,
+            reply_capture.message_id,
         )
         self.assertIn("fournisseur", inbound["user_text"])
         self.assertEqual(inbound["processing_status"], "pending")
@@ -371,6 +531,146 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(run)
         self.assertEqual(run["status"], "running")
 
+    async def test_action_reply_accepts_same_mailbox_on_another_client_domain(
+        self,
+    ) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO domains(fqdn,status,admin_email,verified_at)
+            VALUES ('alias.example.net','active','user@alias.example.net',now())
+            ON CONFLICT (fqdn) DO UPDATE SET status='active',verified_at=now()
+            """
+        )
+        await self.pool.execute(
+            """
+            UPDATE domains alias_domain SET client_id=main_domain.client_id
+            FROM domains main_domain
+            WHERE alias_domain.fqdn='alias.example.net'
+              AND main_domain.fqdn='example.org'
+            """
+        )
+        forget_cache()
+        store = Store(self.pool)
+        smtp = {
+            "peer_ip": "172.20.0.8",
+            "peer_port": 25,
+            "helo": "mx.example",
+            "protocol": "ESMTP",
+            "tls": {},
+            "authenticated": False,
+            "mail_options": [],
+            "rcpt_options": {},
+        }
+        original = await store.capture(
+            b"From: sender@remote.test\r\nTo: user@example.org\r\n"
+            b"Subject: alias action\r\nMessage-ID: <alias-action@remote.test>\r\n\r\nbody\r\n",
+            "sender@remote.test",
+            ["user@example.org"],
+            smtp,
+        )
+        case_id = await self.pool.fetchval(
+            "SELECT id FROM delivery_cases WHERE message_id=$1::uuid",
+            original.message_id,
+        )
+        conversation_id = await self.pool.fetchval(
+            """
+            INSERT INTO conversations(case_id,participant_email,status)
+            VALUES ($1,'user@example.org','awaiting_user') RETURNING id
+            """,
+            case_id,
+        )
+        token = "same-client-alias-action-token-123456"
+        await self.pool.execute(
+            """
+            INSERT INTO smtp_actions(
+                case_id,action,token_hash,reply_address,expires_at,context
+            ) VALUES ($1,'release_original',$2,'maia@example.org',
+                      now()+interval '1 day',$3::jsonb)
+            """,
+            case_id,
+            hashlib.sha256(token.encode()).hexdigest(),
+            '{"conversation_id":"' + str(conversation_id) + '"}',
+        )
+        reply = await store.capture(
+            b"From: User <user@alias.example.net>\r\n"
+            b"To: MAIA <maia@example.org>\r\nSubject: Re: alias action\r\n"
+            b"In-Reply-To: <s3."
+            + token.encode()
+            + b"@sentinel.example>\r\nMessage-ID: <alias-reply@example.net>\r\n\r\nA\r\n",
+            "user@alias.example.net",
+            ["maia@example.org"],
+            smtp,
+        )
+        conversations = ConversationStore(
+            self.pool,
+            "maia@example.org",
+            "MAIA <maia@example.org>",
+        )
+        self.assertEqual(await conversations.record_inbound(reply.message_id), "queued")
+        self.assertEqual(
+            await self.pool.fetchval(
+                """
+                SELECT count(*) FROM audit_log
+                WHERE action='smtp_reply.accepted_client_alias'
+                  AND payload->>'message_id'=$1
+                """,
+                reply.message_id,
+            ),
+            1,
+        )
+
+    async def test_authenticated_suppression_is_terminal_audited_and_idempotent(
+        self,
+    ) -> None:
+        store = Store(self.pool)
+        captured = await store.capture(
+            b"From: blocked@remote.test\r\nTo: user@example.org\r\n"
+            b"Subject: blocked\r\nMessage-ID: <suppressed@remote.test>\r\n\r\nbody\r\n",
+            "blocked@remote.test",
+            ["user@example.org"],
+            {
+                "peer_ip": "172.20.0.8",
+                "peer_port": 25,
+                "helo": "mx.example",
+                "protocol": "ESMTP",
+                "tls": {},
+                "authenticated": False,
+                "mail_options": [],
+                "rcpt_options": {},
+            },
+        )
+        self.assertEqual(
+            await suppress_original(
+                self.pool,
+                captured.message_id,
+                reason="authenticated_sender_policy_hold",
+            ),
+            "suppressed",
+        )
+        state = await self.pool.fetchrow(
+            """
+            SELECT m.delivery_status,dc.state,dc.original_delivery_allowed,
+                   count(de.id) FILTER (
+                     WHERE de.event_type='policy_suppressed'
+                   ) OVER () AS events
+            FROM messages m JOIN delivery_cases dc ON dc.message_id=m.id
+            LEFT JOIN delivery_events de ON de.case_id=dc.id
+            WHERE m.id=$1::uuid
+            """,
+            captured.message_id,
+        )
+        self.assertEqual(state["delivery_status"], "suppressed")
+        self.assertEqual(state["state"], "policy_suppressed")
+        self.assertFalse(state["original_delivery_allowed"])
+        self.assertEqual(state["events"], 1)
+        self.assertEqual(
+            await suppress_original(
+                self.pool,
+                captured.message_id,
+                reason="authenticated_sender_policy_hold",
+            ),
+            "already_suppressed",
+        )
     async def test_provider_bootstrap_and_sensitive_replies_bypass_mail_storage(
         self,
     ) -> None:
@@ -465,7 +765,9 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-    async def test_sender_learning_is_isolated_by_recipient(self) -> None:
+    async def test_sender_learning_is_shared_by_client_and_isolated_between_clients(
+        self,
+    ) -> None:
         store = Store(self.pool)
         smtp = {
             "peer_ip": "172.20.0.8",
@@ -492,8 +794,25 @@ class StorageIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         history = await _history(self.pool, second.message_id)
         self.assertEqual(history["participant_email"], "two@example.org")
-        self.assertEqual(history["previous_message_count"], 0)
-        self.assertEqual(history["ground_truth_labels"], {})
+        self.assertGreaterEqual(history["previous_message_count"], 1)
+        self.assertGreaterEqual(history["ground_truth_labels"].get("legitimate", 0), 1)
+
+        await self.pool.execute(
+            """
+            INSERT INTO domains(fqdn,status,verified_at)
+            VALUES ('isolated.feedback.test','active',now())
+            ON CONFLICT (fqdn) DO UPDATE SET status='active',verified_at=now()
+            """
+        )
+        third = await store.capture(
+            RAW,
+            "same@sender.example",
+            ["three@isolated.feedback.test"],
+            smtp,
+        )
+        isolated = await _history(self.pool, third.message_id)
+        self.assertEqual(isolated["previous_message_count"], 0)
+        self.assertEqual(isolated["ground_truth_labels"], {})
 
     async def test_rulebook_exports_corrects_and_soft_deletes_feedback(self) -> None:
         store = Store(self.pool)

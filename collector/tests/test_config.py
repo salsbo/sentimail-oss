@@ -30,3 +30,14 @@ class SecretFileConfigurationTests(unittest.TestCase):
             "postgresql://sentimail_v3:db%20p%40ss%2Fword@db:5432/sentimail_v3",
         )
         self.assertEqual(settings.assistant_token_secret, "a" * 32)
+
+
+class GroupedLettersTests(unittest.TestCase):
+    def test_le_recapitulatif_groupe_est_coupe_par_defaut(self) -> None:
+        # Décision du mainteneur du 15 octobre 2026 : plus aucun courrier qui
+        # demande une position sur plusieurs messages à la fois. Trois messages
+        # en attente font trois courriers, jamais un bulletin à trois cases.
+        environment = {"DATABASE_URL": "postgresql://sentimail_v3@db:5432/sentimail_v3"}
+        with patch.dict(os.environ, environment, clear=True):
+            settings = load_settings()
+        self.assertFalse(settings.digest_enabled)

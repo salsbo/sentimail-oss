@@ -140,9 +140,14 @@ class ReferencesResoluesTests(unittest.TestCase):
             "_domain_organisations",
             "authentication_signature",
             "express_delivery_reason",
+            "_visible_code",
+            "_sender_established",
+            "shows_one_time_code",
+            "visible_html_text",
+            "ANCIENNETE_JOURS",
         ):
             with self.subTest(nom=nom):
-                self.assertTrue(hasattr(verdict_engine, nom), f"{nom} absent")
+                self.assertTrue(nom in verdict_engine._express_judgment.__globals__, f"{nom} absent")
 
 if __name__ == "__main__":
     unittest.main()

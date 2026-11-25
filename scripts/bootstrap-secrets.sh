@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Amorce le répertoire secrets/ de SentiMail : crée le dossier et les cinq
+# Amorce le répertoire secrets/ de SentiMail : crée le dossier et les six
 # fichiers attendus par docker-compose.yml, sans jamais écraser un secret
 # déjà en place.
 #
 # usage: scripts/bootstrap-secrets.sh
 set -euo pipefail
+umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECRETS_DIR="$REPO_ROOT/secrets"
@@ -41,27 +42,42 @@ ecrire_secret "backup_password" "$(openssl rand -hex 24)"
 # collector/src/sentimail_v3/crypto.py load_key.
 ecrire_secret "raw_eml_key" "$(openssl rand -hex 32)"
 
-# Clé API DeepSeek : prompt interactif, silencieux, laissée vide si non-TTY
-# ou si l'utilisateur n'entre rien.
-DEEPSEEK_PATH="$SECRETS_DIR/deepseek_api_key"
-if [ -s "$DEEPSEEK_PATH" ]; then
-    echo "-- deepseek_api_key : déjà présent, conservé"
-    CONSERVES+=("deepseek_api_key")
-else
-    DEEPSEEK_VALEUR=""
+demander_secret() {
+    local nom="$1"
+    local invite="$2"
+    local message_vide="$3"
+    local chemin="$SECRETS_DIR/$nom"
+
+    if [ -s "$chemin" ]; then
+        echo "-- $nom : déjà présent, conservé"
+        CONSERVES+=("$nom")
+        return 0
+    fi
+
+    local valeur=""
     if [ -t 0 ]; then
-        read -rs -p "Clé API DeepSeek (Entrée pour laisser vide et configurer plus tard via la console /reglages) : " DEEPSEEK_VALEUR
+        read -rs -p "$invite" valeur || true
         echo
     fi
-    printf '%s' "$DEEPSEEK_VALEUR" > "$DEEPSEEK_PATH"
-    chmod 0600 "$DEEPSEEK_PATH"
-    if [ -z "$DEEPSEEK_VALEUR" ]; then
-        echo "-- deepseek_api_key : créé vide (le moteur LLM devra être configuré depuis la console /reglages avant que les verdicts tombent)"
+    printf '%s' "$valeur" > "$chemin"
+    chmod 0600 "$chemin"
+    if [ -z "$valeur" ]; then
+        echo "-- $nom : créé vide ($message_vide)"
     else
-        echo "-- deepseek_api_key : créé"
+        echo "-- $nom : créé"
     fi
-    CREES+=("deepseek_api_key")
-fi
+    CREES+=("$nom")
+}
+
+demander_secret \
+    "deepseek_api_key" \
+    "Clé API DeepSeek (Entrée pour laisser vide et configurer plus tard via la console /reglages) : " \
+    "le moteur LLM devra être configuré depuis la console /reglages avant que les verdicts tombent"
+
+demander_secret \
+    "search_api_key" \
+    "Clé API de recherche Tavily (Entrée pour laisser vide, facultatif) : " \
+    "la recherche externe des domaines officiels reste désactivée"
 
 echo
 echo "Récapitulatif :"

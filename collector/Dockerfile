@@ -11,5 +11,6 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY src /app/src
 COPY tests /app/tests
+RUN chmod -R a+rX /app/src /app/tests
 
 CMD ["python", "-m", "sentimail_v3.observation.smtp_server"]

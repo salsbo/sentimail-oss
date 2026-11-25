@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from sentimail_v3.observation.deep_analysis import _signals
+from sentimail_v3.observation.deep_analysis import _SIGNAL_RULES, _signals
 from sentimail_v3.observation.dossier.hooks.content import ContentHook
-from sentimail_v3.observation.dossier.hooks.nature import NatureHook, is_bulk_mailing, sending_mode
+from sentimail_v3.observation.dossier.hooks.nature import (
+    NatureHook,
+    is_bulk_mailing,
+    sending_mode,
+)
 from sentimail_v3.observation.dossier.models import InvestigationContext
 from sentimail_v3.observation.dossier.pipeline import build_hooks
 from sentimail_v3.observation.parser import parse_message
@@ -44,6 +48,14 @@ PERSONAL = (
     b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
     b"Voici le compte rendu promis hier.\r\n"
 )
+TRANSACTIONAL_WITH_COMPLAINT_HEADER = (
+    b"From: Service client <service@notifications.entreprise.example>\r\n"
+    b"To: user@example.org\r\n"
+    b"Subject: Accuse de reception de votre demande\r\n"
+    b"X-CSA-Complaints: complaints@example.org\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+    b"Nous avons bien recu votre demande et nous la traitons.\r\n"
+)
 
 
 def _observe(raw: bytes) -> tuple[list[object], dict[str, object]]:
@@ -65,7 +77,14 @@ class SendingModeTests(unittest.TestCase):
 
     def test_a_personal_message_is_never_a_mass_mailing(self) -> None:
         self.assertFalse(is_bulk_mailing(parse_message(PERSONAL)))
-        self.assertEqual(sending_mode(parse_message(PERSONAL))["mode"], "conversational")
+        self.assertEqual(
+            sending_mode(parse_message(PERSONAL))["mode"], "conversational"
+        )
+
+    def test_un_canal_de_plainte_seul_ne_prouve_pas_un_envoi_de_masse(self) -> None:
+        mode = sending_mode(parse_message(TRANSACTIONAL_WITH_COMPLAINT_HEADER))
+        self.assertEqual(mode["mode"], "conversational")
+        self.assertIn("x-csa-complaints", mode["bulk_headers_present"])
 
     def test_precedence_alone_identifies_a_mass_mailing(self) -> None:
         raw = PERSONAL.replace(
@@ -96,7 +115,11 @@ class NatureHookTests(unittest.TestCase):
         self.assertEqual(codes, {"NATURE_BULK_MAILING"})
         self.assertEqual(facts["claim_registers"], [])
         self.assertEqual(
-            [clue.direction for clue in clues if clue.clue_code == "NATURE_BULK_MAILING"],
+            [
+                clue.direction
+                for clue in clues
+                if clue.clue_code == "NATURE_BULK_MAILING"
+            ],
             ["neutral"],
         )
 
@@ -149,9 +172,7 @@ class BroadenedCureRhetoricTests(unittest.TestCase):
     def test_a_health_topic_without_cure_rhetoric_stays_silent(self) -> None:
         # Registre santé présent, mais aucune promesse invérifiable : un vrai
         # contenu médical ne doit pas être accusé. Le ET protège du faux positif.
-        codes = self._codes(
-            _spam("Your cardiovascular check-up results are ready")
-        )
+        codes = self._codes(_spam("Your cardiovascular check-up results are ready"))
         self.assertNotIn("NATURE_UNVERIFIABLE_PROMOTIONAL_CLAIMS", codes)
 
     def test_a_cure_verb_without_health_register_stays_silent(self) -> None:
@@ -193,6 +214,30 @@ class UnsolicitedBulkSignalTests(unittest.TestCase):
             {"previous_message_count": 0, "ground_truth_labels": {}},
         )
         self.assertIn("unsolicited_bulk", kinds)
+
+    def test_le_signal_distingue_l_adresse_exacte_du_domaine_parent(self) -> None:
+        signals = _signals(
+            [],
+            [],
+            {
+                "sender_address": "service@campagne.entreprise.example",
+                "sender_apex": "entreprise.example",
+                "previous_message_count": 0,
+                "ground_truth_labels": {},
+            },
+            True,
+            authenticated=True,
+            nature={"sending_mode": "bulk"},
+        )
+        signal = next(
+            value for value in signals if value.get("article_code") == "NATURE-002"
+        )
+        self.assertEqual(signal["sender_apex"], "entreprise.example")
+        statement = _SIGNAL_RULES["NATURE-002"][4]
+        self.assertIn("adresse exacte", statement)
+        self.assertIn("domaine parent est évalué séparément", statement)
+        self.assertNotIn("expéditeur inconnu", statement)
+        self.assertNotIn("sans abonnement établi", statement)
 
     def test_a_known_correspondent_mailing_is_not_unsolicited(self) -> None:
         kinds = self._signal_kinds(

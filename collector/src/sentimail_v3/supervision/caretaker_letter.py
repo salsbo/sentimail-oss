@@ -27,8 +27,6 @@ _COMPTEURS: tuple[tuple[str, str, str], ...] = (
      "dossiers immobilisés depuis plus de 30 minutes"),
     ("livraisons_differees", "message en attente de livraison",
      "messages en attente de livraison"),
-    ("alertes_amorties_24h", "alerte technique étouffée en 24 h",
-     "alertes techniques étouffées en 24 h"),
 )
 
 # Les quatre sens d'un désaccord. Les deux premiers sont de vraies erreurs : le
@@ -112,6 +110,21 @@ def anomalies(state: dict[str, object]) -> list[str]:
     ]
 
 
+def informations(state: dict[str, object]) -> list[str]:
+    """Les faits utiles qui n'appellent aucun geste de l'exploitant."""
+    amorties = _n(state.get("alertes_amorties_24h"))
+    if amorties <= 0:
+        return []
+    return [
+        _quantite(
+            amorties,
+            "alerte technique a été regroupée pour éviter un courrier répété",
+            "alertes techniques ont été regroupées pour éviter des courriers répétés",
+        )
+        + ". Aucune action n’est requise."
+    ]
+
+
 def lire_refus(entree: dict[str, object]) -> tuple[str, bool]:
     """Traduit une erreur de verdict en phrase, et dit si elle appelle un geste.
 
@@ -163,11 +176,52 @@ def _actions(outcome: dict[str, object]) -> list[str]:
     return faites
 
 
+def actions_requises(
+    state: dict[str, object], outcome: dict[str, object]
+) -> list[str]:
+    """Ce que le lecteur peut réellement faire après les réparations automatiques."""
+    # Un désaccord humain/modèle n'appelle aucun geste : le verdict humain
+    # s'est appliqué et personne ne repasse derrière (13 septembre 2026).
+    required: list[str] = []
+
+    rejouees = _n(outcome.get("replay_errored_verdicts"))
+    reparables = sum(
+        _n(entry.get("count")) or 1
+        for entry in (state.get("erreurs_de_verdict_24h") or [])
+        if isinstance(entry, dict) and lire_refus(entry)[1]
+    )
+    if reparables > rejouees:
+        required.append(
+            "Une analyse reste en échec après la tentative automatique : "
+            "ouvre son dossier dans la console."
+        )
+    if _n(state.get("retenues_sans_avis")) > _n(
+        outcome.get("reconcile_review_holds")
+    ):
+        required.append(
+            "Un message reste retenu sans avis : vérifie le pipeline et son dossier."
+        )
+    if _n(state.get("dossiers_coinces")) > 0:
+        required.append(
+            "Un dossier reste immobilisé depuis plus de 30 minutes : ouvre-le "
+            "dans la console."
+        )
+    if _n(state.get("livraisons_differees")) > _n(
+        outcome.get("retry_deferred_deliveries")
+    ):
+        required.append(
+            "Une livraison reste différée après la tentative automatique : "
+            "vérifie son dossier."
+        )
+    return required
+
+
 def _sujet(
     state: dict[str, object],
     erreurs: list[str],
     prudences: list[str],
     refus: list[tuple[str, bool]],
+    required: list[str],
 ) -> str:
     """L'objet dit la situation et son niveau, en cohérence avec l'en-tête.
 
@@ -177,23 +231,21 @@ def _sujet(
     demandent rien - refus définitifs, désaccords de prudence. Sans rien de
     tout cela, il n'y a rien à signaler.
     """
-    if erreurs:
-        return (
-            "[SentiMail] Entretien : signalement grave - "
-            "une erreur de jugement à regarder"
-        )
     points = anomalies(state)
-    if points:
-        return "[SentiMail] Entretien : signalement grave - " + points[0]
-    if any(reparable for _, reparable in refus):
+    if required and points:
         return (
-            "[SentiMail] Entretien : signalement modéré - "
-            "des analyses en échec à regarder"
+            "[SentiMail] Entretien : signalement grave, intervention requise - "
+            + points[0]
         )
-    if refus or prudences:
+    if required:
+        return (
+            "[SentiMail] Entretien : signalement modéré, intervention requise - "
+            "une analyse ou un écart est à examiner"
+        )
+    if erreurs or refus or prudences:
         return (
             "[SentiMail] Entretien : signalement faible - "
-            "des faits notés, rien à réparer"
+            "des faits notés, aucune action requise"
         )
     return "[SentiMail] Entretien : rien à signaler"
 
@@ -213,22 +265,33 @@ def lettre(
         if isinstance(entree, dict)
     ]
     faites = _actions(outcome)
+    required = actions_requises(state, outcome)
+    infos = informations(state)
     diagnostic = str(verdict.get("diagnosis") or "").strip()
     note = str(verdict.get("operator_note") or "").strip()
     ignorees = [str(x) for x in (verdict.get("ignored_recommendations") or [])]
 
-    if points or any(reparable for _, reparable in refus):
-        entete = "J’ai trouvé quelque chose à te signaler."
-        couleur = AMBRE
+    if required:
+        entete = "Ton intervention est requise."
+        couleur = ROUGE if erreurs else AMBRE
     elif erreurs:
-        entete = "J’ai trouvé une erreur de jugement dans mes décisions passées."
+        entete = (
+            "Un destinataire a corrigé mon jugement : sa décision s’applique, "
+            "aucune action n’est requise."
+        )
         couleur = ROUGE
     else:
-        entete = "Tout va bien : rien ne demande ton intervention."
+        entete = "Aucune action n’est requise."
         couleur = VERT
 
     # ── texte ────────────────────────────────────────────────────────────
     lignes = [entete, ""]
+    if required:
+        lignes += ["Ce que tu dois faire :"]
+        lignes += [f"  - {item}" for item in required]
+        lignes += [""]
+    else:
+        lignes += ["Ce que tu dois faire :", "  - Rien.", ""]
     if points:
         lignes += ["Ce qui n’est pas normal :"]
         lignes += [f"  - {point}." for point in points]
@@ -236,10 +299,13 @@ def lettre(
     else:
         lignes += [
             "Aucun message n’est immobilisé, aucun n’est retenu sans que son "
-            "destinataire en soit averti, aucune livraison n’attend, aucune "
-            "alerte n’a été étouffée.",
+            "destinataire en soit averti et aucune livraison n’attend.",
             "",
         ]
+    if infos:
+        lignes += ["Informations, sans action requise :"]
+        lignes += [f"  - {item}" for item in infos]
+        lignes += [""]
     if refus:
         lignes += ["Les analyses qui n’ont pas abouti :"]
         lignes += [f"  - {phrase}" for phrase, _ in refus]
@@ -271,7 +337,7 @@ def lettre(
         lignes += ["Pour toi :", note, ""]
     if ecarts_url:
         lignes += [
-            f"Le détail des écarts et leur acquittement : {ecarts_url}",
+            f"Voir les écarts, déjà tranchés par les destinataires : {ecarts_url}",
             "",
         ]
     # L'état brut ne part plus par courrier : caretaker.run le journalise
@@ -300,6 +366,13 @@ def lettre(
         'border-radius:10px;font-size:14px;font-weight:bold">'
         f"{escape(entete)}</div>"
     ]
+    corps.append(
+        bloc(
+            "Ce que tu dois faire",
+            required or ["Rien."],
+            ROUGE if required else VERT,
+        )
+    )
     if points:
         corps.append(bloc("Ce qui n’est pas normal", [f"{p}." for p in points], AMBRE))
     else:
@@ -307,8 +380,9 @@ def lettre(
             f'<div style="margin-top:14px;font-size:14px;color:{ENCRE};'
             'line-height:1.45">Aucun message n’est immobilisé, aucun n’est '
             "retenu sans que son destinataire en soit averti, aucune livraison "
-            "n’attend, aucune alerte n’a été étouffée.</div>"
+            "n’attend.</div>"
         )
+    corps.append(bloc("Informations, sans action requise", infos, GRIS))
     corps.append(bloc("Les analyses qui n’ont pas abouti", [p for p, _ in refus], GRIS))
     if erreurs or prudences:
         detail = [f"{p}. C’est une erreur de ma part." for p in erreurs] or [
@@ -343,7 +417,7 @@ def lettre(
         corps.append(
             f'<div style="margin-top:14px;font-size:14px;color:{ENCRE}">'
             f'<a href="{escape(ecarts_url)}" style="color:#1a5fd0">'
-            "Le détail des écarts et leur acquittement</a></div>"
+            "Voir les écarts, déjà tranchés par les destinataires</a></div>"
         )
     corps.append(
         '<div style="margin-top:14px;font-size:12px;color:#475569">'
@@ -354,4 +428,8 @@ def lettre(
         '<div style="font-family:Arial,Helvetica,sans-serif;max-width:640px;'
         f'margin:0 auto;color:{ENCRE}">' + "".join(corps) + "</div>"
     )
-    return Lettre(_sujet(state, erreurs, prudences, refus), "\n".join(lignes), html)
+    return Lettre(
+        _sujet(state, erreurs, prudences, refus, required),
+        "\n".join(lignes),
+        html,
+    )

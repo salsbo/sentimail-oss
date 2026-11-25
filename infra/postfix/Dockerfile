@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         gettext-base \
         openssl \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY infra/postfix/main.cf.tmpl /etc/postfix/main.cf.tmpl
@@ -20,11 +21,15 @@ COPY infra/postfix/header_checks /etc/postfix/header_checks
 COPY infra/postfix/relay_domains.cf.tmpl /etc/postfix/relay_domains.cf.tmpl
 COPY infra/postfix/transport.cf.tmpl /etc/postfix/transport.cf.tmpl
 COPY infra/postfix/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY infra/postfix/direct-routes.sh /usr/local/bin/direct-routes.sh
+COPY infra/postfix/health.py /usr/local/bin/mx-health.py
+COPY config/mx-direct/ /etc/postfix/direct-source/
 
-RUN chmod 0755 /usr/local/bin/entrypoint.sh
+
 # Postfix refuse de faire confiance à une configuration modifiable par
 # d'autres que root, et le signale à chaque démarrage.
-RUN chmod 644 /etc/postfix/main.cf.tmpl /etc/postfix/master.cf \
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/direct-routes.sh \
+    && chmod 644 /etc/postfix/main.cf.tmpl /etc/postfix/master.cf \
     /etc/postfix/header_checks /etc/postfix/relay_domains.cf.tmpl \
     /etc/postfix/transport.cf.tmpl
 

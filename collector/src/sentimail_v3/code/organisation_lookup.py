@@ -114,12 +114,23 @@ def search_query(organisation: str) -> str:
     return f"{organisation.strip()} site officiel domaine de l'entreprise"
 
 
-def official_apexes(results: list[dict[str, object]]) -> list[str]:
+def official_apexes(
+    results: list[dict[str, object]], organisation: str = ""
+) -> list[str]:
     """Les domaines que la recherche attribue à l'organisation.
 
     L'ordre des résultats est conservé : le premier est celui que le moteur
     tient pour le plus représentatif, et c'est celui qu'on cite.
+
+    Quand le nom cherché est donné, un domaine n'est officiel que s'il le
+    porte (`porte_le_nom`). La recherche sur « Nintendo » rendait gouv.fr et
+    lechompenchaine.fr au milieu de nintendo.com : cités comme officiels, ils
+    faisaient accuser nintendo-europe.com d'imiter une marque qui n'était pas
+    la leur.
     """
+    from sentimail_v3.code.identity_relation import _label, _tokens
+
+    filtre = bool(organisation and _tokens(organisation))
     apexes: list[str] = []
     for result in results[:MAX_RESULTS]:
         url = str(result.get("url") or "")
@@ -128,8 +139,58 @@ def official_apexes(results: list[dict[str, object]]) -> list[str]:
         apex = _apex(urlsplit(url).hostname or "")
         if not apex or apex in _NOT_OFFICIAL or apex in apexes:
             continue
+        if filtre and not porte_le_nom(_label(apex), organisation):
+            continue
         apexes.append(apex)
     return apexes
+
+
+def _morceaux(organisation: str) -> list[str]:
+    """Tous les morceaux écrits du nom, courts compris ; « + » se lit « plus »."""
+    from sentimail_v3.code.identity_relation import _sans_accents
+
+    texte = _sans_accents(organisation.replace("+", " plus "))
+    return [morceau for morceau in re.split(r"[^a-z0-9]+", texte) if morceau]
+
+
+def porte_le_nom(etiquette: str, organisation: str) -> bool:
+    """Le nom propre d'un domaine porte-t-il le nom cherché ?
+
+    Un nom d'un mot : ce mot dans l'étiquette, comme toujours (nintendo.com,
+    disneyplus.com). Un nom de plusieurs mots : l'étiquette en porte au moins
+    deux (creditagricole pour « Crédit Agricole d'Ile-de-France »,
+    primevideo), ou elle n'est faite que de morceaux du nom (laposte pour « La
+    Poste-Colissimo », lidl pour « Lidl France », samsclub pour « Sam's Club
+    Member Services »).
+
+    Un seul mot trouvé à l'intérieur d'une étiquette qui porte autre chose ne
+    suffit plus : pour « BOURGEOIS Muriel via PRONOTE », rbourgeois.fr portait
+    « bourgeois » et a été cité comme domaine officiel d'une enseignante
+    (M-633c24) ; philduval.com l'a été pour « Philippe DUVAL ».
+
+    Chaque morceau trouvé est retiré de l'étiquette avant de chercher le
+    suivant : deux mots qui se chevauchent n'en font pas deux.
+    """
+    from sentimail_v3.code.identity_relation import _tokens
+
+    mots = _tokens(organisation)
+    if not etiquette or not mots:
+        return False
+    if len(mots) == 1:
+        return mots[0] in etiquette
+    reste, trouves = etiquette, 0
+    for mot in sorted(set(mots), key=len, reverse=True):
+        if mot in reste:
+            reste = reste.replace(mot, " ", 1)
+            trouves += 1
+    if trouves >= 2:
+        return True
+    if not trouves:
+        return False
+    for morceau in sorted(set(_morceaux(organisation)), key=len, reverse=True):
+        while morceau in reste:
+            reste = reste.replace(morceau, " ", 1)
+    return not reste.strip()
 
 
 def belongs(from_apex: str, apexes: list[str]) -> bool:
@@ -147,49 +208,55 @@ def belongs(from_apex: str, apexes: list[str]) -> bool:
     )
 
 
-def _quoted(organisation: str, apexes: list[str]) -> list[str]:
-    """Ceux qu'on peut citer sans se ridiculiser.
+def remembered_apexes(
+    organisation: str, remembered: list[tuple[str, list[str]]]
+) -> list[str]:
+    """Les domaines officiels qu'une recherche passée a déjà établis pour ce nom.
 
-    Un moteur rend aussi du bruit : « nlm.nih.gov » est arrivé le 26 août dans
-    les résultats pour Disney+. Le garder ne change pas la décision - le
-    domaine émetteur reste étranger à tous - mais l'écrire dans un avis
-    revient à affirmer une sottise à l'utilisateur. On cite donc en priorité
-    les domaines qui portent le nom cherché, et à défaut les premiers rendus.
+    La recherche sur « Prime Video » rendait amazon.jobs, aboutamazon.com,
+    amazon.com : aucun ne porte le nom cherché, aucun n'était retenu, et le
+    démenti ne pouvait pas s'écrire (M-8d026c). La mémoire connaissait pourtant
+    primevideo.com, trouvé sous « amazon prime video ». Elle n'était qu'écrite.
 
-    La décision, elle, continue de porter sur la liste entière : retenir un
-    domaine de trop ne peut qu'éviter une accusation, jamais en fabriquer une.
+    Un nom retenu doit contenir tous les mots du nom cherché, et un domaine n'est
+    repris que s'il les porte tous - le filtre d'`official_apexes`, en plus
+    strict, parce que la page qui l'avait rendu n'est plus là pour en répondre.
+    Un nom d'un seul mot n'en hérite pas : « Infos » se retrouverait dans
+    n'importe quelle organisation retenue.
     """
-    racine = _normalise(organisation).replace(" ", "")
-    portant = [apex for apex in apexes if racine and racine[:6] in apex.replace("-", "")]
-    return portant or apexes[:2]
+    from sentimail_v3.code.identity_relation import _label, _tokens
+
+    mots = _tokens(organisation)
+    if len(mots) < 2:
+        return []
+    apexes: list[str] = []
+    for nom, candidats in remembered:
+        if not all(mot in _tokens(nom) for mot in mots):
+            continue
+        for apex in candidats:
+            etiquette = _label(apex)
+            if apex in apexes or apex in _NOT_OFFICIAL:
+                continue
+            if all(mot in etiquette for mot in mots):
+                apexes.append(apex)
+    return apexes
 
 
-def lookup_outcome(
-    organisation: str, from_apex: str, apexes: list[str]
-) -> dict[str, object] | None:
-    """Ce que la recherche apprend sur un soupçon déjà formé.
+def officials_in_memory(remembered: list[tuple[str, list[str]]]) -> dict[str, str]:
+    """Les domaines que les recherches passées ont établis officiels, et pour quel nom.
 
-    Trois issues, et une seule renforce : le domaine est étranger à tous les
-    sites officiels trouvés. Qu'il en fasse partie annule le soupçon ; qu'on
-    n'ait rien trouvé le laisse intact.
+    La table garde des lignes écrites avant le filtre par le nom : relue telle
+    quelle, elle tenait pour officiels nlm.nih.gov sous « disney+ » ou des
+    domaines viticoles sous « product hunt daily ». Le filtre d'aujourd'hui y
+    est donc réappliqué : 549 apex bruts au 29 septembre 2026, 208 retenus.
+    Le premier nom qui établit un domaine est celui qu'on cite.
     """
-    if not apexes:
-        return None
-    if belongs(from_apex, apexes):
-        return {
-            "verified": False,
-            "cleared": True,
-            "official_apexes": apexes,
-            "organisation": organisation,
-        }
-    return {
-        "verified": True,
-        "cleared": False,
-        "official_apexes": apexes,
-        "organisation": organisation,
-        "statement": (
-            f"Les sites officiels de {organisation} sont "
-            + ", ".join(_quoted(organisation, apexes)[:3])
-            + f" ; le message vient de {_apex(from_apex) or from_apex}."
-        ),
-    }
+    from sentimail_v3.code.identity_relation import _label
+
+    out: dict[str, str] = {}
+    for organisation, apexes in remembered:
+        for apex in apexes:
+            if apex in _NOT_OFFICIAL or not porte_le_nom(_label(apex), organisation):
+                continue
+            out.setdefault(apex, organisation)
+    return out

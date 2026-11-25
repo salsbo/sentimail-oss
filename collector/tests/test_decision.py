@@ -6,11 +6,19 @@ import json
 import unittest
 from email import policy
 from email.message import EmailMessage
-from email.parser import BytesParser
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
+from sentimail_v3.judgment.verdict_engine import (
+    JudgmentContradiction,
+    _judgment_execution,
+    _judgment_rules,
+    _parse_final_response,
+    _parse_verdict,
+    _prompt,
+    _validate_final_judgment,
+)
 from sentimail_v3.observation.deep_analysis import (
     _SIGNAL_RULES,
     BASE_URLS,
@@ -20,6 +28,7 @@ from sentimail_v3.observation.deep_analysis import (
     _contextualize_equivalent_url_limits,
     _explained_authenticated_redirect_limit,
     _explained_authenticated_same_apex_fetch_error,
+    _is_definitive_target_failure,
     _json,
     _json_object,
     _message_url_candidates,
@@ -27,15 +36,7 @@ from sentimail_v3.observation.deep_analysis import (
     _signals,
     fetch_url_analysis_with_retry,
 )
-from sentimail_v3.execution.delivery import append_feedback_footer
 from sentimail_v3.observation.preview import render_source
-from sentimail_v3.judgment.verdict_engine import (
-    _judgment_execution,
-    _judgment_rules,
-    _parse_verdict,
-    _prompt,
-    _validate_final_judgment,
-)
 
 
 class DecisionPolicyTests(unittest.IsolatedAsyncioTestCase):
@@ -64,6 +65,92 @@ class DecisionPolicyTests(unittest.IsolatedAsyncioTestCase):
             "delivery_decision": decision,
             "verdict_doubt": doubt or classification != "legitimate",
         }
+
+    # 15 octobre 2026 : une destinataire recevait seize avis par mois, dont
+    # neuf sans danger ni faisceau (analyses inabouties, promotions, activité
+    # mal lue). Elle a choisi de n'être interrogée que sur un vrai doute ; un
+    # message laissé passer « n'est pas grave » (décision du mainteneur).
+    def _vrai_doute_seulement(self, clues: list[dict[str, object]] | None = None,
+                              deep_complete: bool = False,
+                              articles: list[dict[str, object]] | None = None) -> dict[str, object]:
+        dossier: dict[str, object] = {
+            "message": {"investigation_status": "complete", "adverse_points": 0},
+            "clues": clues or [],
+            "code_articles": articles or [],
+        }
+        deep = {
+            "complete": deep_complete,
+            "history": {"ground_truth_labels": {}, "ask_only_on_real_doubt": True},
+        }
+        self._rules(dossier, deep)
+        return dossier
+
+    def test_sans_vrai_doute_le_message_est_livre_meme_analyse_inaboutie(self) -> None:
+        dossier = self._vrai_doute_seulement()
+        rules = dossier["judgment_rules"]
+        self.assertTrue(rules["ask_only_on_real_doubt"])
+        self.assertFalse(rules["real_doubt"])
+        _validate_final_judgment(self._judgment("undetermined", 0.6, "deliver"), dossier)
+        _validate_final_judgment(self._judgment("suspect", 0.55, "deliver"), dossier)
+
+    def test_sans_vrai_doute_demander_est_refuse(self) -> None:
+        dossier = self._vrai_doute_seulement()
+        with self.assertRaises(JudgmentContradiction) as raised:
+            _validate_final_judgment(self._judgment("suspect", 0.55, "ask_user"), dossier)
+        self.assertEqual(raised.exception.contradictions, ["ask_without_real_doubt"])
+        self.assertTrue(raised.exception.structural)
+
+    def test_la_demande_refusee_devient_une_livraison(self) -> None:
+        dossier = self._vrai_doute_seulement()
+        for decision, classification, confidence in (
+            ("ask_user", "suspect", 0.55),
+            ("junk", "spam", 0.5),
+        ):
+            with self.subTest(decision=decision):
+                content = json.dumps({"final_verdict": {
+                    "classification": classification, "confidence": confidence,
+                    "delivery_decision": decision, "rationale": "Promotion.",
+                    "doubt": True, "doubt_reasons": [],
+                }})
+                result, contradictions = _parse_final_response(content, dossier)
+                self.assertEqual(result["delivery_decision"], "deliver")
+                self.assertEqual(result["classification"], classification)
+                self.assertTrue(contradictions)
+                _validate_final_judgment(result, dossier)
+                self.assertTrue(_judgment_execution(result)["original_delivery_allowed"])
+
+    def test_un_faisceau_defavorable_reste_un_vrai_doute(self) -> None:
+        dossier = self._vrai_doute_seulement([{
+            "clue_code": "CORRELATION_COMPROMISED_SENDER", "direction": "adverse", "strength": 70,
+        }], deep_complete=True)
+        self.assertTrue(dossier["judgment_rules"]["real_doubt"])
+        _validate_final_judgment(self._judgment("suspect", 0.6, "ask_user"), dossier)
+        with self.assertRaises(JudgmentContradiction):
+            _validate_final_judgment(self._judgment("suspect", 0.6, "deliver"), dossier)
+
+    def test_une_preuve_materielle_reste_un_vrai_doute(self) -> None:
+        dossier = self._vrai_doute_seulement([{
+            "clue_code": "CONTENT_EXTORTION", "direction": "adverse", "strength": 80,
+            "article_code": "CONTENT-099",
+        }], deep_complete=True, articles=[{
+            "article_code": "CONTENT-099",
+            "parameters": {"delivery_barrier": "material_danger", "material_kind": "extortion"},
+        }])
+        self.assertTrue(dossier["judgment_rules"]["material_danger_evidence"])
+        self.assertTrue(dossier["judgment_rules"]["real_doubt"])
+        _validate_final_judgment(self._judgment("suspect", 0.6, "ask_user"), dossier)
+
+    def test_un_verdict_dangereux_garde_sa_question(self) -> None:
+        dossier = self._vrai_doute_seulement()
+        _validate_final_judgment(self._judgment("dangerous", 0.7, "ask_user"), dossier)
+
+    def test_sans_ce_choix_rien_ne_change(self) -> None:
+        dossier = {"message": {"investigation_status": "complete", "adverse_points": 0}}
+        rules = self._rules(dossier, {"complete": False, "history": {"ground_truth_labels": {}}})
+        self.assertFalse(rules["ask_only_on_real_doubt"])
+        _validate_final_judgment(self._judgment("suspect", 0.55, "ask_user"), dossier)
+        with self.assertRaises(JudgmentContradiction):
+            _validate_final_judgment(self._judgment("undetermined", 0.6, "deliver"), dossier)
 
     def test_legitimate_new_sender_at_ninety_two_percent_is_delivered(self) -> None:
         dossier = {
@@ -111,8 +198,13 @@ class DecisionPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["delivery_decision"], "deliver")
 
     def test_consistent_feedback_reduces_doubt_but_not_below_floor(self) -> None:
+        # Les confirmations portent sur l'adresse exacte : sans DMARC sur ce
+        # message, l'adresse peut être usurpée et la réduction ne s'applique
+        # pas (voir test_seuils_du_juge). Ne pas retirer cet indice pour
+        # « réparer » le test : ce serait rouvrir le trou.
         dossier = {
             "message": {"investigation_status": "complete", "adverse_points": 10},
+            "clues": [{"clue_code": "AUTH_DMARC_PASS"}],
         }
         deep = {
             "complete": True,
@@ -343,6 +435,7 @@ class DecisionPolicyTests(unittest.IsolatedAsyncioTestCase):
         history = {
             "ground_truth_labels": {},
             "previous_message_count": 20,
+            "previous_active_days": 20,
             "size_zscore": 3.5,
             "hour_previously_seen": True,
             "unfamiliar_transport_countries": ["RU"],
@@ -360,6 +453,7 @@ class DecisionPolicyTests(unittest.IsolatedAsyncioTestCase):
         history = {
             "ground_truth_labels": {},
             "previous_message_count": 20,
+            "previous_active_days": 20,
             "hour_previously_seen": False,
             "usual_hours_utc": [0, 2, 4, 6, 8, 10, 12, 13, 14, 16, 18, 19, 21, 23],
             "unfamiliar_transport_countries": [],
@@ -373,6 +467,7 @@ class DecisionPolicyTests(unittest.IsolatedAsyncioTestCase):
         history = {
             "ground_truth_labels": {},
             "previous_message_count": 20,
+            "previous_active_days": 20,
             "hour_previously_seen": False,
             "usual_hours_utc": [8, 9, 10],
             "unfamiliar_transport_countries": [],
@@ -380,17 +475,80 @@ class DecisionPolicyTests(unittest.IsolatedAsyncioTestCase):
         codes = {value["article_code"] for value in _signals([], [], history, True)}
         self.assertIn("HIST-003", codes)
 
-    def test_zscore_alone_still_fires_regardless_of_hours(self) -> None:
+    def test_heure_jamais_vue_sur_quelques_jours_seulement_reste_muette(self) -> None:
+        # M-e36c20, 15 octobre 2026 : douze messages en quatre jours, dont
+        # cinq notifications envoyées dans la même minute. Quatre heures vues,
+        # et 11 h 33 (Paris) passait pour un écart. Ce n'est pas une habitude.
+        history = {
+            "ground_truth_labels": {},
+            "previous_message_count": 12,
+            "previous_active_days": 4,
+            "hour_previously_seen": False,
+            "usual_hours_utc": [8, 12, 13, 14],
+            "unfamiliar_transport_countries": [],
+        }
+        codes = {value["article_code"] for value in _signals([], [], history, True)}
+        self.assertNotIn("HIST-003", codes)
+
+    def test_heure_jamais_vue_sur_douze_jours_tire(self) -> None:
+        history = {
+            "ground_truth_labels": {},
+            "previous_message_count": 12,
+            "previous_active_days": 12,
+            "hour_previously_seen": False,
+            "usual_hours_utc": [8, 12, 13, 14],
+            "unfamiliar_transport_countries": [],
+        }
+        codes = {value["article_code"] for value in _signals([], [], history, True)}
+        self.assertIn("HIST-003", codes)
+
+    def test_taille_hors_fourchette_sur_historique_fourni_tire(self) -> None:
+        # z-score élevé ET taille hors de la fourchette moitié/double : anomalie.
         history = {
             "ground_truth_labels": {},
             "previous_message_count": 20,
+            "previous_active_days": 20,
             "size_zscore": 4.0,
+            "mean_size_bytes": 100000,
+            "current_size_bytes": 350000,
             "hour_previously_seen": True,
             "usual_hours_utc": list(range(14)),
             "unfamiliar_transport_countries": [],
         }
         codes = {value["article_code"] for value in _signals([], [], history, True)}
         self.assertIn("HIST-003", codes)
+
+    def test_newsletter_a_peine_plus_lourde_reste_muette(self) -> None:
+        # Cas M-a5b072 (FlightAware) : z-score 8,8 mais 1,26x la moyenne, dans
+        # la fourchette. Le z-score s'emballe sur des tailles régulières ; sans
+        # écart franc en valeur, ce n'est pas une anomalie.
+        history = {
+            "ground_truth_labels": {},
+            "previous_message_count": 6,
+            "size_zscore": 8.8,
+            "mean_size_bytes": 677206,
+            "current_size_bytes": 854440,
+            "hour_previously_seen": True,
+            "usual_hours_utc": [12, 13],
+            "unfamiliar_transport_countries": [],
+        }
+        codes = {value["article_code"] for value in _signals([], [], history, True)}
+        self.assertNotIn("HIST-003", codes)
+
+    def test_taille_hors_fourchette_mais_historique_maigre_reste_muette(self) -> None:
+        # Écart franc mais moins de 10 messages : trop peu pour parler d'habitude.
+        history = {
+            "ground_truth_labels": {},
+            "previous_message_count": 5,
+            "size_zscore": 6.0,
+            "mean_size_bytes": 100000,
+            "current_size_bytes": 900000,
+            "hour_previously_seen": True,
+            "usual_hours_utc": [12, 13],
+            "unfamiliar_transport_countries": [],
+        }
+        codes = {value["article_code"] for value in _signals([], [], history, True)}
+        self.assertNotIn("HIST-003", codes)
 
     def test_established_domain_is_explicit_weak_defence(self) -> None:
         signals = _signals(
@@ -1033,39 +1191,30 @@ Content-Type: text/html; charset=utf-8\r
         self.assertIn("DEEP-012", codes)
         self.assertNotIn("DEEP-003", codes)
 
-    def test_legitimate_delivery_footer_preserves_reply_to(self) -> None:
-        raw = (
-            b"From: sender@example.org\r\n"
-            b"To: user@example.org\r\n"
-            b"Reply-To: support@example.org\r\n"
-            b"Content-Type: text/html; charset=utf-8\r\n\r\n"
-            b"<html><body><p>Bonjour</p></body></html>\r\n"
-        )
-        rendered, inserted = append_feedback_footer(
-            raw,
-            SimpleNamespace(action_address="maia@sentinel.example"),  # type: ignore[arg-type]
-            "a" * 43,
-        )
-        self.assertTrue(inserted)
-        self.assertIn(b"X-SentiMail-Feedback: smtp-action-available", rendered)
-        self.assertIn(b"Reply-To: support@example.org", rendered)
-        self.assertIn(b"S3-ACTION%3A", rendered)
+    def test_broken_remote_target_is_a_result_not_a_sandbox_outage(self) -> None:
+        for error in (
+            "blocked_url:dns_resolution_failed",
+            "blocked_url:invalid_hostname",
+            "blocked_url:missing_hostname",
+            "redirect_without_location",
+        ):
+            with self.subTest(error=error):
+                self.assertTrue(_is_definitive_target_failure(error))
+                signals = _signals(
+                    [{"role": "html_link", "error": error}],
+                    [],
+                    {"ground_truth_labels": {}, "previous_message_count": 1},
+                    True,
+                    authenticated=False,
+                )
+                self.assertNotIn(
+                    "DEEP-003", {item["article_code"] for item in signals}
+                )
 
-    def test_feedback_footer_wording_also_covers_released_messages(self) -> None:
-        raw = (
-            b"From: sender@example.org\r\n"
-            b"To: user@example.org\r\n"
-            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
-            b"Message previously held.\r\n"
+    def test_security_block_remains_an_incomplete_inspection(self) -> None:
+        self.assertFalse(
+            _is_definitive_target_failure("blocked_url:non_global_address")
         )
-        rendered, inserted = append_feedback_footer(
-            raw,
-            SimpleNamespace(action_address="maia@sentinel.example"),  # type: ignore[arg-type]
-            "b" * 43,
-        )
-        self.assertTrue(inserted)
-        decoded = BytesParser(policy=policy.default).parsebytes(rendered).get_content()
-        self.assertIn("Ce message est non sollicité ?", decoded)
 
     def test_plain_preview_is_html_escaped(self) -> None:
         raw = (

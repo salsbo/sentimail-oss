@@ -13,7 +13,8 @@ myorigin = ${POSTFIX_MYORIGIN}
 mydomain = ${POSTFIX_MYDOMAIN}
 smtpd_banner = $myhostname ESMTP
 
-# Rien n'est livré localement : ce nœud reçoit puis passe la main au collecteur.
+# Rien n'est livré localement : domaines protégés au collecteur, autres routes
+# explicitement déclarées au serveur SMTP de destination.
 mydestination =
 local_recipient_maps =
 inet_interfaces = all
@@ -27,14 +28,17 @@ mynetworks = 127.0.0.0/8 [::1]/128
 # ---------------------------------------------------------------------------
 # Qui est protégé : la base, pas un fichier
 # ---------------------------------------------------------------------------
-# relay_domains est résolu en direct sur la vue mx_relay_domains (migration
+# Les routes exactes de direct_routes précèdent la route SQL dans transport_maps.
+# Une clé par destinataire ne change pas l'enrôlement du domaine : seul ce
+# destinataire contourne le collecteur.
+# Pour les domaines protégés, relay_domains est résolu en direct sur la vue mx_relay_domains (migration
 # 029), qui n'expose que les domaines status='active'. Enrôler un domaine
 # suffit à le rendre recevable ; le suspendre suffit à ne plus l'accepter.
-relay_domains = pgsql:/etc/postfix/relay_domains.cf
+relay_domains = hash:/etc/postfix/direct_routes, pgsql:/etc/postfix/relay_domains.cf
 
 # Même source pour le routage : un domaine actif part vers le collecteur V3.
 # Aucune adresse n'est écrite à la main dans ce fichier.
-transport_maps = pgsql:/etc/postfix/transport.cf
+transport_maps = hash:/etc/postfix/direct_routes, pgsql:/etc/postfix/transport.cf
 
 # ---------------------------------------------------------------------------
 # Anti-relais ouvert
@@ -48,13 +52,45 @@ smtpd_relay_restrictions =
     reject_unauth_destination
 
 smtpd_recipient_restrictions =
+    check_recipient_access hash:/etc/postfix/direct_recipient_access,
     permit_mynetworks,
     reject_non_fqdn_recipient,
-    reject_unauth_destination
+    reject_unauth_destination,
+    reject_unverified_recipient
 
+# ---------------------------------------------------------------------------
+# Destinataires inconnus
+# ---------------------------------------------------------------------------
+# Le MX ne connaît pas les boîtes : seul le serveur de livraison les tient.
+# Avant d'accepter un message, il envoie une sonde (sans contenu) par la route
+# normale du domaine, donc au collecteur, qui pose la même question au serveur
+# de livraison et ne rapporte qu'un refus définitif (observation/recipient_check.py).
+# Le collecteur ne reconnaît la sonde qu'à cette partie locale : les deux
+# valeurs doivent rester identiques. Une sonde sans réponse laisse passer.
+# Sans ce contrôle, un message pour une boîte inexistante était accepté,
+# analysé jusqu'au juge, puis refusé en aval (24 cas du 28/10 au 03/11/2026).
+address_verify_sender = sentimail-verification
+unverified_recipient_reject_code = 550
+# Réponse publique sans détail interne (hôte, table du serveur de livraison).
+unverified_recipient_reject_reason = Destinataire inconnu
+# Sonde en cours ou en échec temporaire (collecteur arrêté, relais lent) :
+# 250 accepte l'adresse, et le message attend dans la file comme avant au lieu
+# d'être renvoyé à l'expéditeur. Postfix le prévoit pour ce seul paramètre.
+unverified_recipient_defer_code = 250
+# Une boîte créée après un refus redevient joignable en moins d'une heure.
+# Les routes directes (direct_routes) sont sondées chez leur propre serveur :
+# là, tout 5xx, même de politique, vaut « Destinataire inconnu ».
+address_verify_negative_expire_time = 1h
+address_verify_negative_refresh_time = 30m
+
+# L'expéditeur des sondes est réservé : venu de l'extérieur, il ferait passer
+# un vrai message pour une sonde auprès du collecteur. Toute forme en est
+# refusée, adresse exacte de la sonde comprise : les vraies sondes ne passent
+# pas par smtpd. La regexp reprend PROBE_LOCAL_PART (test_recipient_check).
 smtpd_sender_restrictions =
     permit_mynetworks,
-    reject_non_fqdn_sender
+    reject_non_fqdn_sender,
+    check_sender_access regexp:{{/^sentimail-verification@/ REJECT 5.7.1 Expediteur reserve}}
 
 # ---------------------------------------------------------------------------
 # Registre des sources hostiles
@@ -73,6 +109,13 @@ smtpd_helo_restrictions =
     reject_invalid_helo_hostname
 
 disable_vrfy_command = yes
+# Aucun accusé de livraison (DSN) pour un expéditeur d'Internet. Le 3 novembre
+# 2026, un faux « Interactive Brokers » l'avait demandé : le MX lui a écrit que
+# l'adresse existait et que le message était « stocke pour analyse par MAIA »,
+# puis cet accusé est resté 5 jours en file, le serveur du fraudeur ne
+# répondant pas. Le serveur de l'expéditeur sait déjà que la passerelle a
+# accepté le message (DSN_README de Postfix).
+smtpd_discard_ehlo_keywords = silent-discard, dsn
 smtpd_data_restrictions = reject_unauth_pipelining
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,7 @@ def _sources() -> str:
 class ArticlesSansProducteurTests(unittest.TestCase):
     def test_les_articles_du_referentiel_supprime_sont_retires(self) -> None:
         """Leur producteur est parti avec la table des marques."""
-        for code in ("IDENTITY-009", "IDENTITY-010", "DEEP-017"):
+        for code in ("IDENTITY-009", "DEEP-017"):
             porteurs = [
                 fichier.name
                 for fichier in RACINE.rglob("*.py")
@@ -45,6 +45,20 @@ class ArticlesSansProducteurTests(unittest.TestCase):
         self.assertIn("enabled = false", migration)
         for code in ("IDENTITY-009", "IDENTITY-010", "DEEP-017"):
             self.assertIn(code, migration)
+
+    def test_le_domaine_sosie_renait_avec_son_producteur(self) -> None:
+        """IDENTITY-010 a de nouveau un producteur (enquêteur cousin_domain,
+        29 septembre 2026) : l'article est réactivé en même temps, sinon
+        l'indice s'écrirait sous un article éteint."""
+        porteurs = [
+            fichier.name
+            for fichier in RACINE.rglob("*.py")
+            if '"IDENTITY-010"' in fichier.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(porteurs, ["sender_relation.py"])
+        migration = next(MIGRATIONS.glob("095_*.sql")).read_text(encoding="utf-8")
+        self.assertIn("SET enabled = true", migration)
+        self.assertIn("WHERE article_code = 'IDENTITY-010'", migration)
 
     def test_chaque_article_cite_dans_le_code_est_ecrit_en_migration(self) -> None:
         """Sinon un indice s'insère sans article : ni force par défaut, ni

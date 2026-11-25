@@ -89,16 +89,42 @@ class CeQuiNeDoitPasBloquerTests(unittest.TestCase):
     def test_un_collectif_n_est_pas_une_personne(self) -> None:
         self.assertEqual(_examiner('M = "From: Health News <x@y.example>"'), [])
 
+    def test_les_adresses_de_role_numerotees_ou_au_pluriel(self) -> None:
+        for adresse in ("noreply0@boutique.fr", "bounce-123@mg.boutique.fr", "bounces@em.boutique.fr"):
+            with self.subTest(adresse=adresse):
+                self.assertEqual(_examiner(f'A = "{adresse}"'), [])
+
+    def test_un_uuid_n_est_pas_une_carte(self) -> None:
+        self.assertEqual(_examiner('ID = "44444444-4444-4444-4444-444444444444"'), [])
+
     def test_une_exception_nommee_est_respectee(self) -> None:
         self.assertEqual(
             _examiner('IP = "100.128.0.1"  # audit-ok: frontière CGNAT éprouvée'), []
         )
 
 
+class LeJournalNeRecopiePasTests(unittest.TestCase):
+    def test_un_iban_trouve_est_masque(self) -> None:
+        with tempfile.TemporaryDirectory() as dossier:
+            racine = pathlib.Path(dossier)
+            (racine / "cas.py").write_text(
+                'IBAN = "FR7630006000011234567890189"', encoding="utf-8"  # audit-ok: cas d'épreuve
+            )
+            extraits = [str(t["extrait"]) for t in audit.examiner(racine)]
+        self.assertEqual(len(extraits), 1)
+        self.assertNotIn("30006000011234567890", extraits[0])  # audit-ok: cas d'épreuve
+
+
 class LaPorteEstBrancheeTests(unittest.TestCase):
     def test_l_export_public_appelle_le_detecteur(self) -> None:
         export = (CHEMIN.parent / "export_public.sh").read_text(encoding="utf-8")
         self.assertIn("audit_personal_data.py", export)
+
+    def test_les_mentions_legales_echappent_a_la_neutralisation(self) -> None:
+        # Le titulaire des droits ne se remplace pas par un nom d'exemple.
+        export = (CHEMIN.parent / "export_public.sh").read_text(encoding="utf-8")
+        self.assertIn('legal = ("LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md")', export)
+        self.assertIn("ne nomme plus le titulaire des droits", export)
 
     def test_le_detecteur_ne_part_pas_dans_l_arbre_publie(self) -> None:
         # Il porte en clair les motifs qu'il cherche.

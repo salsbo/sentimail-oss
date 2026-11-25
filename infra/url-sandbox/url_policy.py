@@ -41,8 +41,12 @@ def validate_url(raw_url: str) -> ValidatedTarget:
     """Accepte uniquement une URL HTTP(S) absolue sans userinfo."""
     if not raw_url or len(raw_url) > MAX_URL_LENGTH:
         raise BlockedUrlError("invalid_length")
-    if "\\" in raw_url or any(
-        char.isspace() or ord(char) < 32 or ord(char) == 127 for char in raw_url
+    # Un espace dans le chemin ou la requête est une URL HTML courante et se
+    # normalise sans ambiguïté en %20. En revanche, aucun espace n'est toléré
+    # autour de l'URL, dans le schéma ou dans l'autorité ; les contrôles et les
+    # antislashs restent interdits partout pour éviter les divergences de parse.
+    if raw_url != raw_url.strip() or "\\" in raw_url or any(
+        ord(char) < 32 or ord(char) == 127 for char in raw_url
     ):
         raise BlockedUrlError("invalid_characters")
     try:
@@ -54,6 +58,8 @@ def validate_url(raw_url: str) -> ValidatedTarget:
         raise BlockedUrlError("invalid_url") from exc
     if scheme not in {"http", "https"}:
         raise BlockedUrlError("unsupported_scheme")
+    if any(char.isspace() for char in parsed.scheme + parsed.netloc):
+        raise BlockedUrlError("invalid_characters")
     if not parsed.netloc or hostname is None:
         raise BlockedUrlError("missing_hostname")
     if parsed.username is not None or parsed.password is not None:
@@ -170,7 +176,7 @@ def _require_global(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> N
         embedded.extend(address.teredo)
     if address in _NAT64_WELL_KNOWN or address in _NAT64_LOCAL:
         embedded.append(ipaddress.IPv4Address(int(address) & 0xFFFFFFFF))
-    if any(not value.is_global for value in embedded):
+    if any(not value.is_global or value.is_multicast for value in embedded):
         raise BlockedUrlError("embedded_non_global_address")
 
 

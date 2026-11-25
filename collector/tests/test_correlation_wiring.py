@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from sentimail_v3.observation.deep_analysis import persist_signals
@@ -30,8 +31,15 @@ class _Connection:
 
     async def fetch(self, query: str, *args: object) -> list[dict[str, object]]:
         if "FROM clues" in query:
-            return [{"clue_code": code} for code in self.existing]
+            return [{"clue_code": code, "facts": {}} for code in self.existing]
         return []
+
+    async def fetchrow(self, query: str, *args: object) -> dict[str, object]:
+        return {
+            "from_header": "Seafy <no-reply@seafy.com>",
+            "envelope_from": "bounce-123@mg.seafy.com",
+            "reply_to": None,
+        }
 
     async def execute(self, query: str, *args: object) -> str:
         self.inserted.append((query, args))
@@ -74,6 +82,21 @@ class CorrelationWiringTests(unittest.IsolatedAsyncioTestCase):
             if isinstance(value, str)
         }
         self.assertFalse({code for code in codes if code.startswith("CORRELATION_")})
+
+    async def test_le_faisceau_compte_detourne_conserve_les_identites(self) -> None:
+        pool = _Pool(
+            ["SENDER_ACTIVITY_INCOHERENT", "HISTORY_FIRST_OBSERVATION", "AUTH_DMARC_PASS"]
+        )
+
+        await persist_signals(pool, "11111111-1111-1111-1111-111111111111", {})  # type: ignore[arg-type]
+
+        facts = [
+            json.loads(str(args[8]))
+            for query, args in pool.connection.inserted
+            if "INSERT INTO clues" in query
+            and "CORRELATION_COMPROMISED_SENDER" in args
+        ]
+        self.assertEqual(facts[0]["identity"]["displayed_email"], "no-reply@seafy.com")
 
 
 if __name__ == "__main__":

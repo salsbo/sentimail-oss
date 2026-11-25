@@ -90,6 +90,8 @@ class _Pool:
         self._avec_miniature = avec_miniature
 
     async def fetchrow(self, query, *args):
+        if "instance_identity" in str(query):
+            return None
         return {
             "id": 1,
             "action_id": "11111111-1111-1111-1111-111111111111",
@@ -139,9 +141,15 @@ async def _envoyer(avec_miniature: bool):
         envois.append(message)
         return {}
 
+    from sentimail_v3.identity import reset_cache
+
+    reset_cache()
     settings = SimpleNamespace(
         assistant_token_secret="secret",
         action_address="maia@sentinel.mondomaine.example",
+        action_aliases=(),
+        assistant_sender="MAIA <maia@mondomaine.example>",
+        probe_recipient="sonde@mondomaine.example",
         relay_host="relay",
         relay_port=25,
     )
@@ -152,11 +160,13 @@ async def _envoyer(avec_miniature: bool):
 
 
 class EnvoiDeLaCaptureTests(unittest.IsolatedAsyncioTestCase):
-    """La capture voyage une fois, dans le corps, et rien de plus.
+    """La miniature dans le corps, pour reconnaître ; l'original joint, pour lire.
 
-    Elle partait aussi en pièce jointe, en pleine résolution : le poids de
-    l'avis doublait sur un téléphone pour un fichier que personne n'ouvrait, et
-    une photo qu'il faut ouvrir ne dit rien tant qu'on ne l'a pas ouverte.
+    L'original avait cessé de partir en pièce jointe : le poids de l'avis
+    doublait pour un fichier que personne n'ouvrait. Le 6 septembre 2026, il
+    est redemandé - la miniature ne se lit pas, et une image rattachée au corps
+    ne s'ouvre pas en grand dans tous les clients. Il repart donc, sous un nom
+    qui dit à quoi il sert.
     """
 
     async def test_la_miniature_est_l_image_du_corps(self) -> None:
@@ -169,14 +179,16 @@ class EnvoiDeLaCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(corps), 1)
         self.assertEqual(corps[0].get_payload(decode=True), MINIATURE)
 
-    async def test_l_original_ne_part_plus_en_piece_jointe(self) -> None:
+    async def test_l_original_part_en_piece_jointe_pour_etre_lu_en_grand(self) -> None:
         message = await _envoyer(True)
         jointes = [
             part
             for part in message.walk()
             if part.get_content_disposition() == "attachment"
         ]
-        self.assertEqual(jointes, [])
+        self.assertEqual(len(jointes), 1)
+        self.assertEqual(jointes[0].get_filename(), "message-en-grand.png")
+        self.assertEqual(jointes[0].get_payload(decode=True), ORIGINAL)
 
     async def test_sans_miniature_l_original_tient_les_deux_roles(self) -> None:
         # Le bac à sable peut échouer : l'avis part quand même, avec l'original
@@ -190,14 +202,24 @@ class EnvoiDeLaCaptureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(corps), 1)
         self.assertEqual(corps[0].get_payload(decode=True), ORIGINAL)
 
-    async def test_la_capture_ne_voyage_qu_une_fois(self) -> None:
+    async def test_la_miniature_ne_voyage_qu_une_fois(self) -> None:
         message = await _envoyer(True)
         images = [
             p for p in message.walk()
             if p.get_content_type() in {"image/png", "image/jpeg"}
         ]
+        self.assertEqual(len(images), 2)
+        self.assertEqual(
+            [p.get_payload(decode=True) for p in images].count(MINIATURE), 1
+        )
+
+    async def test_sans_miniature_l_original_ne_part_pas_deux_fois(self) -> None:
+        message = await _envoyer(False)
+        images = [
+            p for p in message.walk()
+            if p.get_content_type() in {"image/png", "image/jpeg"}
+        ]
         self.assertEqual(len(images), 1)
-        self.assertEqual(images[0].get_payload(decode=True), MINIATURE)
 
     async def test_la_miniature_garde_le_type_annonce(self) -> None:
         message = await _envoyer(True)

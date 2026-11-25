@@ -1,5 +1,8 @@
 .DS_Store
 .env
+# Les sauvegardes de configuration portent les mêmes secrets que .env :
+# non ignorées, un « git add -A » les emporterait dans un commit.
+.env.bak*
 __pycache__/
 *.pyc
 secrets/

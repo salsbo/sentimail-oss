@@ -243,7 +243,7 @@ async def refresh_learned_doctrine(
                    coalesce(l.context->'signals','[]'::jsonb) AS signals
             FROM labels l
             WHERE l.is_ground_truth=true AND l.active=true
-              AND lower(l.participant_email)=lower($1)
+              AND sentimail_same_client(l.participant_email,$1)
               AND l.created_at > now() - interval '180 days'
             ORDER BY l.created_at DESC
             LIMIT 500

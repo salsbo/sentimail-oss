@@ -27,6 +27,8 @@ _BULK_HEADERS = (
     "list-help",
     "list-post",
     "feedback-id",
+)
+_BULK_SUPPORTING_HEADERS = (
     "x-csa-complaints",
     "x-report-abuse",
 )
@@ -77,14 +79,21 @@ def sending_mode(parsed: ParsedMessage) -> dict[str, object]:
         grouped.setdefault(str(header["name_normalized"]), []).append(
             str(header["value_decoded"])
         )
-    present = [name for name in _BULK_HEADERS if name in grouped]
+    present = [
+        name for name in (*_BULK_HEADERS, *_BULK_SUPPORTING_HEADERS) if name in grouped
+    ]
+    decisive = [name for name in _BULK_HEADERS if name in grouped]
     precedence = " ".join(grouped.get("precedence", [])).strip().casefold()
     bulk_precedence = precedence in _BULK_PRECEDENCE
     automated = any(
         value.strip().casefold().startswith(("auto-generated", "auto-replied"))
         for value in grouped.get(_AUTOMATED_HEADER, [])
     )
-    bulk = bool(present) or bulk_precedence
+    # Un canal de plainte décrit l'infrastructure d'envoi, pas nécessairement
+    # la nature du message. Des plateformes le posent aussi sur des accusés et
+    # notifications transactionnelles : il reste observé, mais ne suffit pas
+    # seul à affirmer une diffusion de masse.
+    bulk = bool(decisive) or bulk_precedence
     return {
         "mode": "bulk" if bulk else "automated" if automated else "conversational",
         "bulk_headers_present": present,
@@ -98,12 +107,31 @@ def is_bulk_mailing(parsed: ParsedMessage) -> bool:
     return sending_mode(parsed)["mode"] == "bulk"
 
 
+# Le registre de la réclame : remise chiffrée, affaire, promotion, incitation
+# à acheter. Une mention isolée arrive dans n'importe quel courrier (« le
+# fournisseur propose une offre spéciale ») ; c'est la répétition qui fait le
+# registre. Une réclame forgée sans aucune de ces marques n'existe pas, et
+# « Save 50% », « CHECK CURRENT DEAL » ne relevaient d'aucun registre le
+# 3 septembre 2026 : rien ne la qualifiait de sollicitation.
+_COMMERCIAL_OFFER = re.compile(
+    r"\b(\d{1,2}\s?%\s?(?:off|offerts?|de r[ée]duction|de remise|offer)|"
+    r"(?:save|[ée]conomisez?|jusqu.[àa])\s+(?:up to\s+)?\d{1,2}\s?%|"
+    r"deal|promo(?:tions?)?|coupon|"
+    r"offre (?:sp[ée]ciale|limit[ée]e|exclusive|flash)|special offer|"
+    r"limited[- ]time|(?:buy|shop|order|commandez|achetez) (?:now|maintenant))\b",
+    re.IGNORECASE,
+)
+_COMMERCIAL_MIN_MATCHES = 2
+
+
 def _claim_registers(sample: str) -> list[str]:
     registers: list[str] = []
     if _HEALTH_PROMISE.search(sample):
         registers.append("health")
     if _WEALTH_PROMISE.search(sample):
         registers.append("wealth")
+    if len(_COMMERCIAL_OFFER.findall(sample)) >= _COMMERCIAL_MIN_MATCHES:
+        registers.append("commercial")
     return registers
 
 
@@ -254,27 +282,27 @@ class NatureHook(EvidenceHook):
                     {"source": "visible-subject+body"},
                 )
             )
-            # Les diffusions honnêtes se déclarent et offrent une sortie. Une
-            # sollicitation qui promet l'invérifiable sans jamais permettre de
-            # s'en défaire n'a pas de destinataire consentant.
-            if not mode["unsubscribe_offered"]:
-                clues.append(
-                    Clue(
-                        "NATURE-004",
-                        "NATURE_SOLICITATION_WITHOUT_OPT_OUT",
-                        "adverse",
-                        20,
-                        0.75,
-                        "La sollicitation n’offre aucun moyen normalisé de se "
-                        "désinscrire.",
-                        {
-                            "sending_mode": mode["mode"],
-                            "bulk_headers_present": mode["bulk_headers_present"],
-                            "registers": registers,
-                        },
-                        {"source": "headers:list-unsubscribe"},
-                    )
+        # Les diffusions honnêtes se déclarent et offrent une sortie. Une
+        # sollicitation - promesse invérifiable ou réclame - qui ne permet
+        # jamais de s'en défaire n'a pas de destinataire consentant.
+        if registers and not mode["unsubscribe_offered"]:
+            clues.append(
+                Clue(
+                    "NATURE-004",
+                    "NATURE_SOLICITATION_WITHOUT_OPT_OUT",
+                    "adverse",
+                    20,
+                    0.75,
+                    "La sollicitation n’offre aucun moyen normalisé de se "
+                    "désinscrire.",
+                    {
+                        "sending_mode": mode["mode"],
+                        "bulk_headers_present": mode["bulk_headers_present"],
+                        "registers": registers,
+                    },
+                    {"source": "headers:list-unsubscribe"},
                 )
+            )
         return clues, {
             "sending_mode": mode["mode"],
             "bulk_headers_present": mode["bulk_headers_present"],

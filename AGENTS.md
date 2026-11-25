@@ -1,4 +1,4 @@
-# AGENTS.md
+# SentiMail V3
 
 Repères pour les agents IA qui développent ou font évoluer SentiMail.
 Lire d'abord `docs/code-sentinel.md` (procédure fonctionnelle complète) et
@@ -70,14 +70,12 @@ cd collector && PYTHONPATH=src uv run --with pytest --with-requirements requirem
 cd admin && PYTHONPATH=src uv run --with pytest --with-requirements requirements.txt python -m pytest tests/ -q
 ```
 
-Tolérance connue : 2 tests de `collector/tests/test_caretaker.py` échouent
-hors d'un environnement où `DATABASE_URL` est positionnée
-(`KeyError 'DATABASE_URL'`) ; préexistant, sans rapport avec le code
-applicatif.
+Les tests unitaires du caretaker fournissent eux-mêmes leur configuration et
+ne dépendent plus de la présence de `DATABASE_URL` dans le terminal appelant.
 
 ## Langue et style
 
 - Code et docstrings : français.
 - Modules courts ; les commentaires expliquent le pourquoi d'une décision,
   pas ce que fait déjà la ligne suivante.
-- Aucun tiret cadratin (—) : utiliser « - » ou « : ».
+- Aucun tiret cadratin : utiliser « - » ou « : ».

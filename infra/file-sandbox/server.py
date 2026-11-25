@@ -6,15 +6,19 @@ applique YARA + détection oletools/pdfminer selon mime, retourne JSON verdict.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import math
+import json
 import os
 import re
+import signal
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
-from contextlib import suppress
+from contextlib import redirect_stdout, suppress
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -48,6 +52,10 @@ OCR_MAX_BYTES = _positive_int_env("OCR_MAX_BYTES", 10 * 1024 * 1024)
 OCR_MAX_CHARS = _positive_int_env("OCR_MAX_CHARS", 2500)
 OCR_TIMEOUT_SECONDS = _positive_float_env("OCR_TIMEOUT_SECONDS", 15.0)
 OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "eng+fra")
+# Le client laisse 35 s par fichier. Ce délai inclut l'attente de capacité et
+# arrête aussi les descendants OCR, plutôt que d'abandonner seulement le HTTP.
+FILE_ANALYSIS_TIMEOUT_SECONDS = min(30.0, _positive_float_env("FILE_ANALYSIS_TIMEOUT_SECONDS", 30.0))
+_analysis_slots = asyncio.Semaphore(min(4, _positive_int_env("FILE_ANALYSIS_CONCURRENCY", 1)))
 PDF_TEXT_MAX_CHARS = _positive_int_env("PDF_TEXT_MAX_CHARS", 100_000)
 PDF_URL_MAX_COUNT = _positive_int_env("PDF_URL_MAX_COUNT", 1_000)
 PDF_MAX_PAGES = _positive_int_env("PDF_MAX_PAGES", 200)
@@ -410,6 +418,7 @@ def _extract_pdf(data: bytes) -> TextExtraction:
 
 def _pdf_findings(
     extraction: TextExtraction,
+    raw_pdf: bytes = b"",
     *,
     context: str | None = None,
 ) -> tuple[list[dict[str, Any]], float]:
@@ -437,7 +446,7 @@ def _pdf_findings(
                 ),
             }
         )
-    if re.search(r"/JavaScript|/JS|\bJavaScript\b", extraction.text, re.IGNORECASE):
+    if re.search(rb"/JavaScript\b|/JS\b", raw_pdf, re.IGNORECASE):
         findings.append(
             {
                 "code": "PDF_JAVASCRIPT",
@@ -446,7 +455,7 @@ def _pdf_findings(
             }
         )
         score = max(score, 0.6)
-    if re.search(r"/Launch|/EmbeddedFile|/OpenAction", extraction.text, re.IGNORECASE):
+    if re.search(rb"/Launch\b|/EmbeddedFile\b|/OpenAction\b", raw_pdf, re.IGNORECASE):
         findings.append(
             {
                 "code": "PDF_LAUNCH_ACTION",
@@ -458,9 +467,12 @@ def _pdf_findings(
     return findings, score
 
 
+MAX_CONTENT_B64_CHARS = ((MAX_BYTES + 2) // 3) * 4 + 64
+
+
 class AnalyzeIn(BaseModel):
     filename: str = Field(min_length=1, max_length=512)
-    content_b64: str = Field(min_length=1)
+    content_b64: str = Field(min_length=1, max_length=MAX_CONTENT_B64_CHARS)
 
 
 @app.get("/health")
@@ -470,6 +482,55 @@ async def health() -> dict[str, str]:
 
 @app.post("/analyze")
 async def analyze(payload: AnalyzeIn) -> dict[str, Any]:
+    try:
+        async with asyncio.timeout(FILE_ANALYSIS_TIMEOUT_SECONDS):
+            async with _analysis_slots:
+                return await _run_analysis_process(payload)
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="analysis_deadline_exceeded") from exc
+
+
+def _worker_command() -> tuple[str, ...]:
+    return sys.executable, str(Path(__file__).resolve()), "--analyze-worker"
+
+
+async def _stop_process(process: asyncio.subprocess.Process) -> None:
+    # Un OCR peut encore tourner alors que son parent a fini : on vise toute
+    # la session créée pour cette analyse, jamais le groupe du serveur HTTP.
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    await process.communicate()
+
+
+async def _run_analysis_process(payload: AnalyzeIn) -> dict[str, Any]:
+    process = await asyncio.create_subprocess_exec(
+        *_worker_command(), stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        request = await asyncio.to_thread(payload.model_dump_json)
+        output, _ = await process.communicate(request.encode("utf-8"))
+        if process.returncode != 0:
+            raise HTTPException(status_code=503, detail="analysis_process_failed")
+        try:
+            response = json.loads(output)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=503, detail="invalid_analysis_result") from exc
+        if not isinstance(response, dict):
+            raise HTTPException(status_code=503, detail="invalid_analysis_result")
+        if "status_code" in response:
+            raise HTTPException(status_code=response["status_code"], detail=response.get("detail"))
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise HTTPException(status_code=503, detail="invalid_analysis_result")
+        return result
+    finally:
+        await _stop_process(process)
+
+
+def analyze_content(payload: AnalyzeIn) -> dict[str, Any]:
+    """Traitement synchrone exécuté exclusivement dans le processus d'analyse."""
     try:
         data = base64.b64decode(payload.content_b64, validate=True)
     except Exception as exc:
@@ -559,7 +620,7 @@ async def analyze(payload: AnalyzeIn) -> dict[str, Any]:
     is_pdf = mime_low == "application/pdf" or name.lower().endswith(".pdf")
     if is_pdf:
         pdf_extraction = _extract_pdf(data)
-        pdf_findings, pdf_score = _pdf_findings(pdf_extraction)
+        pdf_findings, pdf_score = _pdf_findings(pdf_extraction, data)
         findings.extend(pdf_findings)
         score = max(score, pdf_score)
         extracted_text = pdf_extraction.text
@@ -643,6 +704,7 @@ async def analyze(payload: AnalyzeIn) -> dict[str, Any]:
                     member_pdf = _extract_pdf(member.data)
                     member_pdf_findings, member_pdf_score = _pdf_findings(
                         member_pdf,
+                        member.data,
                         context=f"membre archive {ref}",
                     )
                     findings.extend(member_pdf_findings)
@@ -827,7 +889,24 @@ async def analyze(payload: AnalyzeIn) -> dict[str, Any]:
     }
 
 
-if __name__ == "__main__":
+def _analysis_worker() -> None:
+    try:
+        payload = AnalyzeIn.model_validate_json(sys.stdin.buffer.read())
+        # Les bibliothèques documentaires peuvent écrire sur stdout. Le canal
+        # de résultat reste un seul objet JSON, sans leur bruit de diagnostic.
+        with redirect_stdout(sys.stderr):
+            result = analyze_content(payload)
+        response = {"result": result}
+    except HTTPException as exc:
+        response = {"status_code": exc.status_code, "detail": exc.detail}
+    except Exception:
+        response = {"status_code": 503, "detail": "analysis_process_failed"}
+    sys.stdout.write(json.dumps(response, ensure_ascii=False))
+
+
+if __name__ == "__main__" and "--analyze-worker" in sys.argv:
+    _analysis_worker()
+elif __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8091)

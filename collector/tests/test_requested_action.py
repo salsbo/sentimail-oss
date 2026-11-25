@@ -6,6 +6,7 @@ from sentimail_v3.code.requested_action import (
     ACTION_PROMPT,
     KNOWN_ACTIONS,
     action_clues,
+    asks_to_disclose_code,
 )
 
 
@@ -61,6 +62,66 @@ class PromptDistinctionTests(unittest.TestCase):
         self.assertIn("mfa_code_disclosure", prompt)
         # La règle doit être écrite noir sur blanc, pas déduite.
         self.assertIn("communiquer", prompt)
+
+
+class ConfirmationCodeTests(unittest.TestCase):
+    """Le modèle confondait « code à saisir » et « code à communiquer ».
+
+    Onze codes de connexion légitimes portaient l'indice le plus grave du
+    registre (17 août - 13 septembre 2026) ; un code Dashlane restait retenu.
+    """
+
+    DASHLANE = (
+        "Voici le code que vous avez demandé\nVotre code figure dans cet e-mail. "
+        "Ce code expirera dans 3 heures. Vous vérifiez votre identité pour accéder "
+        "à Exemple à partir de l'adresse IP 203.0.113.5. Le code de vérification de "
+        "votre nouvel appareil est le suivant: 123456 Important : ce code unique "
+        "expirera dans 15 minutes. Vérifier cet appareil [lien] Cet e-mail vous a "
+        "été envoyé, car vous vous êtes connecté depuis un appareil inconnu."
+    )
+
+    def test_les_demandes_de_transmission_sont_reconnues(self) -> None:
+        for phrase in (
+            "Merci de nous communiquer le code reçu par SMS pour débloquer votre compte.",
+            "Reply to this email with the verification code you just received.",
+            "Pour valider, envoyez-nous le code à 6 chiffres.",
+            "Un conseiller va vous appeler : donnez-lui le code affiché.",
+            "Please send us the code displayed on your phone.",
+            "Veuillez nous transmettre le code reçu.",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(asks_to_disclose_code(phrase))
+
+    def test_l_usage_normal_d_un_code_n_est_pas_une_demande(self) -> None:
+        for phrase in (
+            DASHLANE,
+            "Ne partagez jamais ce code avec personne.",
+            "Never share this code with anyone.",
+            "Saisissez ce code sur l'appareil.",
+            "We sent you a code. Do not share it.",
+            "We'll send you a code by SMS.",
+            "Il va vous envoyer un code.",
+            "If you didn't send this request, the code expires in 15 minutes.",
+        ):
+            with self.subTest(phrase=phrase[:40]):
+                self.assertFalse(asks_to_disclose_code(phrase))
+
+    def test_le_modele_seul_ne_fabrique_pas_l_indice(self) -> None:
+        reponse = {"actions": ["mfa_code_disclosure", "click_link"]}
+        codes = {c["clue_code"] for c in action_clues(reponse, DASHLANE)}
+        self.assertNotIn("ACTION_MFA_CODE_DISCLOSURE", codes)
+        self.assertIn("ACTION_CLICK_LINK", codes)
+
+    def test_une_demande_confirmee_garde_l_indice(self) -> None:
+        reponse = {"actions": ["mfa_code_disclosure"]}
+        clues = action_clues(reponse, "Merci de nous communiquer le code reçu par SMS.")
+        self.assertEqual(["ACTION_MFA_CODE_DISCLOSURE"], [c["clue_code"] for c in clues])
+
+    def test_le_prompt_dit_que_saisir_n_est_pas_communiquer(self) -> None:
+        self.assertIn("Saisir un code", ACTION_PROMPT)
+
+
+DASHLANE = ConfirmationCodeTests.DASHLANE
 
 
 class ActionRegistryTests(unittest.TestCase):

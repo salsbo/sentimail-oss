@@ -41,8 +41,10 @@ class _Connection:
         }
 
     async def execute(self, query: str, *args: object) -> str:
-        self.pool.calls.append((query, args))
-        return "UPDATE 1"
+        return await self.pool.execute(query, *args)
+
+    async def fetchval(self, query: str, *args: object) -> object:
+        return await self.pool.fetchval(query, *args)
 
 
 class _Pool:

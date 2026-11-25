@@ -6,6 +6,15 @@ from typing import Any
 
 _ACTIONABLE = {"release_original", "suppress_future", "cancel_suppression"}
 
+# Noyée dans un long texte, une lettre ou une phrase vient plus souvent d'une
+# citation mal détourée que d'une intention. Au-delà, le texte part au modèle.
+CHOICE_CONTEXT_LIMIT = 400
+
+
+def short_enough(text: str) -> bool:
+    """Le texte tient dans la limite, blancs réduits."""
+    return len(" ".join(text.split())) <= CHOICE_CONTEXT_LIMIT
+
 
 def _normalized(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value.casefold())
@@ -25,7 +34,13 @@ def _lone_letter(text: str) -> str | None:
     """« A » ou « B » isolé sur sa ligne, tel que les boutons l'écrivent."""
     trouvees = {match.group(1).upper() for match in _LONE_LETTER.finditer(text or "")}
     # Deux lettres différentes ne disent plus rien : on préfère ne rien décider.
-    return trouvees.pop() if len(trouvees) == 1 else None
+    if len(trouvees) != 1:
+        return None
+    # Même garde que pour les boutons : une lettre au milieu d'un long texte
+    # ne décide pas. Sans elle, le texte libre confié au modèle retrouvait ici
+    # la lettre que la lecture des choix venait d'écarter.
+    reste = _LONE_LETTER.sub("", text or "")
+    return trouvees.pop() if short_enough(reste) else None
 
 
 def _explicit_action(text: str) -> str | None:
@@ -87,11 +102,22 @@ def _explicit_classification(text: str) -> str | None:
     return None
 
 
+def explicit_directive(user_text: str) -> tuple[str | None, str | None]:
+    """Lit localement l'action et la qualification dites par l'utilisateur.
+
+    Cette lecture ne donne aucun droit d'exécution à elle seule : le jeton de
+    réponse SMTP et le rattachement au dossier restent les autorités. Elle est
+    publique afin que les réponses préremplies, rédigées en toutes lettres,
+    empruntent exactement la même voie déterministe que les anciennes lettres
+    A/B, sans dépendre d'un fournisseur LLM.
+    """
+    text = _normalized(user_text)
+    return _explicit_action(text), _explicit_classification(text)
+
+
 def evaluate_directive(user_text: str, llm_result: dict[str, Any]) -> dict[str, object]:
     """Bloque toute action LLM absente ou contraire au texte explicite."""
-    text = _normalized(user_text)
-    explicit_action = _explicit_action(text)
-    explicit_classification = _explicit_classification(text)
+    explicit_action, explicit_classification = explicit_directive(user_text)
     llm_action = str(llm_result.get("requested_action") or "none")
     llm_classification = llm_result.get("classification")
     conflicts: list[str] = []

@@ -19,7 +19,8 @@ l'instance.
   Ollama/vLLM). L'encart de confidentialité de la console (`/reglages`,
   `/etat`) affiche en permanence, rôle par rôle, où part ce contenu : vers
   l'URL du fournisseur distant configuré, ou vers le modèle local si aucune
-  donnée ne sort.
+  donnée ne sort. Les analyses auxiliaires peuvent rester sur Ollama ; les
+  verdicts disposent d'une cascade Flash → Pro précédée d'un mode comparatif.
 - **Poser un MX en coupure du flux de courrier exige de savoir opérer un
   serveur mail** : enregistrement MX, PTR de l'adresse publique, certificat
   TLS. Une mauvaise configuration DNS/TLS fait refuser le courrier par les

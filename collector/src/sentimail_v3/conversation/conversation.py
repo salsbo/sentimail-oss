@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import html
 import json
 import re
 from email.utils import parseaddr
@@ -9,8 +8,20 @@ from typing import Any
 
 import asyncpg
 
+from sentimail_v3.code.attack_techniques import pedagogy
+from sentimail_v3.code.plain_words import (
+    classification_reasons,
+    confidence_badge,
+    sender_lines,
+)
+from sentimail_v3.code.reference import reference
+from sentimail_v3.code.tenancy import is_protected, protected_recipient
 from sentimail_v3.config import Settings
-from sentimail_v3.conversation.action_tokens import ACTION_MARKER_RE, REFERENCE_TOKEN_RE, token_hash
+from sentimail_v3.conversation.action_tokens import (
+    ACTION_MARKER_RE,
+    REFERENCE_TOKEN_RE,
+    token_hash,
+)
 from sentimail_v3.conversation.confirmation_code import (
     TTL_MINUTES as CONFIRMATION_TTL_MINUTES,
 )
@@ -19,29 +30,29 @@ from sentimail_v3.conversation.confirmation_code import (
     confirms,
     new_code,
 )
-from sentimail_v3.crypto import reveal
-from sentimail_v3.identity import Identity, instance_identity
-from sentimail_v3.execution.delivery_state import CONSUMED, HELD, move
 from sentimail_v3.conversation.digest import PURPOSE as DIGEST_PURPOSE
-from sentimail_v3.observation.dossier.hooks.visible_text import visible_html_text
-from sentimail_v3.code.attack_techniques import pedagogy
-from sentimail_v3.code.plain_words import (
-    plain_limits,
-    plain_points,
-    short_conclusion,
+from sentimail_v3.conversation.reply_alias import (
+    ALIAS_PURPOSE,
+    ALIAS_TTL_MINUTES,
+    alias_challenge_letter,
+    alias_decision,
 )
-from sentimail_v3.code.reference import reference
+from sentimail_v3.conversation.reply_reference import (
+    body_action_token,
+    referenced_message_ids,
+)
 from sentimail_v3.conversation.review_notice import render_notice_html
+from sentimail_v3.crypto import reveal
+from sentimail_v3.execution.delivery_state import CONSUMED, HELD, move
+from sentimail_v3.identity import Identity, instance_identity
+from sentimail_v3.observation.dossier.hooks.visible_text import (
+    reply_html_text,
+    visible_html_text,
+)
 from sentimail_v3.observation.preview import screenshot, thumbnail
-from sentimail_v3.observation.risk_text import risky_text_excerpts
-from sentimail_v3.code.tenancy import is_protected, protected_recipient
-from sentimail_v3.code.trust import pool_trusts_sender
-
-# La première ligne lue de l'avis. « Il attend ta réponse » laissait croire que
-# le message répondrait de lui-même ; ce qui est attendu est une directive.
-# Le mot « livré » y reste : la couleur d'alerte du bandeau se règle dessus.
-HOLD_STATUS_TEXT = (
-    "L’email ci-dessous n’a pas été livré : j’attends tes directives."
+from sentimail_v3.observation.risk_text import (
+    message_text_excerpts,
+    neutralize_excerpt_links,
 )
 
 _CONFIRM_RE = re.compile(r"^\s*confirme\s+(?:maia|kitt)[.!]?\s*$", re.IGNORECASE)
@@ -144,12 +155,16 @@ def readable_body(body_text: object, body_html: object) -> str:
     Outlook et la plupart des clients mobiles répondent en HTML seul. Ne lire
     que la partie texte revenait à recevoir une directive vide : la réponse
     était bien arrivée, mais personne ne l'avait lue.
+
+    Le HTML se lit ligne par ligne, citation marquée « > ». Aplati en une
+    seule ligne, il ne laissait rien couper : le 28 septembre 2026, la réponse
+    iPhone de M-d8df0e et l'avis qu'elle citait se lisaient comme un seul texte.
     """
     text = str(body_text or "").strip()
     if text:
         return text
     html = str(body_html or "")
-    return visible_html_text(html).strip() if html else ""
+    return reply_html_text(html).strip() if html else ""
 
 
 def strip_quoted_reply(body: str) -> str:
@@ -224,6 +239,9 @@ class ConversationStore:
         self, message_id: str, *, decision_mode: bool | None = None
     ) -> bool:
         identite = await self._identity()
+        # La photo du message, prise hors transaction : c'est un appel réseau au
+        # bac à sable de rendu, qui bloquerait la ligne pendant ce temps. Un
+        # échec n'est pas une panne : l'avis part sans image.
         preview: bytes | None = None
         preview_inline: bytes | None = None
         preview_inline_type: str | None = None
@@ -235,18 +253,18 @@ class ConversationStore:
             if isinstance(original, bytes):
                 preview = await screenshot(original, self.render_sandbox_url)
                 if preview:
-                    # L'avis affiche la miniature et joint l'original.
-                    # Une miniature absente n'est pas une panne : l'original
-                    # tient alors les deux rôles.
+                    # La miniature se montre dans le corps ; la capture pleine
+                    # part en pièce jointe pour être lue en grand.
                     reduite = await thumbnail(preview, self.render_sandbox_url)
                     if reduite is not None:
                         preview_inline, preview_inline_type = reduite
         async with self.pool.acquire() as connection, connection.transaction():
             dossier = await connection.fetchrow(
                 """
-                SELECT dc.id AS case_id, m.subject, m.body_text, m.envelope_recipients,
-                       m.from_header, i.favorable_points, i.adverse_points,
-                       m.delivery_status, v.classification, v.confidence, v.rationale,
+                SELECT dc.id AS case_id, m.subject, m.body_text, m.body_html,
+                       m.captured_at, m.from_header, m.envelope_from, m.reply_to_header,
+                       m.envelope_recipients, m.delivery_status,
+                       v.classification, v.rationale,
                        vr.attack_techniques
                 FROM delivery_cases dc
                 JOIN messages m ON m.id=dc.message_id
@@ -265,6 +283,7 @@ class ConversationStore:
                     ORDER BY completed_at DESC LIMIT 1
                 ) vr ON true
                 WHERE m.id=$1::uuid
+                FOR UPDATE OF m, dc
                 """,
                 message_id,
             )
@@ -273,7 +292,7 @@ class ConversationStore:
             recipients = [
                 str(value).casefold() for value in dossier["envelope_recipients"]
             ]
-            participant = await protected_recipient(self.pool, recipients)
+            participant = await protected_recipient(connection, recipients)
             if participant is None:
                 # Aucun domaine actif ne couvre ce message : il n'y a personne à
                 # qui demander un avis, et personne à qui écrire.
@@ -381,142 +400,108 @@ class ConversationStore:
             }
 
             subject = str(dossier["subject"] or "(sans objet)")
-            sender_name = str(dossier["from_header"] or "(expéditeur inconnu)")
-            concerns = plain_points([dict(row) for row in by_direction["adverse"]], 3)
-            reassurances = plain_points(
-                [dict(row) for row in by_direction["favorable"]], 2
+            # Sans indice matériel, l'avis restait muet - « Rien de précis à te
+            # signaler » sous un bouclier rouge. La motivation du verdict existe
+            # en base : elle vaut mieux qu'une contradiction. Aucun motif n'est
+            # désormais absorbé par une carte d'identité, puisque cette carte ne
+            # fait plus partie de la fiche visible.
+            concerns = classification_reasons(
+                [dict(row) for row in by_direction["adverse"]],
+                dossier["rationale"],
+                3,
             )
-            limits = plain_limits([dict(row) for row in by_direction["neutral"]], 2)
-            # La motivation complète reste au dossier ; la lettre n'en garde
-            # que ce que les deux colonnes n'ont pas déjà dit. Redire ligne à
-            # ligne ce qu'on vient de lire enterre la seule phrase qui répond
-            # à « et donc ? ».
-            decision = short_conclusion(
-                str(dossier["rationale"] or ""),
-                listed=[*concerns, *reassurances, *limits],
-            )
-            risk_excerpts = risky_text_excerpts(
-                subject, str(dossier["body_text"] or "")
+            # Dois-je m'en méfier : un niveau, un mot, une couleur. Il remplace
+            # la motivation recopiée, la technique nommée et la liste des
+            # vérifications inabouties. Il ouvre maintenant directement la fiche.
+            badge = confidence_badge(dossier["classification"], len(concerns))
+            # Un doute peut venir de l'identité ou du contexte, sans mot
+            # alarmant dans le corps. L'utilisateur garde donc quelques
+            # passages pour reconnaître et comprendre le message. Le HTML
+            # n'est jamais repris : on n'en extrait que le texte visible.
+            excerpt_source = str(dossier["body_text"] or "")
+            if not excerpt_source:
+                excerpt_source = visible_html_text(str(dossier["body_html"] or ""))
+            message_excerpts = (
+                message_text_excerpts(excerpt_source) if hold_original else []
             )
 
             def block(title: str, values: list[str], empty: str) -> str:
                 lines = [f"- {value}" for value in values] or [f"- {empty}"]
                 return title + "\n" + "\n".join(lines)
 
-            def block_html(title: str, values: list[str], empty: str, color: str) -> str:
-                items = "".join(
-                    f'<li style="margin:4px 0">{html.escape(value)}</li>'
-                    for value in values
-                ) or f'<li style="margin:4px 0">{html.escape(empty)}</li>'
-                return (
-                    f'<h3 style="color:{color};margin-bottom:4px">{html.escape(title)}</h3>'
-                    f'<ul style="margin:0;padding-left:20px">{items}</ul>'
-                )
-
-            trusted = await pool_trusts_sender(self.pool, dossier)
-            status_text = (
-                HOLD_STATUS_TEXT
-                if hold_original
-                else "Ce message t’a été livré ; ta réponse me sert à mieux faire."
-            )
-            if hold_original and trusted:
-                # Deranger malgre une autorisation demande une explication :
-                # sinon la liste blanche passe pour cassee.
-                status_text += (
-                    " Tu as pourtant autorisé cet expéditeur : je te préviens"
-                    " quand même, car ce que j’ai trouvé ici ne s’explique pas"
-                    " par une simple habitude."
-                )
             choices_text = (
                 "Que veux-tu faire ? Réponds avec une lettre :\n"
                 "A - Livre-le, cet expéditeur est fiable\n"
                 "B - Non merci, et retiens les prochains de cette adresse\n"
                 "C - Autre chose : écris C puis explique-moi"
             )
-            limits_text = (
-                "\n\n" + block(
-                    "Ce que je n’ai pas pu vérifier", limits, ""
-                ) + "\nCela ne veut pas dire que le message est dangereux."
-                if limits
+            excerpt_text = (
+                "\n\nExtraits du message :\n"
+                + "\n".join(
+                    f"- {neutralize_excerpt_links(value)}"
+                    for value in message_excerpts
+                )
+                if message_excerpts
                 else ""
             )
-            risk_text = (
-                "\n\nPassages du message qui m’ont alertée :\n"
-                + "\n".join(f"- {value}" for value in risk_excerpts)
-                if risk_excerpts
-                else ""
-            )
-            # Nommer la technique, et l'expliquer : c'est ce qui apprend au
-            # destinataire à reconnaître la prochaine tentative sans moi.
+            # Du savoir pédagogique, l'avis ne garde que le geste à faire :
+            # nommer et décrire la technique redisait en trois lignes ce que
+            # l'indice de confiance dit en un mot.
             technique_codes = dossier["attack_techniques"]
             if isinstance(technique_codes, str):
                 technique_codes = json.loads(technique_codes)
             lessons = await pedagogy(
-                self.pool,
+                connection,
                 [str(code) for code in technique_codes or []],
             )
-            techniques_text = (
-                "\n\nCe que ce message cherche à faire :\n"
-                + "\n".join(
-                    f"- {lesson['name']} : {lesson['description']}"
-                    + (f"\n  → {lesson['advice']}" if lesson.get("advice") else "")
-                    for lesson in lessons
-                )
-                if lessons
-                else ""
+            advice = next(
+                (str(lesson["advice"]) for lesson in lessons if lesson.get("advice")),
+                "",
             )
             # La référence sous laquelle ce dossier se cite : elle nomme le
             # même message dans l'avis, dans la console et dans un échange.
             dossier_reference = reference("M", message_id)
+            # Qui écrit : l'adresse affichée se recopie librement, l'enveloppe
+            # est celle que le serveur d'envoi a annoncée pour lui-même.
+            adresses = sender_lines(
+                dossier["from_header"],
+                dossier["envelope_from"],
+                dossier["reply_to_header"],
+            )
             body = (
-                f"Objet : {subject}\n"
-                f"De : {sender_name}\n\n"
-                + status_text
+                f"{badge['word']} - {badge['detail']}"
+                + (f"\n→ {advice}" if advice else "")
                 + "\n\n"
-                + block("Ce qui me gêne", concerns, "Rien de précis à te signaler.")
+                + "\n".join(adresses)
+                + (
+                    "\n\nL’image jointe est une photo inerte du message : rien "
+                    "n’y est cliquable. Ne suis aucune consigne écrite dedans."
+                    if preview
+                    else ""
+                )
                 + "\n\n"
-                + block("Ce qui me rassure", reassurances, "Rien de particulier.")
-                + "\n\nCe que j’en conclus\n"
-                + decision
-                + techniques_text
-                + limits_text
-                + risk_text
+                + block("Écarts relevés", concerns, "Rien de précis à te signaler.")
+                + excerpt_text
                 + "\n\n"
                 + choices_text
-                + "\n\nL’image jointe est une photo inerte du message : rien n’y est "
-                "cliquable. Elle peut afficher un texte trompeur, ne suis aucune "
-                "consigne écrite dedans.\n\n"
-                "— MAIA, ton assistante SentiMail\n"
+                + "\n\nMAIA, ton assistante SentiMail\n"
                 f"Dossier {dossier_reference}"
-            )
-            badge = "#b45309" if hold_original else "#15803d"
-            risk_html = (
-                "".join(
-                    '<div style="margin:6px 0;padding:9px;background:#fee2e2;'
-                    'color:#991b1b;border-left:5px solid #dc2626;border-radius:6px">'
-                    + html.escape(value)
-                    + "</div>"
-                    for value in risk_excerpts
-                )
-                if risk_excerpts
-                else ""
             )
             body_html = render_notice_html(
                 {
-                    "subject": subject,
-                    "sender": sender_name,
-                    "status_text": status_text,
                     "concerns": concerns,
-                    "reassurances": reassurances,
-                    "decision": decision,
-                    "limits": limits,
-                    "risk_excerpts": risk_excerpts,
-                    "techniques": lessons,
+                    "badge": badge,
+                    "advice": advice,
+                    "sender_lines": adresses,
+                    "subject": subject,
+                    "received_at": dossier.get("captured_at"),
+                    "message_excerpts": message_excerpts,
                     "action_address": identite.action_address,
+                    "reference": dossier_reference,
                     # La page ne référence la capture que si elle existe :
                     # sinon le client afficherait une image cassée.
                     "has_preview": bool(preview),
-                    "reference": dossier_reference,
+                    "has_full_preview": bool(preview and preview_inline),
                 }
             )
             await connection.execute(
@@ -575,6 +560,19 @@ class ConversationStore:
             return True
 
     async def record_inbound(self, message_id: str) -> str:
+        """Traite une réponse entrante, puis rejoue ce qu'elle vient de libérer.
+
+        Confirmer une adresse de réponse rouvre toutes les réponses qu'elle
+        avait envoyées et qu'on avait mises de côté. Le rejeu se fait après la
+        transaction : chaque passage reprend une connexion propre, et voit
+        l'alias qui vient d'être écrit.
+        """
+        outcome, replays = await self._record_inbound(message_id)
+        for other in replays:
+            await self.record_inbound(other)
+        return outcome
+
+    async def _record_inbound(self, message_id: str) -> tuple[str, list[str]]:
         async with self.pool.acquire() as connection, connection.transaction():
             message = await connection.fetchrow(
                 """
@@ -584,7 +582,19 @@ class ConversationStore:
                            WHERE message_id=messages.id
                              AND name_normalized IN ('in-reply-to','references')
                            ORDER BY ordinal
-                       ) AS references
+                       ) AS references,
+                       ARRAY(
+                           SELECT value_decoded FROM headers
+                           WHERE message_id=messages.id
+                             AND name_normalized='in-reply-to'
+                           ORDER BY ordinal
+                       ) AS in_reply_to,
+                       ARRAY(
+                           SELECT value_decoded FROM headers
+                           WHERE message_id=messages.id
+                             AND name_normalized='references'
+                           ORDER BY ordinal
+                       ) AS reference_chain
                 FROM messages WHERE id=$1::uuid
                 """,
                 message_id,
@@ -604,21 +614,34 @@ class ConversationStore:
                     _json({"message_id": message_id}),
                 )
                 await self._mark_consumed(connection, message_id)
-                return "rejected_sender_alignment"
+                return "rejected_sender_alignment", []
             joined_references = " ".join(message["references"] or [])
-            match = REFERENCE_TOKEN_RE.search(joined_references)
-            if match is None:
-                match = ACTION_MARKER_RE.search(
-                    f"{message['subject'] or ''}\n"
-                    + readable_body(message["body_text"], message["body_html"])
+            match = REFERENCE_TOKEN_RE.search(joined_references) or ACTION_MARKER_RE.search(
+                str(message["subject"] or "")
+            )
+            token = match.group(1) if match else None
+            # Sans jeton dans l'en-tête ni dans l'objet, la réponse vise
+            # peut-être un message livré, qui ne porte plus de bouton. Ce
+            # message passe avant les jetons du corps : ceux-là peuvent venir
+            # d'anciens pieds de page cités plus bas dans le fil.
+            replied_case = None
+            if token is None:
+                replied_case = await self._replied_delivered_case(
+                    connection, message, sender
+                )
+            if token is None and replied_case is None:
+                token = body_action_token(
+                    readable_body(message["body_text"], message["body_html"])
                 )
             action = None
-            if match:
+            if token:
                 action = await connection.fetchrow(
                     """
                     SELECT sa.id, sa.case_id, c.id AS conversation_id,
                            c.participant_email, sa.context->>'purpose' AS purpose,
                            sa.context->>'confirm_message_id' AS confirm_message_id,
+                           sa.context->>'challenged_sender' AS challenged_sender,
+                           sa.context->>'expected_sender' AS alias_expected_sender,
                            sa.context->>'confirmation_code_hash'
                                AS confirmation_code_hash
                     FROM smtp_actions sa
@@ -632,20 +655,73 @@ class ConversationStore:
                     -- plutôt que de rejouer la directive.
                     FOR UPDATE OF sa
                     """,
-                    token_hash(match.group(1)),
+                    token_hash(token),
                 )
-            if action is not None and sender != action["participant_email"].casefold():
+            expected_sender = (
+                str(action["participant_email"]).casefold()
+                if action is not None
+                else ""
+            )
+            same_mailbox = action is not None and bool(
+                await connection.fetchval(
+                    "SELECT sentimail_same_client_mailbox($1,$2)",
+                    sender,
+                    expected_sender,
+                )
+            )
+            # La confirmation d'une adresse arrive elle-même depuis cette
+            # adresse : la contrôler avant de la reconnaître fermerait la porte
+            # dont on tient la clé. Le code est la preuve, pas l'expéditeur.
+            if action is not None and action["purpose"] == ALIAS_PURPOSE:
+                return await self._confirm_reply_alias(
+                    connection, message_id, message, sender, action
+                )
+            alias_confirmed = action is not None and bool(
+                await connection.fetchval(
+                    "SELECT sentimail_reply_alias_confirmed($1,$2)",
+                    sender,
+                    expected_sender,
+                )
+            )
+            if action is not None and alias_decision(
+                same_mailbox, alias_confirmed
+            ) == "challenge":
+                return await self._queue_alias_challenge(
+                    connection, message_id, sender, expected_sender
+                ), []
+            if action is not None and alias_confirmed and not same_mailbox:
                 await connection.execute(
                     """
                     INSERT INTO audit_log (actor, action, payload)
-                    VALUES ('conversation','smtp_reply.rejected_sender',$1::jsonb)
+                    VALUES ('conversation','smtp_reply.accepted_confirmed_alias',
+                            $1::jsonb)
                     """,
-                    _json({"message_id": message_id, "sender": sender}),
+                    _json(
+                        {
+                            "message_id": message_id,
+                            "sender": sender,
+                            "expected_sender": expected_sender,
+                        }
+                    ),
                 )
-                await self._mark_consumed(connection, message_id)
-                return "rejected_sender"
+            # Un autre domaine du même client : la réponse passait déjà, elle
+            # se note à part de l'adresse confirmée une fois pour toutes.
+            if action is not None and same_mailbox and sender != expected_sender:
+                await connection.execute(
+                    """
+                    INSERT INTO audit_log (actor, action, payload)
+                    VALUES ('conversation','smtp_reply.accepted_client_alias',$1::jsonb)
+                    """,
+                    _json(
+                        {
+                            "message_id": message_id,
+                            "sender": sender,
+                            "expected_sender": expected_sender,
+                        }
+                    ),
+                )
 
-            if action is None and not await is_protected(self.pool, sender):
+            if action is None and not await is_protected(connection, sender):
                 await connection.execute(
                     """
                     INSERT INTO audit_log (actor, action, payload)
@@ -654,20 +730,20 @@ class ConversationStore:
                     _json({"message_id": message_id, "sender": sender}),
                 )
                 await self._mark_consumed(connection, message_id)
-                return "rejected_sender"
+                return "rejected_sender", []
 
             if action is None:
                 return await self._queue_identity_challenge(
-                    connection, message_id, message, sender
-                )
+                    connection, message_id, message, sender, replied_case
+                ), []
             if action["purpose"] == DIGEST_PURPOSE:
                 return await self._queue_digest_reply(
                     connection, message_id, message, sender, action
-                )
+                ), []
             if action["purpose"] == "authenticate_directive":
                 return await self._confirm_directive(
                     connection, message_id, message, sender, action
-                )
+                ), []
             conversation_id = str(action["conversation_id"])
             await connection.execute(
                 """
@@ -701,7 +777,7 @@ class ConversationStore:
                 user_text,
             )
             await self._mark_consumed(connection, message_id)
-            return "queued"
+            return "queued", []
 
     async def _queue_digest_reply(
         self,
@@ -744,12 +820,261 @@ class ConversationStore:
         await self._mark_consumed(connection, message_id)
         return "queued_digest"
 
+    async def _queue_alias_challenge(
+        self,
+        connection: asyncpg.Connection,
+        message_id: str,
+        sender: str,
+        expected_sender: str,
+    ) -> str:
+        """Met la réponse de côté et demande à la boîte de l'avis d'ouvrir l'adresse.
+
+        L'action d'origine reste en attente : c'est elle qui portera la
+        décision au rejeu. Un seul code par adresse à la fois - sept réponses
+        d'affilée ne doivent pas donner sept courriers - et les suivantes sont
+        seulement notées, jamais perdues : la confirmation les rejouera toutes.
+        """
+        identite = await self._identity()
+        pending_challenge = await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM smtp_actions
+                WHERE status='pending'
+                  AND context->>'purpose'=$3
+                  AND lower(context->>'challenged_sender')=lower($1)
+                  AND issued_at > now() - ($2 * interval '1 minute')
+            )
+            """,
+            sender,
+            ALIAS_TTL_MINUTES,
+            ALIAS_PURPOSE,
+        )
+        await connection.execute(
+            """
+            INSERT INTO audit_log (actor, action, payload)
+            VALUES ('conversation',$2,$1::jsonb)
+            """,
+            _json(
+                {
+                    "message_id": message_id,
+                    "sender": sender,
+                    "expected_sender": expected_sender,
+                }
+            ),
+            "smtp_reply.awaiting_alias"
+            if pending_challenge
+            else "smtp_reply.alias_challenge_sent",
+        )
+        if pending_challenge:
+            await self._mark_consumed(connection, message_id)
+            return "awaiting_alias_confirmation"
+
+        conversation_id = await connection.fetchval(
+            """
+            INSERT INTO conversations (participant_email, status)
+            VALUES ($1,'awaiting_user') RETURNING id::text
+            """,
+            expected_sender,
+        )
+        code = new_code()
+        subject, body = alias_challenge_letter(sender, expected_sender, code)
+        action_id = await connection.fetchval(
+            """
+            INSERT INTO smtp_actions (
+                case_id, action, token_hash, reply_address, expires_at, context
+            ) VALUES (
+                NULL,'give_directive',NULL,$1,
+                now() + ($3 * interval '1 minute'),$2::jsonb
+            )
+            RETURNING id::text
+            """,
+            identite.action_address,
+            _json(
+                {
+                    "conversation_id": conversation_id,
+                    "purpose": ALIAS_PURPOSE,
+                    "challenged_sender": sender,
+                    "expected_sender": expected_sender,
+                    "confirmation_code_hash": code_hash(code),
+                    "binding": False,
+                }
+            ),
+            ALIAS_TTL_MINUTES,
+        )
+        await connection.execute(
+            """
+            INSERT INTO assistant_outbox (
+                conversation_id, action_id, recipient, sender, reply_to,
+                subject, body_text
+            ) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7)
+            """,
+            conversation_id,
+            action_id,
+            expected_sender,
+            identite.assistant_sender,
+            identite.action_address,
+            subject,
+            body,
+        )
+        await self._mark_consumed(connection, message_id)
+        return "alias_confirmation_sent"
+
+    async def _confirm_reply_alias(
+        self,
+        connection: asyncpg.Connection,
+        message_id: str,
+        message: asyncpg.Record,
+        sender: str,
+        action: asyncpg.Record,
+    ) -> tuple[str, list[str]]:
+        """Ouvre l'adresse de réponse, puis rend les réponses qu'elle avait faites.
+
+        Le code prouve l'accès à la boîte de l'avis : il vaut donc comme
+        confirmation, quelle que soit l'adresse qui le renvoie - c'est la même
+        personne qui écrit des deux côtés. Une tentative, une seule : l'action
+        est consommée que le code soit bon ou non.
+        """
+        alias = str(action["challenged_sender"] or "")
+        expected = str(action["alias_expected_sender"] or "")
+        confirmed = confirms(
+            strip_quoted_reply(
+                readable_body(message["body_text"], message["body_html"])
+            ),
+            action["confirmation_code_hash"],
+        )
+        await connection.execute(
+            """
+            UPDATE smtp_actions SET status='consumed', consumed_at=now(),
+                reply_message_id=$2::uuid, requested_by=$3
+            WHERE id=$1 AND status='pending'
+            """,
+            action["id"],
+            message_id,
+            sender,
+        )
+        await connection.execute(
+            "UPDATE conversations SET status='closed',updated_at=now() WHERE id=$1",
+            action["conversation_id"],
+        )
+        replays: list[str] = []
+        if confirmed and alias and expected:
+            await connection.execute(
+                """
+                INSERT INTO participant_reply_aliases (participant_email, alias_email)
+                VALUES ($1,$2) ON CONFLICT DO NOTHING
+                """,
+                expected,
+                alias,
+            )
+            # Tout ce que cette adresse avait envoyé et qu'on avait écarté. Le
+            # rejeu repasse par les mêmes contrôles : une réponse dont l'action
+            # a expiré ou déjà servi n'y gagne rien.
+            replays = [
+                str(row["message_id"])
+                for row in await connection.fetch(
+                    """
+                    SELECT DISTINCT ON (a.payload->>'message_id')
+                           a.payload->>'message_id' AS message_id, a.id
+                    FROM audit_log a
+                    WHERE a.action IN ('smtp_reply.rejected_sender',
+                                       'smtp_reply.awaiting_alias',
+                                       'smtp_reply.alias_challenge_sent')
+                      AND lower(a.payload->>'sender')=lower($1)
+                      AND a.payload->>'message_id' IS NOT NULL
+                      AND a.created_at >= now() - interval '30 days'
+                    ORDER BY a.payload->>'message_id', a.id DESC
+                    """,
+                    alias,
+                )
+            ]
+        await connection.execute(
+            "INSERT INTO audit_log (actor, action, payload) "
+            "VALUES ('conversation',$1,$2::jsonb)",
+            "smtp_reply.alias_confirmed" if confirmed else "smtp_reply.alias_rejected",
+            _json(
+                {
+                    "message_id": message_id,
+                    "alias": alias,
+                    "expected_sender": expected,
+                    "replayed": len(replays),
+                }
+            ),
+        )
+        await self._mark_consumed(connection, message_id)
+        return ("alias_confirmed" if confirmed else "alias_rejected"), replays
+
+    @staticmethod
+    async def _replied_delivered_case(
+        connection: asyncpg.Connection,
+        message: asyncpg.Record,
+        sender: str,
+    ) -> asyncpg.Record | None:
+        """Le message livré à cette boîte auquel la réponse fait suite.
+
+        Seul un message livré à la boîte qui écrit peut être désigné : un
+        identifiant cité ne rattache jamais la réponse au courrier d'un autre.
+        """
+        identifiers = referenced_message_ids(
+            message["in_reply_to"] or [], message["reference_chain"] or []
+        )
+        if not identifiers:
+            return None
+        return await connection.fetchrow(
+            """
+            SELECT dc.id AS case_id, m.subject
+            FROM messages m
+            JOIN delivery_cases dc ON dc.message_id=m.id
+            WHERE lower(btrim(m.message_id,'<> '))=ANY($1::text[])
+              AND m.delivery_status='delivered'
+              AND EXISTS (
+                  SELECT 1 FROM unnest(m.envelope_recipients) AS r(address)
+                  WHERE sentimail_same_client_mailbox(r.address,$2)
+              )
+            ORDER BY array_position($1::text[],lower(btrim(m.message_id,'<> '))),
+                     m.captured_at DESC
+            LIMIT 1
+            """,
+            identifiers,
+            sender,
+        )
+
+    @staticmethod
+    async def _case_conversation(
+        connection: asyncpg.Connection, case_id: object, sender: str
+    ) -> str | None:
+        """La conversation du dossier, créée au besoin, si elle est à cette boîte."""
+        conversation_id = await connection.fetchval(
+            """
+            INSERT INTO conversations (case_id,participant_email,status)
+            VALUES ($1,$2,'awaiting_user')
+            ON CONFLICT (case_id) WHERE case_id IS NOT NULL DO NOTHING
+            RETURNING id::text
+            """,
+            case_id,
+            sender,
+        )
+        if conversation_id is not None:
+            return str(conversation_id)
+        existing = await connection.fetchrow(
+            """
+            SELECT id::text AS id,
+                   sentimail_same_client_mailbox(participant_email,$2) AS same_mailbox
+            FROM conversations WHERE case_id=$1
+            """,
+            case_id,
+            sender,
+        )
+        if existing is None or not existing["same_mailbox"]:
+            return None
+        return str(existing["id"])
+
     async def _queue_identity_challenge(
         self,
         connection: asyncpg.Connection,
         message_id: str,
         message: asyncpg.Record,
         sender: str,
+        replied_case: asyncpg.Record | None = None,
     ) -> str:
         identite = await self._identity()
         # Le quota porte sur l'expéditeur qui déclenche le challenge. Un compteur
@@ -780,13 +1105,30 @@ class ConversationStore:
             await self._mark_consumed(connection, message_id)
             return "challenge_rate_limited"
 
-        conversation_id = await connection.fetchval(
-            """
-            INSERT INTO conversations (participant_email, status)
-            VALUES ($1,'awaiting_user') RETURNING id::text
-            """,
-            sender,
+        # Rattachée au message livré qu'elle cite, la directive saura quel
+        # expéditeur bloquer une fois confirmée. Sans rattachement, elle reste
+        # une conversation libre.
+        conversation_id = (
+            await self._case_conversation(connection, replied_case["case_id"], sender)
+            if replied_case is not None
+            else None
         )
+        if conversation_id is None:
+            replied_case = None
+            conversation_id = await connection.fetchval(
+                """
+                INSERT INTO conversations (participant_email, status)
+                VALUES ($1,'awaiting_user') RETURNING id::text
+                """,
+                sender,
+            )
+        # Le courrier nomme le message visé : confirmer, c'est agir sur lui, et
+        # la personne doit pouvoir reconnaître une directive qu'elle n'a pas
+        # écrite.
+        about = ""
+        if replied_case is not None:
+            objet = " ".join(str(replied_case["subject"] or "(sans objet)").split())
+            about = f" à propos du message « {objet[:120]} »"
         conversation_message_id = await connection.fetchval(
             """
             INSERT INTO conversation_messages (
@@ -843,7 +1185,7 @@ class ConversationStore:
             identite.assistant_sender,
             identite.action_address,
             "[SentiMail] Confirme ta directive à MAIA",
-            "J’ai reçu une nouvelle directive SMTP en ton nom.\n\n"
+            f"J’ai reçu une nouvelle directive SMTP en ton nom{about}.\n\n"
             "Pour prouver que cette demande vient bien de ta boîte, réponds "
             f"exactement : CONFIRME MAIA {code}\n\n"
             f"Ce code ne vaut que {CONFIRMATION_TTL_MINUTES} minutes et ne sert "
@@ -859,7 +1201,15 @@ class ConversationStore:
             INSERT INTO audit_log (actor, action, payload)
             VALUES ('conversation','smtp_challenge.sent',$1::jsonb)
             """,
-            _json({"message_id": message_id, "conversation_id": conversation_id}),
+            _json(
+                {
+                    "message_id": message_id,
+                    "conversation_id": conversation_id,
+                    "replied_case_id": (
+                        str(replied_case["case_id"]) if replied_case is not None else None
+                    ),
+                }
+            ),
         )
         await self._mark_consumed(connection, message_id)
         return "confirmation_sent"

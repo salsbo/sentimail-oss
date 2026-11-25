@@ -93,6 +93,39 @@ Use this one-time sign-in link. It expires in 10 minutes.\r
         self.assertNotIn("CONTENT_SENSITIVE_REQUEST", codes)
         self.assertNotIn("CONTENT_SOCIAL_ENGINEERING_COMBINATION", codes)
 
+    async def test_verification_de_compte_prime_sur_un_pied_de_page_commercial(
+        self,
+    ) -> None:
+        raw = """From: Seafy <no-reply@seafy.com>\r
+To: Me <me@mondomaine.example>\r
+Subject: Vérifie ton compte Seafy\r
+Content-Type: text/html; charset=utf-8\r
+\r
+<html><body><h1>Vérifie ton compte</h1><p>Utilise ce lien sécurisé.</p>
+<footer>Paiement, facture et politique de remboursement</footer></body></html>\r
+""".encode()
+        results = await run_hooks(_context(raw))
+        content = next(result for result in results if result.hook_name == "content")
+        self.assertEqual(
+            content.facts["content_context"]["purpose"], "one_time_authentication"
+        )
+        self.assertNotEqual(content.facts["content_context"]["purpose"], "payment")
+
+    async def test_objet_francais_verifie_ton_compte_est_reconnu(self) -> None:
+        raw = """From: Seafy <no-reply@seafy.com>\r
+To: Me <me@mondomaine.example>\r
+Subject: Vérifie ton compte Seafy\r
+Content-Type: text/html; charset=utf-8\r
+\r
+<html><body><p>Finalise ton inscription.</p>
+<footer>Paiement, facture et politique de remboursement</footer></body></html>\r
+""".encode()
+        results = await run_hooks(_context(raw))
+        content = next(result for result in results if result.hook_name == "content")
+        self.assertEqual(
+            content.facts["content_context"]["purpose"], "account_security"
+        )
+
     async def test_entering_otp_is_distinct_from_disclosing_it(self) -> None:
         expected = b"""From: Security <security@example.org>\r
 To: Me <me@mondomaine.example>\r

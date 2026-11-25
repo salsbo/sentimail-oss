@@ -16,6 +16,13 @@ from sentimail_v3.conversation.conversation import ConversationStore
 from sentimail_v3.crypto import load_key
 from sentimail_v3.identity import instance_identity
 from sentimail_v3.conversation.provider_setup import ProviderSetup
+from sentimail_v3.observation.recipient_check import (
+    UNKNOWN_RECIPIENT_REPLY,
+    UNVERIFIED_PROBE_REPLY,
+    ProbeResult,
+    is_probe,
+    probe_outcome,
+)
 from sentimail_v3.observation.storage import CaptureResult, Store
 from sentimail_v3.code.reference import nommer_dossier
 
@@ -85,6 +92,51 @@ class Handler:
             start_tls=False,
             timeout=30,
         )
+
+    async def handle_RCPT(
+        self,
+        server: SMTP,
+        session: Session,
+        envelope: Envelope,
+        address: str,
+        rcpt_options: list[str],
+    ) -> str:
+        # Seule la sonde de vérification du MX peut être refusée ou reportée
+        # ici (voir recipient_check) ; tout autre destinataire est accepté
+        # comme avant.
+        del server, session
+        sender = envelope.mail_from or ""
+        try:
+            result = await probe_outcome(
+                self.store.pool,
+                self.conversations,
+                sender=sender,
+                address=address,
+                relay_host=self.settings.relay_host,
+                relay_port=self.settings.relay_port,
+            )
+        except Exception as exc:  # noqa: BLE001 - une exception ne doit jamais devenir un 5xx
+            result = ProbeResult(
+                "error" if is_probe(sender) else "not_probe", type(exc).__name__
+            )
+        if result.outcome != "not_probe":
+            event = {
+                "error": "recipient_probe.error",
+                "unverified": "recipient_probe_deferred",
+            }.get(result.outcome, "recipient_probe.checked")
+            _log(
+                event,
+                outcome=result.outcome,
+                detail=result.detail,
+                recipient_domain=address.rpartition("@")[2].casefold(),
+            )
+        if result.outcome == "unknown":
+            return UNKNOWN_RECIPIENT_REPLY
+        if result.outcome in {"error", "unverified"}:
+            return UNVERIFIED_PROBE_REPLY
+        envelope.rcpt_tos.append(address)
+        envelope.rcpt_options.extend(rcpt_options)
+        return "250 OK"
 
     async def handle_DATA(
         self,

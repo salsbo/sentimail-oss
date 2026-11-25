@@ -58,9 +58,9 @@
       "url": "https://sentimail.example/doctrine/fraude_financiere",
       "topic": "fraude_financiere",
       "path": "fraude_financiere.txt",
-      "sha256": "495a4ee2142fb36f8866e0b12b84efd9fe4208aad247438e50f6193975112877",
-      "bytes": 5425,
-      "captured_on": "2026-08-17"
+      "sha256": "9538e5b484116754c98223b57980ed4156806db0ff137cb46db30ad02a4bce1b",
+      "bytes": 7708,
+      "captured_on": "2026-09-16"
     },
     {
       "id": "attaques-codes-secrets",

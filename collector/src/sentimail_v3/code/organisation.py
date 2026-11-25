@@ -71,19 +71,41 @@ _LEGAL_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 # Messageries publiques : un contact chez elles ne dit rien de l'organisation.
-_PUBLIC_MAILBOXES = frozenset(
+PUBLIC_MAILBOXES = frozenset(
     {
         "gmail.com",
         "googlemail.com",
         "outlook.com",
+        "outlook.fr",
         "hotmail.com",
+        "hotmail.fr",
+        "live.com",
+        "live.fr",
+        "msn.com",
         "yahoo.com",
+        "yahoo.fr",
+        "aol.com",
         "free.fr",
         "orange.fr",
         "wanadoo.fr",
+        "laposte.net",
+        "sfr.fr",
+        "neuf.fr",
+        "bbox.fr",
         "icloud.com",
+        "me.com",
+        "mac.com",
         "proton.me",
         "protonmail.com",
+        "gmx.com",
+        "gmx.fr",
+        "gmx.de",
+        "web.de",
+        "yandex.com",
+        "yandex.ru",
+        "mail.ru",
+        "zoho.com",
+        "tutanota.com",
     }
 )
 
@@ -136,7 +158,7 @@ def organisation_signature(rdap: object) -> set[str]:
             domain = raw.rsplit("@", 1)[-1].casefold().strip()
             if (
                 domain
-                and domain not in _PUBLIC_MAILBOXES
+                and domain not in PUBLIC_MAILBOXES
                 and domain not in _REGISTRAR_MAILBOXES
                 and "." in domain
             ):
@@ -293,6 +315,6 @@ def authentication_signature(domain: str, dkim_domain: object) -> set[str]:
     signataire = str(dkim_domain or "").casefold().strip().rstrip(".")
     if not signataire or "." not in signataire:
         return set()
-    if signataire in _PUBLIC_MAILBOXES:
+    if signataire in PUBLIC_MAILBOXES:
         return set()
     return {"dkim:" + signataire}

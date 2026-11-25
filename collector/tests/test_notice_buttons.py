@@ -4,7 +4,7 @@ import re
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
-from sentimail_v3.conversation.choice_answers import GRIS, ROUGE, VERT
+from sentimail_v3.conversation.choice_registry import GRIS, ROUGE, VERT
 from sentimail_v3.conversation.review_notice import (
     ACTION_TOKEN_PLACEHOLDER,
     choice_links,
@@ -86,7 +86,13 @@ class ReponsesEnBoutonsTests(unittest.TestCase):
     def test_aucune_hauteur_n_est_imposee(self) -> None:
         for lettre in ("A", "B", "C"):
             with self.subTest(lettre=lettre):
-                self.assertNotRegex(self._lien(lettre), r"(?<!line-)height:")
+                self.assertNotRegex(self._lien(lettre), r"(?<!-)height:")
+
+    def test_les_trois_cartes_ont_la_meme_hauteur(self) -> None:
+        # En V2, les trois boutons partagent la même taille et la même marge interne.
+        for lettre in ("A", "B", "C"):
+            with self.subTest(lettre=lettre):
+                self.assertIn("padding:7px 12px", self._lien(lettre))
 
     def test_les_reponses_tiennent_sur_une_ligne(self) -> None:
         for lettre in ("A", "B", "C"):
@@ -94,9 +100,14 @@ class ReponsesEnBoutonsTests(unittest.TestCase):
                 self.assertIn("display:inline-block", self._lien(lettre))
 
     def test_chaque_lettre_garde_sa_couleur(self) -> None:
-        for lettre, couleur in (("A", VERT), ("B", ROUGE), ("C", GRIS)):
+        attendus = {
+            "A": f"background:{VERT}",
+            "B": "color:#b91c1c;background:#ffffff;border:1px solid #fecaca",
+            "C": "color:#334155;background:#ffffff;border:1px solid #cbd5e1",
+        }
+        for lettre, style in attendus.items():
             with self.subTest(lettre=lettre):
-                self.assertIn(f"background:{couleur}", self._lien(lettre))
+                self.assertIn(style, self._lien(lettre))
 
 
 if __name__ == "__main__":

@@ -9,19 +9,9 @@ Répondre demandait d'écrire « 1 A, 2 B » de mémoire. La liste est sous les 
 mais la réponse, elle, s'écrit à l'aveugle. D'où les cases : elles sont là où
 l'œil est déjà, et cocher est le seul geste que le courrier autorise.
 
-Trois contraintes propres au courrier dictent la forme retenue :
-
-- une vraie case de formulaire n'existe pas en messagerie ; les clients la
-  suppriment, et rien ne partirait avec la réponse. La case est donc faite de
-  deux crochets, en toutes lettres, qu'on remplit d'une croix comme sur un
-  bulletin de vote ;
-- un bouton n'exécute rien : il ouvre un message déjà rédigé. Le bouton du
-  récapitulatif ouvre donc le bulletin entier, cases vides, prêt à cocher - ce
-  qui met la réponse dans le texte saisi, là où elle est lue sans réserve ;
-- ce corps prérempli voyage dans une URL, et plusieurs clients tronquent au-delà
-  de deux mille caractères. Le bulletin cliquable s'arrête donc à ``MAX_BULLETIN``
-  dossiers, puis se rétrécit tant qu'il dépasse - un bulletin amputé se
-  cocherait dans le vide.
+Le récapitulatif conserve uniquement les blocs des messages et leurs cases.
+La réponse se fait avec la fonction « Répondre » de la messagerie, en cochant
+le texte cité ou en écrivant les numéros et les lettres.
 
 La référence en tête (« D-3f9c1a ») dit de quel envoi ces cases proviennent.
 Sans elle, une réponse d'hier recitée dans un fil appliquerait ses croix aux
@@ -33,12 +23,7 @@ from __future__ import annotations
 from html import escape
 from urllib.parse import quote, urlencode
 
-from sentimail_v3.conversation.choice_answers import (
-    GRIS,
-    ROUGE,
-    VERT,
-    render_action_button,
-)
+from sentimail_v3.conversation.choice_registry import choice_presentations
 from sentimail_v3.conversation.review_notice import ACTION_TOKEN_PLACEHOLDER
 
 __all__ = [
@@ -51,8 +36,9 @@ __all__ = [
 
 # Au-delà, l'URL du bulletin dépasse ce que les clients transportent.
 MAX_BULLETIN = 12
-# Marge sous la limite basse observée (2000), pour l'objet et le schéma.
+# Marge sous la limite basse observée (2000), jeton final compris.
 LONGUEUR_MAX_LIEN = 1900
+BALLOT_TOKEN_PREFIX = "S3-BALLOT-"
 # Un objet long ne rend pas le dossier plus reconnaissable, il rend le
 # bulletin intransportable.
 OBJET_MAX = 46
@@ -60,16 +46,10 @@ OBJET_MAX_BULLETIN = 38
 
 SUJET_REPONSE = f"Re: [SentiMail] Mon bulletin · {ACTION_TOKEN_PLACEHOLDER}"
 
-BLEU = "#2563eb"
-
 # Ce que chaque lettre décide. Écrit une seule fois : la page, le texte et le
 # bulletin disent la même chose, sinon la réponse ne veut plus dire la même
 # chose selon l'endroit où on l'a lue.
-LETTRES = (
-    ("A", "livrer", "livre-le, cet expéditeur est fiable", VERT),
-    ("B", "bloquer", "ne le livre pas, retiens les prochains", ROUGE),
-    ("C", "autre", "autre chose, explique après les deux-points", GRIS),
-)
+LETTRES = tuple(choice.render_tuple() for choice in choice_presentations("digest"))
 
 
 def _objet(valeur: object, taille: int = OBJET_MAX) -> str:
@@ -78,10 +58,11 @@ def _objet(valeur: object, taille: int = OBJET_MAX) -> str:
 
 
 def ballot_lines(items: list[dict[str, object]]) -> list[str]:
-    """Un dossier, deux lignes : ce dont il s'agit, puis les cases."""
+    """Chaque choix emporte les identités et motifs qui permettent de décider."""
     lignes: list[str] = []
     for item in items:
         lignes.append(f"{item['number']}. {_objet(item.get('subject'), OBJET_MAX_BULLETIN)}")
+        lignes.extend(_decision_context(item))
         lignes.append("   [ ] A   [ ] B   [ ] C : ")
         lignes.append("")
     return lignes
@@ -99,9 +80,7 @@ def ballot_body(
     """
     entete = [
         "Bonjour MAIA,",
-        "",
-        f"Voici mes réponses. Récapitulatif {reference}",
-        "Je mets une croix dans une seule case par message.",
+        f"Récapitulatif {reference}. Une croix par message.",
         "",
         "A = livre-le, cet expéditeur est fiable",
         "B = ne le livre pas, retiens les prochains",
@@ -113,8 +92,8 @@ def ballot_body(
     if reste > 0 and items:
         suivant = int(items[-1]["number"]) + 1
         pied = [
-            f"(mes {reste} autre(s) message(s) restent à cocher dans ton",
-            f"récapitulatif, ou à écrire ici : « {suivant} A », « {suivant + 1} B »)",
+            f"({reste} autre(s) message(s) : boutons suivants, à partir du n°{suivant},",
+            f"ou réponse écrite : « {suivant} A ».)",
             "",
         ]
     return "\n".join([*entete, *ballot_lines(items), *pied, "Merci !", ""])
@@ -126,9 +105,16 @@ def ballot_mailto(
     """Le lien qui ouvre le bulletin, raccourci tant qu'il ne passe pas.
 
     Un client qui tronque une URL ne prévient pas : le bulletin arriverait
-    amputé de ses derniers dossiers, cochés dans le vide. Mieux vaut en
-    proposer moins et redemander le reste au prochain envoi.
+    amputé de ses derniers dossiers, cochés dans le vide. Les dossiers suivants
+    sont proposés par les autres boutons du récapitulatif.
     """
+    return _select_ballot(action_address, items, reference)[1]
+
+
+def _select_ballot(
+    action_address: str, items: list[dict[str, object]], reference: str
+) -> tuple[list[dict[str, object]], str]:
+    """Un lot de dossiers complets ; jamais d'adresse ni de motif amputé."""
     total = len(items)
     retenus = list(items)[:MAX_BULLETIN]
     while retenus:
@@ -142,13 +128,10 @@ def ballot_mailto(
             },
             quote_via=quote,
         )
-        if len(lien) <= LONGUEUR_MAX_LIEN or len(retenus) == 1:
-            return lien
+        if len(lien.replace(ACTION_TOKEN_PLACEHOLDER, "S3-ACTION:" + "x" * 43)) <= LONGUEUR_MAX_LIEN:
+            return retenus, lien
         retenus = retenus[:-1]
-    return "mailto:" + action_address + "?" + urlencode(
-        {"subject": SUJET_REPONSE, "body": ballot_body([], reference)},
-        quote_via=quote,
-    )
+    return [], ""
 
 
 def _phrase_abandons(nombre: int) -> str:
@@ -167,6 +150,23 @@ def _phrase_abandons(nombre: int) -> str:
         + " resté"
         + ("s" if nombre > 1 else "")
         + " sans réponse : aucun n’a été livré."
+    )
+
+
+def sequence_hint(nombre: int) -> str:
+    """La consigne « une suite de lettres », avec un exemple à la taille de la liste.
+
+    Sur téléphone, cocher est pénible ; « ABA » ne l'est pas. L'exemple a la
+    longueur de la liste envoyée, pour que l'ordre se voie. Un seul dossier
+    n'en a pas besoin : une lettre seule suffit déjà.
+    """
+    if nombre < 2:
+        return ""
+    lettres = "".join("AB"[index % 2] for index in range(nombre))
+    detail = ", ".join(f"{index + 1} {lettre}" for index, lettre in enumerate(lettres))
+    return (
+        f"Sur téléphone, réponds par la suite des lettres dans l’ordre de la liste "
+        f"(A ou B seulement) : « {lettres} » vaut {detail}."
     )
 
 
@@ -189,6 +189,7 @@ def build_text(
         "",
         "Coche une seule case par message, puis renvoie-moi ce message.",
         "Tu peux aussi écrire « 1 A », « 2 B » : les deux se valent.",
+        *([sequence_hint(len(items))] if len(items) >= 2 else []),
         "",
         "A = livre-le, cet expéditeur est fiable",
         "B = ne le livre pas, retiens les prochains",
@@ -203,8 +204,8 @@ def build_text(
         lignes.extend(
             [
                 f"{item['number']}. {_objet(item.get('subject'))}",
-                f"   de {str(item.get('sender') or '(expéditeur inconnu)')[:70]}",
                 f"   reçu le {item.get('received') or ''}".rstrip(),
+                *_decision_context(item),
                 "   [ ] A   [ ] B   [ ] C : ",
                 "",
             ]
@@ -242,29 +243,69 @@ def _cases_html() -> str:
     )
 
 
+def _sender_lines(item: dict[str, object]) -> list[str]:
+    """Séparer le nom annoncé de l'adresse complète, y compris en texte brut."""
+    return item.get("identities") or [f"De : {item.get('sender') or '(expéditeur inconnu)'}"]
+
+
+def _decision_context(item: dict[str, object]) -> list[str]:
+    """Le même contexte dans le courrier et dans la réponse préremplie."""
+    return [
+        *[f"   {value}" for value in _sender_lines(item)],
+        *[f"   {value}" for value in item.get("addresses") or []],
+        "   Pourquoi je te demande :",
+        *[
+            f"   - {value}"
+            for value in item.get("concerns") or ["Aucun point défavorable précis disponible."]
+        ],
+        *[f"   Limite d’analyse : {value}" for value in item.get("limits") or []],
+    ]
+
+
 def _carte(item: dict[str, object]) -> str:
     numero = escape(str(item.get("number") or ""))
     sujet = escape(_objet(item.get("subject")))
-    expediteur = escape(str(item.get("sender") or "(expéditeur inconnu)")[:70])
+    expediteur = "".join(
+        f'<div style="color:#475569;font-size:13px">{escape(str(value))}</div>'
+        for value in _sender_lines(item)
+    )
     recu = escape(str(item.get("received") or ""))
+    addresses = "".join(
+        f'<div style="color:#475569;font-size:12px">{escape(str(value))}</div>'
+        for value in item.get("addresses") or []
+    )
+    concerns = "".join(
+        f'<li style="margin:3px 0">{escape(str(value))}</li>'
+        for value in item.get("concerns") or ["Aucun point défavorable précis disponible."]
+    )
+    limits = "".join(
+        '<div style="margin-top:5px;color:#64748b;font-size:12px">'
+        f'Limite d’analyse : {escape(str(value))}</div>'
+        for value in item.get("limits") or []
+    )
     return (
         '<div style="border:1px solid #e2e8f0;border-radius:8px;padding:10px 12px;'
-        'margin-bottom:8px">'
+        'margin-bottom:8px;overflow-wrap:anywhere;word-break:break-word">'
         f'<div style="font-size:14px;font-weight:bold">{numero}. {sujet}</div>'
-        f'<div style="color:#475569;font-size:13px">De : {expediteur}'
-        + (f" · reçu le {recu}" if recu else "")
-        + "</div>"
+        + expediteur
+        + (f'<div style="color:#64748b;font-size:12px">Reçu le {recu}</div>' if recu else "")
+        + addresses
+        + '<div style="margin-top:8px;font-size:12px;line-height:1.45">'
+        '<strong>Pourquoi je te demande :</strong>'
+        '<ul style="margin:4px 0 0;padding-left:18px">'
+        + concerns
+        + "</ul></div>"
+        + limits
         + _cases_html()
         + "</div>"
     )
 
 
 def render_digest_html(context: dict[str, object]) -> str:
-    """La page du récapitulatif : le bandeau, les dossiers, le bulletin."""
+    """La page du récapitulatif : le bandeau et les blocs des messages."""
     items = [value for value in context.get("items") or [] if isinstance(value, dict)]
     total = int(context.get("total") or len(items))
     reference = str(context.get("reference") or "")
-    action_address = str(context.get("action_address") or "")
     abandons = int(context.get("abandoned") or 0)
     reste = total - len(items)
     legende = "".join(
@@ -287,15 +328,6 @@ def render_digest_html(context: dict[str, object]) -> str:
         f'<div style="margin-top:6px;color:#64748b;font-size:11px">Récapitulatif '
         f"{escape(reference)}</div>"
         "</div>"
-        # Le bouton ouvre le bulletin entier : la réponse est alors du texte
-        # saisi, et non une citation modifiée.
-        + render_action_button(
-            "bulletin",
-            "Répondre en cochant",
-            "Ouvre une réponse déjà rédigée, il ne reste qu’à cocher",
-            BLEU,
-            ballot_mailto(action_address, items, reference),
-        )
         + "".join(_carte(item) for item in items)
         + (
             '<div style="font-size:12px;color:#64748b;margin-bottom:8px">'
@@ -311,9 +343,10 @@ def render_digest_html(context: dict[str, object]) -> str:
             else ""
         )
         + '<div style="font-size:11px;color:#64748b;line-height:1.4">'
-        "Si le bouton ne fonctionne pas, réponds à ce message et coche "
+        "Réponds à ce message et coche "
         "directement dans le texte cité, ou écris « 1 A », « 2 B ». "
-        "Tu peux n’en traiter que quelques-uns : je te redemanderai le reste."
+        + escape(sequence_hint(len(items)))
+        + " Tu peux n’en traiter que quelques-uns : je te redemanderai le reste."
         "</div>"
         '<div style="margin-top:10px;font-size:12px;color:#475569">'
         "— MAIA, ton assistante SentiMail</div>"

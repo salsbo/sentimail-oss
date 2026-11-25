@@ -11,6 +11,7 @@ from sentimail_admin.naming import (
     normalize_email_address,
     normalize_fqdn,
     normalize_identifier,
+    normalize_local_role,
     normalize_model_name,
     normalize_preset,
     normalize_quota,
@@ -145,10 +146,6 @@ class EnregistrementDeVerificationTests(unittest.TestCase):
         self.assertEqual(verification_record("mondomaine.example"), "_sentimail.mondomaine.example")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PlafondTests(unittest.TestCase):
     def test_un_champ_vide_fait_heriter_de_l_instance(self) -> None:
         self.assertIsNone(normalize_quota(""))
@@ -191,6 +188,11 @@ class ModeleTests(unittest.TestCase):
             with self.assertRaises(SaisieInvalide, msg=saisie):
                 normalize_role(saisie)
 
+    def test_l_analyse_est_un_role_local_sans_etre_un_fournisseur(self) -> None:
+        self.assertEqual(normalize_local_role("ANALYSIS"), "analysis")
+        with self.assertRaises(SaisieInvalide):
+            normalize_role("analysis")
+
 
 class BaseUrlTests(unittest.TestCase):
     """L'adresse où part le courrier vers le moteur : http(s) uniquement.
@@ -218,6 +220,28 @@ class BaseUrlTests(unittest.TestCase):
     def test_base_url_refuse_l_espace(self) -> None:
         with self.assertRaises(SaisieInvalide):
             normalize_base_url("https://api.deepseek.com/ chemin")
+
+    def test_base_url_refuse_hote_vide_identifiants_controle_et_port_invalide(self) -> None:
+        for mauvais in (
+            "https://",
+            "http:///v1",
+            "http:api.deepseek.com",
+            "https://user:pass@api.deepseek.com",
+            "https://user@api.deepseek.com",
+            "https://api.deepseek.com/\x00v1",
+            "https://api.deepseek.com/\r\nX: y",
+            "https://api.deepseek.com:99999",
+            "https://api.deepseek.com:abc",
+            "https://api.deepseek.com:0",
+        ):
+            with self.subTest(mauvais=repr(mauvais)), self.assertRaises(SaisieInvalide):
+                normalize_base_url(mauvais)
+
+    def test_base_url_accepte_un_port_valide(self) -> None:
+        self.assertEqual(
+            normalize_base_url("http://127.0.0.1:8080/v1"),
+            "http://127.0.0.1:8080/v1",
+        )
 
 
 class NormalizePresetTests(unittest.TestCase):
@@ -366,3 +390,7 @@ class NormalizeAddressListTests(unittest.TestCase):
     def test_un_saut_de_ligne_est_refuse(self) -> None:
         with self.assertRaises(SaisieInvalide):
             normalize_address_list("kitt@sentinel.mondomaine.example\r\nBcc: evil@example.com")
+
+
+if __name__ == "__main__":
+    unittest.main()

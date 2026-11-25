@@ -34,7 +34,7 @@ _FINDING_RULES: dict[str, tuple[str, str, str, int, str]] = {
     ),
     "OFFICE_AUTO_EXEC": (
         "ATTACHMENT_MACRO_AUTO", "ATT-011", "adverse", 85,
-        "Un document joint contient une macro qui s’exécute à l’ouverture.",
+        "Un document joint contient une macro programmée pour se lancer à l’ouverture.",
     ),
     "OFFICE_HAS_MACROS": (
         "ATTACHMENT_MACRO", "ATT-012", "adverse", 60,
@@ -42,11 +42,11 @@ _FINDING_RULES: dict[str, tuple[str, str, str, int, str]] = {
     ),
     "PDF_JAVASCRIPT": (
         "ATTACHMENT_ACTIVE_DOCUMENT", "ATT-013", "adverse", 75,
-        "Un document joint contient du code qui s’exécute à l’ouverture.",
+        "Un document joint mentionne du JavaScript.",
     ),
     "PDF_LAUNCH_ACTION": (
         "ATTACHMENT_ACTIVE_DOCUMENT", "ATT-013", "adverse", 85,
-        "Un document joint tente de lancer un programme à l’ouverture.",
+        "Un document joint mentionne une action de lancement ou un fichier embarqué.",
     ),
     "ARCHIVE_ENCRYPTED_ENTRY": (
         "ATTACHMENT_ENCRYPTED_ARCHIVE", "ATT-014", "adverse", 70,
@@ -63,7 +63,7 @@ _FINDING_RULES: dict[str, tuple[str, str, str, int, str]] = {
     ),
     "IMAGE_OCR_TEXT": (
         "ATTACHMENT_IMAGE_TEXT", "ATT-017", "neutral", 0,
-        "Une image jointe porte du texte, qu’une lecture automatique ne voit pas.",
+        "Une image jointe porte du texte, lu par reconnaissance de caractères.",
     ),
 }
 # Les articles qui établissent un dommage matériel, et non un simple soupçon :

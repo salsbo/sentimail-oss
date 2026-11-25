@@ -12,7 +12,6 @@ import unittest
 
 from sentimail_v3.code.organisation_lookup import (
     belongs,
-    lookup_outcome,
     official_apexes,
     search_query,
     searchable,
@@ -87,52 +86,6 @@ class AppartenanceTests(unittest.TestCase):
 
     def test_un_domaine_etranger_n_appartient_pas(self) -> None:
         self.assertFalse(belongs("careerwiseenglish.com.au", ["disneyplus.com"]))
-
-
-class CeQueLaRechercheApprendTests(unittest.TestCase):
-    def test_le_cas_du_26_aout_est_verifie(self) -> None:
-        issue = lookup_outcome(
-            "Disney+",
-            "careerwiseenglish.com.au",
-            ["disneyplus.com", "disney.fr"],
-        )
-        self.assertTrue(issue["verified"])
-        self.assertFalse(issue["cleared"])
-        self.assertIn("disneyplus.com", str(issue["statement"]))
-        self.assertIn("careerwiseenglish.com.au", str(issue["statement"]))
-
-    def test_le_bruit_du_moteur_n_est_pas_cite(self) -> None:
-        """« nlm.nih.gov » est arrivé dans les résultats pour Disney+.
-
-        Il ne change pas la décision, mais l'écrire dans un avis affirmerait
-        une sottise à l'utilisateur.
-        """
-        issue = lookup_outcome(
-            "Disney+",
-            "careerwiseenglish.com.au",
-            ["disneyplus.com", "disney.com", "nlm.nih.gov", "disneycareers.com"],
-        )
-        self.assertNotIn("nlm.nih.gov", str(issue["statement"]))
-        self.assertIn("disneyplus.com", str(issue["statement"]))
-        # La décision, elle, a bien vu la liste entière.
-        self.assertIn("nlm.nih.gov", issue["official_apexes"])
-
-    def test_un_domaine_sans_rapport_lexical_reste_citable(self) -> None:
-        # « Ameli » publie sur assurance-maladie.fr : aucun mot commun, et
-        # pourtant c'est bien son domaine. Faute de mieux, on cite les premiers.
-        issue = lookup_outcome(
-            "Ameli", "courrier-ameli.top", ["assurance-maladie.fr", "ameli.fr"]
-        )
-        self.assertIn("ameli.fr", str(issue["statement"]))
-
-    def test_un_domaine_officiel_annule_le_soupcon(self) -> None:
-        # Le modèle peut se tromper : la recherche doit pouvoir le démentir.
-        issue = lookup_outcome("Synology", "news.synology.com", ["synology.com"])
-        self.assertTrue(issue["cleared"])
-        self.assertFalse(issue["verified"])
-
-    def test_une_recherche_sans_resultat_laisse_le_soupcon_intact(self) -> None:
-        self.assertIsNone(lookup_outcome("Disney+", "exemple.test", []))
 
 
 if __name__ == "__main__":

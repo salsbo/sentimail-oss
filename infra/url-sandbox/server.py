@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import os
 import re
 import warnings
 from dataclasses import dataclass, field
@@ -24,6 +25,17 @@ TOTAL_TIMEOUT = 40.0
 BODY_LIMIT_BYTES = 256 * 1024
 IMG_LIMIT_BYTES = 2 * 1024 * 1024
 MAX_IMAGE_PIXELS = 20_000_000
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+_fetch_slots = asyncio.Semaphore(_positive_int_env("URL_FETCH_CONCURRENCY", 8))
 
 app = FastAPI(title="sentimail url-sandbox", version="0.2.1")
 
@@ -49,6 +61,7 @@ class FetchResult:
     visible_links: list[str] = field(default_factory=list)
     forms: list[dict[str, Any]] = field(default_factory=list)
     qr_codes: list[str] = field(default_factory=list)
+    qr_error: str | None = None
     profile: str = "scanner"
     content_digest: str = ""
 
@@ -78,6 +91,10 @@ class FetchResult:
             "visible_links": self.visible_links[:30],
             "forms": self.forms[:5],
             "qr_codes": self.qr_codes,
+            # Le QR est un enrichissement facultatif. Son décodeur peut ne pas
+            # reconnaître une image parfaitement inspectée : cela ne transforme
+            # jamais le fetch HTTP réussi en analyse incomplète.
+            "qr_error": self.qr_error,
         }
 
 
@@ -94,7 +111,8 @@ async def fetch(payload: FetchIn) -> dict[str, Any]:
     )
     try:
         async with asyncio.timeout(TOTAL_TIMEOUT):
-            await _fetch_chain(payload, result)
+            async with _fetch_slots:
+                await _fetch_chain(payload, result)
     except TimeoutError:
         result.error = "sandbox_total_timeout"
     except Exception as exc:  # fail-soft : le pipeline recoit une preuve d'indisponibilite
@@ -191,6 +209,11 @@ def content_digest(html: str) -> str:
     la divergence structurelle.
     """
     texte = BeautifulSoup(html or "", "lxml").get_text(" ", strip=True)
+    return _text_digest(texte)
+
+
+def _text_digest(texte: str) -> str:
+    """Même normalisation pour le helper public et la réponse HTTP réelle."""
     normalise = re.sub(r"\s+", " ", texte).strip().casefold()
     return hashlib.sha256(normalise.encode("utf-8")).hexdigest()
 
@@ -202,9 +225,7 @@ def _analyze_html(content: bytes, result: FetchResult) -> None:
             node.decompose()
         texte = soup.get_text(" ", strip=True)
         result.body_excerpt = texte[:5000]
-        result.content_digest = hashlib.sha256(
-            re.sub(r"\\s+", " ", texte).strip().casefold().encode("utf-8")
-        ).hexdigest()
+        result.content_digest = _text_digest(texte)
         result.visible_links = [str(node["href"]) for node in soup.find_all("a", href=True)[:30]]
         result.forms = [
             {
@@ -232,7 +253,7 @@ def _decode_qr(content: bytes, result: FetchResult) -> None:
         for obj in zbar_decode(image):
             result.qr_codes.append(obj.data.decode("utf-8", errors="replace"))
     except Exception as exc:
-        result.error = f"qr_decode:{type(exc).__name__}"
+        result.qr_error = f"qr_decode:{type(exc).__name__}"
 
 
 def _redact_url(raw_url: str) -> str:

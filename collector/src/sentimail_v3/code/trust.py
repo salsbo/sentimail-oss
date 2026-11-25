@@ -30,7 +30,10 @@ async def pool_trusts_sender(
                 SELECT 1 FROM sender_policies
                 WHERE active=true AND action='allow' AND scope='sender'
                   AND value_normalized=$1
-                  AND lower(participant_email) = ANY($2::text[])
+                  AND EXISTS (
+                      SELECT 1 FROM unnest($2::text[]) recipient
+                      WHERE sentimail_same_client(participant_email,recipient)
+                  )
             )
             """,
             sender,

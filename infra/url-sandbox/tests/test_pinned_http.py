@@ -197,7 +197,7 @@ async def test_l_identite_du_profil_part_reellement_sur_le_fil(
     scanner = envois["scanner"].decode("ascii")
     navigateur = envois["browser"].decode("ascii")
 
-    assert "User-Agent: sentimail-sandbox/2.0" in scanner
+    assert "User-Agent: Mozilla/5.0 (compatible)" in scanner
     assert "Mozilla/5.0" in navigateur
     assert "sentimail-sandbox" not in navigateur
     assert "Accept-Language: fr-FR" in navigateur

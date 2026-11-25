@@ -47,6 +47,15 @@ class FamilyOfTests(unittest.TestCase):
         # Une corrélation relie des familles ; la compter comme une famille de
         # plus ferait passer un seul faisceau pour deux preuves.
         self.assertEqual(family_of("CORR-001"), CROSS_CUTTING)
+        # Le soupçon du filtre sans authentification reste une heuristique :
+        # ni famille de preuve, ni barrière.
+        self.assertEqual(family_of("CORR-018"), CROSS_CUTTING)
+
+    def test_le_nom_deguise_et_le_domaine_sosie_sont_des_preuves_d_identite(self) -> None:
+        # Rangé par défaut dans « liens », le nom déguisé pouvait faire
+        # compter une seconde famille forte à côté d'une organisation démentie.
+        self.assertEqual(family_of("DEEP-026"), "identite")
+        self.assertEqual(family_of("IDENTITY-010"), "identite")
 
     def test_un_article_inconnu_ne_fait_pas_tomber_le_jugement(self) -> None:
         self.assertEqual(family_of("ZZZ-999"), "autre")

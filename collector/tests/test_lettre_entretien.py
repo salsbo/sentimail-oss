@@ -99,7 +99,7 @@ class ObjetTests(unittest.TestCase):
         self.assertIn("signalement grave", sujet)
         self.assertIn("3 dossiers immobilisés", sujet)
 
-    def test_une_erreur_de_jugement_est_un_signalement_grave(self) -> None:
+    def test_une_erreur_corrigee_par_l_humain_n_est_qu_un_fait_note(self) -> None:
         erreur = dict(
             CALME,
             sens_des_desaccords_7j=dict(
@@ -107,8 +107,8 @@ class ObjetTests(unittest.TestCase):
             ),
         )
         sujet = lettre(erreur, DIAGNOSTIC, {}).subject
-        self.assertIn("signalement grave", sujet)
-        self.assertIn("jugement", sujet)
+        self.assertIn("signalement faible", sujet)
+        self.assertNotIn("intervention requise", sujet)
 
     def test_une_panne_reparable_est_un_signalement_modere(self) -> None:
         sujet = lettre(PANNE_REPARABLE, DIAGNOSTIC, {}).subject
@@ -139,14 +139,20 @@ class ObjetCoherentTests(unittest.TestCase):
 
     def test_l_objet_et_l_entete_disent_la_meme_chose(self) -> None:
         rendu = lettre(PANNE_REPARABLE, DIAGNOSTIC, {})
-        self.assertIn("quelque chose à te signaler", rendu.text.splitlines()[0])
+        self.assertIn("intervention est requise", rendu.text.splitlines()[0])
         self.assertNotIn("rien à signaler", rendu.subject)
 
     def test_un_signalement_faible_garde_une_entete_calme(self) -> None:
         # Un fait qui ne demande rien ne doit pas ouvrir sur une alerte.
         rendu = lettre(REFUS_DEFINITIF, DIAGNOSTIC, {})
         self.assertIn("signalement faible", rendu.subject)
-        self.assertIn("Tout va bien", rendu.text.splitlines()[0])
+        self.assertIn("Aucune action", rendu.text.splitlines()[0])
+
+    def test_une_analyse_rejouee_ne_demande_plus_de_la_regarder(self) -> None:
+        rendu = lettre(PANNE_REPARABLE, DIAGNOSTIC, {"replay_errored_verdicts": 2})
+        self.assertIn("aucune action requise", rendu.subject)
+        self.assertIn("Aucune action", rendu.text.splitlines()[0])
+        self.assertNotIn("à regarder", rendu.subject)
 
 
 class RefusSmtpTests(unittest.TestCase):
@@ -186,7 +192,9 @@ class DesaccordsTests(unittest.TestCase):
         rendu = lettre(etat, DIAGNOSTIC, {})
         self.assertIn("écarté", rendu.text)
         self.assertIn("livré", rendu.text)
-        self.assertIn("erreur", rendu.subject.casefold())
+        self.assertIn("C’est une erreur de ma part", rendu.text)
+        # Le verdict humain s'est appliqué : l'erreur est un fait, pas une tâche.
+        self.assertNotIn("intervention requise", rendu.subject)
 
     def test_au_singulier_le_nombre_ne_double_pas(self) -> None:
         # « 1 j'ai demandé son avis » : la phrase se suffit au singulier.
@@ -244,6 +252,44 @@ class ActionsTests(unittest.TestCase):
 
     def test_sans_action_le_rapport_le_dit(self) -> None:
         self.assertIn("Je n’ai rien eu à faire", lettre(CALME, DIAGNOSTIC, {}).text)
+
+    def test_le_rapport_dit_exactement_ce_que_l_exploitant_doit_faire(self) -> None:
+        etat = dict(
+            CALME,
+            alertes_amorties_24h=9,
+            erreurs_de_verdict_24h=[
+                {
+                    "error_type": "JudgmentContradiction",
+                    "detail": "sortie incohérente",
+                    "count": 1,
+                },
+                {
+                    "error_type": "SMTPRecipientsRefused",
+                    "detail": "550 5.1.1 <info@agence.example>: user unknown",
+                    "count": 1,
+                },
+            ],
+            sens_des_desaccords_7j={
+                **CALME["sens_des_desaccords_7j"],
+                "laisse_passer": 1,
+                "demande_au_lieu_de_classer": 8,
+                "demande_au_lieu_de_livrer": 14,
+            },
+            ecarts_non_traites={"laisse_passer": 1},
+        )
+        rendu = lettre(
+            etat,
+            {"diagnosis": "Un écart réel reste à examiner."},
+            {"replay_errored_verdicts": 1},
+            ecarts_url="https://sentimail.example/ecarts",
+        )
+        self.assertIn("Ce que tu dois faire", rendu.text)
+        self.assertNotIn("le message livré mais jugé indésirable", rendu.text)
+        self.assertNotIn("acquitte", rendu.text)
+        self.assertIn("Informations, sans action requise", rendu.text)
+        self.assertIn("9 alertes techniques ont été regroupées", rendu.text)
+        self.assertIn("déjà tranchés par les destinataires", rendu.text)
+        self.assertNotIn("alertes techniques étouffées", rendu.text)
 
 
 class TraceTechniqueTests(unittest.TestCase):

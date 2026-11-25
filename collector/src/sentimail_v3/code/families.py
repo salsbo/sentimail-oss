@@ -96,6 +96,14 @@ _BY_ARTICLE: dict[str, str] = {
     "DEEP-019": "coherence_metier",
     "DEEP-021": "identite",
     "DEEP-022": "identite",
+    "DEEP-023": "identite",
+    # Le nom affiché déguisé est un constat d'identité. Rangé par défaut dans
+    # « liens » (70, au-dessus du seuil fort), il pouvait faire compter une
+    # seconde famille forte à côté d'une organisation démentie. Sur les 5
+    # messages qui le portaient au 29 septembre 2026, 2 changent de famille
+    # forte, aucun ne change de nombre de familles convergentes.
+    "DEEP-026": "identite",
+    "DEEP-027": "coherence_metier",
     "DOMAIN-001": "identite",
     "DOMAIN-002": "identite",
     "DOMAIN-003": "identite",

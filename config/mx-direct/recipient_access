@@ -1,0 +1,2 @@
+# Refus SMTP facultatifs pour les destinataires des routes directes.
+# Format : adresse@domaine.example 550 5.1.1 Adresse reservee a l envoi

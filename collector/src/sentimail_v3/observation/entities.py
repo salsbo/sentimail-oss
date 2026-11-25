@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from email import policy
-from email.parser import BytesParser
 from email.utils import getaddresses, parseaddr
 from urllib.parse import urlsplit, urlunsplit
 
-from sentimail_v3.observation.parser import ParsedMessage
+from sentimail_v3.observation.parser import ParsedMessage, parse_email
 
 _URL_RE = re.compile(r"(?i)\b(?:https?://|ftp://)[^\s<>\"']+")
 _IP_CANDIDATE_RE = re.compile(r"(?<![\w.])(?:[0-9a-fA-F:.]{3,})(?![\w.])")
@@ -172,7 +170,7 @@ def extract_entities(
     envelope_from: str,
     recipients: list[str],
 ) -> list[dict[str, object]]:
-    message = BytesParser(policy=policy.default).parsebytes(raw)
+    message = parse_email(raw)
     result = _address_entities("envelope_from", [parseaddr(envelope_from)[1]])
     result.extend(_address_entities("envelope_to", recipients))
 

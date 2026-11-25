@@ -99,7 +99,7 @@ class PresetsTests(unittest.TestCase):
             Preset(
                 "anthropic",
                 "https://api.anthropic.com",
-                "claude-sonnet-4-5",
+                "claude-sonnet-5-5",
                 "max_tokens",
                 "anthropic_api_key",
             ),

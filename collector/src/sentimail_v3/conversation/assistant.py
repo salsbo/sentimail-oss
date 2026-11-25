@@ -5,21 +5,36 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
-from email.utils import parseaddr
+from pathlib import Path
+from email.utils import formatdate, parseaddr
 from typing import Any
 
 import aiosmtplib
 import asyncpg
 import httpx
 
+from sentimail_v3.code.reference import nommer_dossier
+from sentimail_v3.code.rulebook import (
+    MANAGEMENT_ACTIONS,
+    RuleResponse,
+    apply_rule_request,
+    label_sender,
+    validate_rule_request,
+)
+from sentimail_v3.code.sender_identity import read_proven_identity
+from sentimail_v3.code.tenancy import Quota, domain_of, quota_of
+from sentimail_v3.config import Settings, load_settings
 from sentimail_v3.conversation.action_tokens import action_token, new_nonce, token_hash
 from sentimail_v3.conversation.agent_loop import answer_question
-from sentimail_v3.config import Settings, load_settings
+from sentimail_v3.conversation.choice_registry import (
+    choice_meaning,
+    fold_lone_accented_a,
+    prefilled_reply,
+)
 from sentimail_v3.conversation.conversation_scope import conversation_scope
-from sentimail_v3.llm import provider_chat_json
-from sentimail_v3.execution.delivery import release_original
 from sentimail_v3.conversation.digest import (
     DigestDecision,
     acknowledgement,
@@ -29,41 +44,43 @@ from sentimail_v3.conversation.digest import (
     residual_text,
     validate_interpretation,
 )
-from sentimail_v3.conversation.directive_policy import apply_directive_gate
+from sentimail_v3.conversation.directive_policy import (
+    apply_directive_gate,
+    explicit_directive,
+    short_enough,
+)
 from sentimail_v3.conversation.directive_receipt import receipt_html, receipt_text
+from sentimail_v3.conversation.human_decision import (
+    HumanDecision,
+    apply_human_decision,
+    block_proven_sender,
+)
 from sentimail_v3.conversation.receipt_preference import (
     get_receipt_enabled,
     parse_receipt_toggle,
     set_receipt_enabled,
 )
-from sentimail_v3.execution.campaign_memory import remember_campaign
-from sentimail_v3.execution.hostile_sources import record_hostile_source
-from sentimail_v3.identity import instance_identity
-from sentimail_v3.supervision.health import pulse
-from sentimail_v3.execution.hold_lifecycle import run_hold_lifecycle
-from sentimail_v3.execution.outbox import queue_response
-from sentimail_v3.execution.review_guard import (
-    abandon_undeliverable_notice,
-    fail_open_for_exhausted_outbox,
-)
 from sentimail_v3.conversation.review_notice import (
     ACTION_TOKEN_PLACEHOLDER,
     PREVIEW_CID,
 )
+from sentimail_v3.execution.campaign_memory import remember_campaign
+from sentimail_v3.execution.delivery import release_original
+from sentimail_v3.execution.header_text import une_ligne
+from sentimail_v3.execution.hold_lifecycle import run_hold_lifecycle
+from sentimail_v3.execution.hostile_sources import record_hostile_source
+from sentimail_v3.execution.outbox import bind_digest_ballots, queue_response
+from sentimail_v3.execution.review_guard import (
+    abandon_undeliverable_notice,
+    fail_open_for_exhausted_outbox,
+)
 from sentimail_v3.execution.smtp_failure import is_permanent_rejection
 from sentimail_v3.execution.smtp_sender import require_sender
-from sentimail_v3.code.tenancy import Quota, domain_of, quota_of
-from sentimail_v3.code.rulebook import (
-    MANAGEMENT_ACTIONS,
-    RuleResponse,
-    apply_rule_request,
-    label_sender,
-    set_sender_list_policy,
-    validate_rule_request,
-)
+from sentimail_v3.identity import Identity, instance_identity
+from sentimail_v3.llm import provider_chat_json
+from sentimail_v3.llm_accounting import llm_scope
 from sentimail_v3.observation.smtp_utils import extract_queue_id
-from sentimail_v3.supervision.training import SCHEMA as TRAINING_SCHEMA
-from sentimail_v3.code.reference import nommer_dossier
+from sentimail_v3.supervision.health import pulse
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("sentimail-v3-assistant")
@@ -124,7 +141,7 @@ def _preformatted_choice(user_text: str) -> tuple[str | None, str]:
     )
     choices: list[str] = []
     remaining: list[str] = []
-    for line in cleaned.splitlines():
+    for line in fold_lone_accented_a(cleaned).splitlines():
         match = marker.fullmatch(line)
         if match:
             choices.append(match.group(1).upper())
@@ -135,9 +152,42 @@ def _preformatted_choice(user_text: str) -> tuple[str | None, str]:
     # réponse. Noyée dans un paragraphe, elle vient plus probablement d'une
     # citation mal détourée que d'une intention : le texte part alors au
     # LLM, qui demandera une confirmation, plutôt que d'engager une action.
-    if len(distinct) == 1 and len(" ".join(remaining)) <= 400:
-        return choices[0], "\n".join(remaining)
+    if len(distinct) == 1 and short_enough("\n".join(remaining)):
+        choice = choices[0]
+        detail = "\n".join(remaining)
+        return ("C_TEXT", detail) if choice == "C" else (choice, detail)
+    prefilled_choice, prefilled_detail = prefilled_reply(cleaned)
+    if prefilled_choice:
+        return (
+            ("C_TEXT", prefilled_detail)
+            if prefilled_choice == "C"
+            else (prefilled_choice, cleaned)
+        )
+    # Seules les décisions écrites sortent d'ici : une lettre, « réponse A »,
+    # le corps d'un bouton. Une phrase sans lettre se lit plus loin, par
+    # _phrase_choice, et reste une décision dérivée.
     return None, cleaned
+
+
+_PHRASE_CHOICES = {
+    ("release_original", "legitimate"): "A",
+    ("suppress_future", "spam"): "B",
+}
+
+
+def _phrase_choice(text: str) -> str | None:
+    """Une phrase sans lettre qui dit exactement ce que dit A ou B.
+
+    La garde porte sur le texte entier, et non sur le reste comme pour la
+    lettre : une lettre se sépare de ce qui l'entoure, une phrase non. Les mots
+    qui décident peuvent être n'importe où ; seul un texte court garantit
+    qu'ils sont de la personne. Mesure du 29 septembre : 150 caractères au
+    plus sur cette voie en production, hors les 1 368 de la citation de
+    M-d8df0e.
+    """
+    if not text.strip() or not short_enough(text):
+        return None
+    return _PHRASE_CHOICES.get(explicit_directive(text))
 
 
 def _freeform_choice_prompt(user_text: str) -> str:
@@ -150,7 +200,8 @@ def _freeform_choice_prompt(user_text: str) -> str:
 
 
 def _choice_list_action(choice: str | None) -> str | None:
-    return {"A": "allow", "B": "hold"}.get(choice or "")
+    meaning = choice_meaning(choice)
+    return meaning.list_action if meaning else None
 
 
 def _apply_freeform_choice_guard(result: dict[str, object]) -> dict[str, object]:
@@ -223,6 +274,9 @@ def _apply_freeform_choice_guard(result: dict[str, object]) -> dict[str, object]
 
 
 def _choice_interpretation(choice: str) -> tuple[dict[str, object], dict[str, object]]:
+    meaning = choice_meaning(choice)
+    if meaning is None or meaning.interpretation != "deterministic":
+        raise ValueError(f"choix non déterministe : {choice}")
     common: dict[str, object] = {
         "domain_scope": "mail",
         # A et B ne jugent pas seulement ce message : ils inscrivent aussi
@@ -245,8 +299,8 @@ def _choice_interpretation(choice: str) -> tuple[dict[str, object], dict[str, ob
         result = {
             **common,
             "intent": "release_original",
-            "classification": "legitimate",
-            "requested_action": "release_original",
+            "classification": meaning.classification,
+            "requested_action": meaning.requested_action,
             "explanation": (
                 "C’est noté : je te livre ce message et je considère désormais "
                 "cet expéditeur comme fiable. Les prochains messages de cette "
@@ -262,11 +316,13 @@ def _choice_interpretation(choice: str) -> tuple[dict[str, object], dict[str, ob
         result = {
             **common,
             "intent": "record_feedback",
-            "classification": "spam",
-            "requested_action": "record_feedback",
+            "classification": meaning.classification,
+            "requested_action": meaning.requested_action,
             "explanation": (
                 "C’est noté : ce message ne te sera pas livré, et je retiendrai "
-                "les prochains messages de cette adresse. J’apprends aussi ce "
+                "les prochains messages de son expéditeur réel, celui que "
+                "l’authentification prouve, jamais le nom ou l’adresse qu’il "
+                "affiche. J’apprends aussi ce "
                 "que ce message avait de caractéristique pour reconnaître les "
                 "sollicitations du même genre."
             ),
@@ -276,27 +332,8 @@ def _choice_interpretation(choice: str) -> tuple[dict[str, object], dict[str, ob
         }
         explicit_action = None
         explicit_classification = "spam"
-    else:
-        result = {
-            **common,
-            "intent": "clarification",
-            "classification": None,
-            "requested_action": "none",
-            # C seul n'engage rien tant que l'explication n'est pas donnée.
-            "scope": "unknown",
-            "explanation": (
-                "Dis-moi ce que je dois faire de ce message et ce que tu veux "
-                "que j’en retienne."
-            ),
-            "clarification_question": (
-                "Réponds en commençant par C, puis décris ce que tu veux que je fasse "
-                "et ce que je dois apprendre de cet email."
-            ),
-            "reasons": ["preformatted_choice_c"],
-            "raw_response": {"choice": "C"},
-        }
-        explicit_action = None
-        explicit_classification = None
+    else:  # pragma: no cover - le registre ne contient que A et B ici
+        raise ValueError(f"choix déterministe inconnu : {choice}")
     gate = {
         "status": "allow_binding_choice",
         "explicit_action": explicit_action,
@@ -345,6 +382,7 @@ async def _context(pool: asyncpg.Pool[Any], conversation_id: str) -> dict[str, o
         """
         SELECT c.case_id, c.participant_email, m.id AS original_message_id,
                m.subject, m.from_header, m.envelope_from, m.delivery_status,
+               dc.assessed_classification,
                i.favorable_points, i.adverse_points
         FROM conversations c
         LEFT JOIN delivery_cases dc ON dc.id=c.case_id
@@ -570,7 +608,8 @@ async def _reserve_llm_call(
                      AND domain_fqdn=$3
                  ) AS domain_daily
                FROM llm_call_events
-               WHERE participant_email=$2 OR domain_fqdn=$3""",
+               WHERE created_at > now()-interval '24 hours'
+                 AND (participant_email=$2 OR domain_fqdn=$3)""",
             conversation_id,
             participant,
             domain,
@@ -594,6 +633,23 @@ async def _reserve_llm_call(
             domain,
         )
         return int(event_id), None
+
+
+def _reservation_with_first(
+    pool: asyncpg.Pool[Any], settings: Settings, conversation_id: str,
+    participant: str, first_id: int,
+):
+    """Réutilise l'appel déjà réservé, puis réserve chaque tentative de repli."""
+    first_available = True
+
+    async def reserve() -> tuple[int | None, str | None]:
+        nonlocal first_available
+        if first_available:
+            first_available = False
+            return first_id, None
+        return await _reserve_llm_call(pool, settings, conversation_id, participant)
+
+    return reserve
 
 
 async def _reject_without_llm(
@@ -745,6 +801,9 @@ async def _process_question(
     message: asyncpg.Record,
     context: dict[str, object],
     question: str,
+    *,
+    deadline: float | None = None,
+    prior_attempts: int = 1,
 ) -> None:
     """Répond à une question de messagerie sans rien décider ni rien modifier.
 
@@ -754,9 +813,17 @@ async def _process_question(
     """
     participant = str(context["participant_email"])
     identite = await instance_identity(pool, settings)
-    answer = await answer_question(
-        pool, client, settings, question, participant=participant
-    )
+    async def reserve() -> tuple[int | None, str | None]:
+        return await _reserve_llm_call(pool, settings, str(message["conversation_id"]), participant)
+
+    with llm_scope(message_id=context.get("original_message_id") or message["message_id"],
+                   conversation_id=str(message["conversation_id"])):
+        answer = await answer_question(
+            pool, client, settings, question, participant=participant,
+            reserve_call=reserve,
+            deadline_seconds=max(0, deadline-time.monotonic()) if deadline is not None else None,
+            max_calls=max(0, 6-prior_attempts),
+        )
     # Rappeler A, B ou C n'a de sens que s'il reste un dossier sur lequel
     # répondre. Après une question de bilan, cette phrase parle d'une action
     # qui n'existe pas et donne l'impression que MAIA n'a pas compris.
@@ -767,7 +834,7 @@ async def _process_question(
         JOIN conversations c ON c.case_id=dc.id
         WHERE m.delivery_status='held'
           AND dc.state IN ('review_notice_pending','awaiting_reply')
-          AND lower(c.participant_email)=lower($1)
+          AND sentimail_same_client_mailbox(c.participant_email,$1)
         """,
         participant,
     )
@@ -982,14 +1049,15 @@ async def _understand_digest_reply(
         return [], None
     catalogue = await _digest_catalogue(pool, mapping)
     try:
-        content, metadata = await provider_chat_json(
-            pool,
-            client,
-            settings,
-            messages=interpretation_prompt(catalogue, text),
-            max_tokens=900,
-            role="conversation",
-        )
+        with llm_scope(
+            message_id=message["message_id"], conversation_id=str(message["conversation_id"]),
+            purpose="digest_interpretation",
+            reserve_call=_reservation_with_first(pool, settings, str(message["conversation_id"]), auteur, llm_event_id),
+        ):
+            content, metadata = await provider_chat_json(
+                pool, client, settings, messages=interpretation_prompt(catalogue, rest),
+                max_tokens=900, role="conversation",
+            )
         payload = json.loads(content[content.find("{") : content.rfind("}") + 1])
     except Exception as exc:  # noqa: BLE001 - une panne ne perd pas la reponse
         await pool.execute(
@@ -1000,18 +1068,20 @@ async def _understand_digest_reply(
         )
         _log("digest.interpretation_error", error=type(exc).__name__)
         return [], None
-    await pool.execute(
-        """UPDATE llm_call_events SET status='complete',provider=$2,
-           model_name=$3,completed_at=now() WHERE id=$1""",
-        llm_event_id,
-        metadata.get("provider"),
-        metadata.get("model"),
-    )
+    if not metadata.get("quota_event_id"):
+        await pool.execute(
+            """UPDATE llm_call_events SET status='complete',provider=$2,
+               model_name=$3,completed_at=now() WHERE id=$1""",
+            llm_event_id, metadata.get("provider"), metadata.get("model"),
+        )
+    deterministic_numbers = {
+        value.number for value in decisions if value.choice in {"A", "B"}
+    }
     return validate_interpretation(
         payload,
-        text,
+        rest,
         mapping,
-        {value.number for value in decisions},
+        deterministic_numbers,
         senders={item["number"]: item["sender"] for item in catalogue},
     )
 
@@ -1069,6 +1139,14 @@ async def _process_digest_reply(
     )
     decisions = list(lecture.decisions)
     ambiguous = list(lecture.conflicts)
+    if lecture.sequence:
+        # Un lot peut montrer les dossiers 4 et 5 : « AB » vise ces deux
+        # numéros, pas les dossiers 1 et 2 du récapitulatif complet.
+        numbers = sorted(int(number) for number in mapping)
+        decisions = [
+            DigestDecision(numbers[value.number - 1], value.choice, value.detail, value.interpreted)
+            for value in decisions
+        ]
     # Une lettre seule ne dit pas de quel message elle parle - sauf quand il
     # n'y en a qu'un. Répondre « A » est alors exactement ce qu'on attend de
     # quelqu'un, et lui réclamer un numéro n'apporterait rien.
@@ -1078,13 +1156,25 @@ async def _process_digest_reply(
         decisions = [
             DigestDecision(int(numero), seule.choice, seule.detail, seule.interpreted)
         ]
-    understood, question = await _understand_digest_reply(
-        pool, client, settings, message, mapping, decisions, auteur
-    )
-    decisions = decisions + understood
+    literal_decisions = list(decisions)
+    if lecture.sequence or lecture.note:
+        # Une suite de lettres est entièrement lue, ou entièrement refusée :
+        # dans les deux cas il ne reste rien à faire comprendre au modèle, et
+        # lui donner « ABAAB » à interpréter serait l'inviter à deviner.
+        understood, question = [], (lecture.note or None)
+    else:
+        understood, question = await _understand_digest_reply(
+            pool, client, settings, message, mapping, decisions, auteur
+        )
+    # A et B sont déjà complets. C exprime au contraire « autre chose » : il
+    # rejoint le LLM et seule l'interprétation bornée qui en ressort s'applique.
+    decisions = [
+        value for value in literal_decisions if value.choice in {"A", "B"}
+    ] + understood
     applied: list[tuple[DigestDecision, str]] = []
     unknown: list[DigestDecision] = []
     needs_confirmation: list[tuple[DigestDecision, str]] = []
+    dangerous_numbers: set[int] = set()
     for decision in decisions:
         message_id = mapping.get(str(decision.number))
         if message_id is None:
@@ -1093,7 +1183,8 @@ async def _process_digest_reply(
         row = await pool.fetchrow(
             """
             SELECT m.subject, m.from_header, m.envelope_from, m.delivery_status,
-                   dc.id AS case_id, c.participant_email
+                   dc.id AS case_id, c.participant_email,
+                   dc.assessed_classification
             FROM messages m
             JOIN delivery_cases dc ON dc.message_id=m.id
             LEFT JOIN conversations c ON c.case_id=dc.id
@@ -1105,20 +1196,28 @@ async def _process_digest_reply(
             unknown.append(decision)
             continue
         proprietaire = str(row["participant_email"] or "")
-        if proprietaire and proprietaire.lower() != auteur.lower():
+        if proprietaire and not await pool.fetchval(
+            "SELECT sentimail_same_client_mailbox($1,$2)", auteur, proprietaire
+        ):
             # Le dossier d'un autre ne se décide pas depuis cette boîte. Le
             # numéro est rendu comme inconnu : dire son objet le divulguerait.
             unknown.append(decision)
             continue
         # Livrer est irréversible. Une phrase comprise par le modèle ne suffit
         # donc pas à sortir de la boîte un message dont le Code retient une
-        # preuve matérielle : on redemande, en disant ce qu'on a compris.
-        if (
-            decision.choice == "A"
-            and decision.interpreted
-            and await _has_material_danger(pool, message_id)
-        ):
+        # preuve matérielle, ou que le verdict classe dangereux : on redemande,
+        # en disant ce qu'on a compris. Une lettre écrite garde son pouvoir.
+        motif = (
+            await _trust_confirmation_reason(
+                pool, message_id, row.get("assessed_classification")
+            )
+            if decision.choice == "A" and decision.interpreted
+            else None
+        )
+        if motif:
             needs_confirmation.append((decision, str(row["subject"] or "(sans objet)")))
+            if motif == "dangerous":
+                dangerous_numbers.add(decision.number)
             continue
         await _apply_single_decision(pool, settings, message_id, row, decision)
         applied.append((decision, str(row["subject"] or "(sans objet)")))
@@ -1129,33 +1228,40 @@ async def _process_digest_reply(
         JOIN conversations c ON c.case_id=dc.id
         WHERE m.delivery_status='held'
           AND dc.state IN ('review_notice_pending','awaiting_reply')
-          AND lower(c.participant_email)=lower($1)
+          AND sentimail_same_client_mailbox(c.participant_email,$1)
         """,
         auteur,
     )
+    # Une décision appliquée est prise en compte sans qu'on le confirme. On
+    # n'écrit que s'il reste quelque chose à dire, ou si l'accusé a été demandé.
+    needs_response = bool(
+        unknown or question or needs_confirmation or ambiguous or not applied
+    ) or await get_receipt_enabled(pool, auteur)
     identite = await instance_identity(pool, settings)
     async with pool.acquire() as connection, connection.transaction():
         await connection.execute(
             "UPDATE conversation_messages SET processing_status='complete' WHERE id=$1",
             message["id"],
         )
-        await queue_response(
-            connection,
-            str(message["conversation_id"]),
-            None,
-            auteur,
-            identite.assistant_sender,
-            identite.action_address,
-            "[SentiMail] C’est noté",
-            acknowledgement(
-                applied,
-                unknown,
-                int(remaining or 0),
-                question,
-                needs_confirmation,
-                ambiguous,
-            ),
-        )
+        if needs_response:
+            await queue_response(
+                connection,
+                str(message["conversation_id"]),
+                None,
+                auteur,
+                identite.assistant_sender,
+                identite.action_address,
+                "[SentiMail] C’est noté",
+                acknowledgement(
+                    applied,
+                    unknown,
+                    int(remaining or 0),
+                    question,
+                    needs_confirmation,
+                    ambiguous,
+                    dangerous_numbers=dangerous_numbers,
+                ),
+            )
         await connection.execute(
             "INSERT INTO audit_log(actor,action,payload) VALUES "
             "('assistant','digest.decisions_applied',$1::jsonb)",
@@ -1166,8 +1272,12 @@ async def _process_digest_reply(
                         for value, _ in applied
                     ],
                     "unknown": [value.number for value in unknown],
+                    "needs_confirmation": [
+                        value.number for value, _ in needs_confirmation
+                    ],
                     "ambiguous": ambiguous,
                     "remaining": int(remaining or 0),
+                    "acknowledged": needs_response,
                 }
             ),
         )
@@ -1177,6 +1287,7 @@ async def _process_digest_reply(
         applied=len(applied),
         unknown=len(unknown),
         remaining=int(remaining or 0),
+        response_queued=needs_response,
     )
 
 
@@ -1206,6 +1317,167 @@ async def _has_material_danger(pool: asyncpg.Pool[Any], message_id: str) -> bool
     )
 
 
+async def _trust_confirmation_reason(
+    pool: asyncpg.Pool[Any], message_id: str, assessed: object
+) -> str | None:
+    """Ce qui oblige à redemander avant de livrer ou de faire confiance.
+
+    La preuve matérielle passe d'abord : c'est la plus forte, et c'est elle
+    que la question nomme quand les deux sont vraies.
+    """
+    if await _has_material_danger(pool, message_id):
+        return "material_danger"
+    if assessed == "dangerous":
+        return "dangerous"
+    return None
+
+
+# Le courrier qui pose la question porte ce but : seule une réponse à ce
+# courrier-là, sur ce message-là, confirme une confiance redemandée.
+CONFIRM_PURPOSE = "confirm_choice_a"
+
+
+async def _answers_trust_confirmation(
+    pool: asyncpg.Pool[Any], reply_message_id: object, original_id: str
+) -> bool:
+    return bool(
+        await pool.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM smtp_actions
+                WHERE reply_message_id=$1::uuid
+                  AND context->>'purpose'=$2
+                  AND context->>'confirm_original_message_id'=$3
+            )
+            """,
+            reply_message_id,
+            CONFIRM_PURPOSE,
+            original_id,
+        )
+    )
+
+
+def _trust_requested(plan: DecisionPlan, choice: str | None) -> bool:
+    """La décision livre le message, ou inscrit son expéditeur comme fiable."""
+    return plan.release_requested or _choice_list_action(choice) == "allow"
+
+
+def _trust_guard_applies(
+    plan: DecisionPlan,
+    choice: str | None,
+    *,
+    derived: bool,
+    held: bool,
+    confirmed: bool,
+) -> bool:
+    """Faut-il demander un « A » écrit avant d'appliquer cette décision ?
+
+    Sur un message retenu, la lettre répond à la question posée sur ce
+    message : elle garde son pouvoir (13 août, 54b593c). Sur un avis
+    d'indésirable, A ne livre rien mais pose d'un clic une confiance durable :
+    il n'est tenu pour acquis qu'une fois répondu à la question.
+    """
+    if not _trust_requested(plan, choice):
+        return False
+    if held:
+        return derived
+    return derived or not confirmed
+
+
+async def _trust_check(
+    pool: asyncpg.Pool[Any],
+    reply_message_id: object,
+    context: dict[str, object],
+    plan: DecisionPlan,
+    choice: str | None,
+    *,
+    derived: bool,
+) -> tuple[str | None, bool]:
+    """Le motif d'une question à poser, et si cette réponse en confirme une.
+
+    Sans dossier d'origine, il n'y a ni message à livrer ni expéditeur à
+    juger : la garde ne s'évalue pas, plutôt que de chercher un message nul.
+    """
+    original = context.get("original_message_id")
+    if not original:
+        return None, False
+    held = context.get("delivery_status") == "held"
+    confirmed = bool(
+        not held
+        and choice == "A"
+        and not derived
+        and await _answers_trust_confirmation(pool, reply_message_id, str(original))
+    )
+    if not _trust_guard_applies(
+        plan, choice, derived=derived, held=held, confirmed=confirmed
+    ):
+        return None, confirmed
+    motif = await _trust_confirmation_reason(
+        pool, str(original), context.get("assessed_classification")
+    )
+    return motif, confirmed
+
+
+_ANALYSE_DIT = {
+    "material_danger": "retient une preuve matérielle de danger",
+    "dangerous": "le classe dangereux",
+}
+
+
+def _ask_trust_confirmation(
+    result: dict[str, object],
+    gate: dict[str, object],
+    motif: str,
+    *,
+    held: bool,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Remplace la décision par une question, sans rien perdre de l'interprétation.
+
+    L'intention, la portée et l'explication restent : l'interprétation est
+    archivée telle quelle, et la question dit ce qu'on a compris.
+    """
+    analyse = _ANALYSE_DIT[motif]
+    if held:
+        question = (
+            "Je n’ai pas livré ce message. J’ai cru comprendre que tu voulais le "
+            f"recevoir, mais son analyse {analyse}. Si c’est bien ce que tu "
+            "veux, réponds simplement « A » à ce courrier."
+        )
+    else:
+        question = (
+            "Je n’ai rien changé. Tu m’as demandé de considérer cet expéditeur "
+            f"comme fiable, mais son analyse {analyse}. Si c’est bien ce que tu "
+            "veux, réponds simplement « A » à ce courrier."
+        )
+    new_gate = {
+        **gate,
+        "status": "blocked_needs_literal_confirmation",
+        "explicit_action": None,
+        "explicit_classification": None,
+        "conflicts": [
+            *[str(value) for value in gate.get("conflicts") or []],
+            f"trust_requires_confirmation_{motif}",
+        ],
+    }
+    reasons = [str(value) for value in result.get("reasons") or []]
+    reasons.append(f"trust_confirmation_{motif}")
+    updated = dict(result)
+    updated.update(
+        {
+            "requested_action": "none",
+            "classification": None,
+            "confidence": min(float(result.get("confidence") or 0), 0.49),
+            "clarification_question": question,
+            "reasons": reasons[:12],
+            "raw_response": {
+                "previous": result.get("raw_response"),
+                "policy_gate": new_gate,
+            },
+        }
+    )
+    return updated, new_gate
+
+
 async def _apply_single_decision(
     pool: asyncpg.Pool[Any],
     settings: Settings,
@@ -1216,73 +1488,35 @@ async def _apply_single_decision(
     """Traduit une lettre en la même action qu'une réponse individuelle."""
     participant = str(row["participant_email"] or "")
     sender = label_sender(row["from_header"], row["envelope_from"])
-    classification = {"A": "legitimate", "B": "spam"}.get(decision.choice)
+    meaning = choice_meaning(decision.choice)
+    classification = meaning.classification if meaning else None
+    list_action = (
+        meaning.list_action if meaning and sender and "@" in sender else None
+    )
     async with pool.acquire() as connection, connection.transaction():
-        if classification:
-            await connection.execute(
-                """
-                INSERT INTO labels (
-                    message_id, source, label, confidence, is_ground_truth,
-                    context, sender_normalized, participant_email, subject
-                ) VALUES ($1::uuid,'smtp_feedback_user',$2,1,true,$3::jsonb,$4,$5,$6)
-                ON CONFLICT DO NOTHING
-                """,
-                message_id,
-                classification,
-                _json(
-                    {
-                        "interpretation": "digest_choice",
-                        "binding": True,
-                        "user_reason": decision.detail or f"choix {decision.choice}",
-                    }
+        await apply_human_decision(
+            connection,
+            HumanDecision(
+                message_id=message_id,
+                participant_email=participant,
+                sender=sender,
+                subject=str(row["subject"] or "")[:998] or None,
+                classification=classification,
+                list_action=list_action,
+                policy_source=(
+                    f"authenticated_smtp_digest_{decision.choice.casefold()}"
                 ),
-                sender,
-                participant.casefold(),
-                str(row["subject"] or "")[:998] or None,
-            )
-            await connection.execute(
-                """
-                INSERT INTO training_samples (
-                    label_id, message_id, kind, dossier, dossier_sha256,
-                    human_label, schema_version
-                )
-                SELECT l.id, $1::uuid, 'ground_truth', vr.input_snapshot,
-                       encode(sha256(vr.input_snapshot::text::bytea),'hex'),
-                       $2, $3
-                FROM verdict_runs vr
-                JOIN investigations i ON i.id=vr.investigation_id
-                LEFT JOIN labels l
-                  ON l.message_id=$1::uuid AND l.source='smtp_feedback_user'
-                WHERE i.message_id=$1::uuid AND vr.input_snapshot IS NOT NULL
-                ORDER BY vr.completed_at DESC NULLS LAST, l.id DESC
-                LIMIT 1
-                ON CONFLICT (kind, dossier_sha256) DO UPDATE
-                    SET human_label=EXCLUDED.human_label
-                """,
-                message_id,
-                classification,
-                TRAINING_SCHEMA,
-            )
-        list_action = _choice_list_action(decision.choice)
-        if list_action and sender and "@" in sender:
-            await set_sender_list_policy(
-                connection,
-                participant,
-                sender,
-                list_action,
-                source=f"authenticated_smtp_digest_{decision.choice.casefold()}",
-            )
-        if decision.choice == "B":
-            await connection.execute(
-                """
-                UPDATE delivery_cases
-                SET state='closed', original_delivery_allowed=false,
-                    updated_at=now(), details=details || $2::jsonb
-                WHERE id=$1
-                """,
-                row["case_id"],
-                _json({"closed_by": "digest_choice_b"}),
-            )
+                label_context={
+                    "interpretation": "digest_choice",
+                    "binding": True,
+                    "user_reason": decision.detail or f"choix {decision.choice}",
+                },
+                case_id=row["case_id"],
+                close_current=decision.choice == "B",
+                close_details={"closed_by": "digest_choice_b"},
+                audit_choice=decision.choice,
+            ),
+        )
     if decision.choice == "A" and row["delivery_status"] == "held":
         await release_original(
             pool,
@@ -1293,6 +1527,495 @@ async def _apply_single_decision(
         )
 
 
+@dataclass(frozen=True)
+class DecisionPlan:
+    release_requested: bool
+    persistent_action: str | None
+    feedback_classification: str | None
+    binding_feedback: bool
+    reject_current: bool
+
+
+def _decision_plan(
+    result: dict[str, object],
+    policy_gate: dict[str, object],
+    context: dict[str, object],
+) -> DecisionPlan:
+    """Transforme l'interprétation validée en effets locaux autorisés."""
+    explicit_action = policy_gate.get("explicit_action")
+    explicit_classification = policy_gate.get("explicit_classification")
+    conflict_free = not str(policy_gate["status"]).startswith("blocked")
+    release_requested = bool(
+        conflict_free
+        and explicit_action == "release_original"
+        and result["requested_action"] == "release_original"
+        and context.get("original_message_id")
+        and context.get("delivery_status") == "held"
+    )
+    persistent_action = (
+        str(explicit_action)
+        if conflict_free
+        and explicit_action in {"suppress_future", "cancel_suppression"}
+        and result["requested_action"] == explicit_action
+        and context.get("original_message_id")
+        else None
+    )
+    feedback_classification = (
+        str(explicit_classification) if explicit_classification else None
+    )
+    if (
+        feedback_classification is None
+        and release_requested
+        and result["classification"] == "legitimate"
+        and float(result["confidence"]) >= 0.85
+    ):
+        feedback_classification = "legitimate"
+    binding_feedback = bool(conflict_free and feedback_classification)
+    reject_current = bool(
+        not release_requested
+        and feedback_classification in {"spam", "dangerous", "suspect"}
+        and context.get("delivery_status") == "held"
+        and context.get("case_id")
+    )
+    return DecisionPlan(
+        release_requested=release_requested,
+        persistent_action=persistent_action,
+        feedback_classification=feedback_classification,
+        binding_feedback=binding_feedback,
+        reject_current=reject_current,
+    )
+
+
+async def _persist_decision(
+    pool: asyncpg.Pool[Any],
+    settings: Settings,
+    message: asyncpg.Record,
+    context: dict[str, object],
+    result: dict[str, object],
+    metadata: dict[str, object],
+    policy_gate: dict[str, object],
+    plan: DecisionPlan,
+    choice: str | None,
+    user_reason: str,
+) -> None:
+    """Conserve l'interprétation et ses effets durables dans une transaction."""
+    model_name = str(metadata.get("model") or settings.deepseek_assistant_model)
+    explicit_classification = policy_gate.get("explicit_classification")
+    async with pool.acquire() as connection, connection.transaction():
+        await connection.execute(
+            """
+            INSERT INTO assistant_interpretations (
+                conversation_message_id, model_name, prompt_version, intent,
+                classification, requested_action, scope, confidence, explanation,
+                clarification_question, reasons, raw_response, binding
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13)
+            ON CONFLICT (conversation_message_id) DO UPDATE SET
+                model_name=excluded.model_name,
+                prompt_version=excluded.prompt_version,
+                intent=excluded.intent,
+                classification=excluded.classification,
+                requested_action=excluded.requested_action,
+                scope=excluded.scope,
+                confidence=excluded.confidence,
+                explanation=excluded.explanation,
+                clarification_question=excluded.clarification_question,
+                reasons=excluded.reasons,
+                raw_response=excluded.raw_response,
+                status='corrected',
+                binding=excluded.binding,
+                created_at=now()
+            """,
+            message["id"],
+            model_name,
+            PROMPT_VERSION,
+            result["intent"],
+            result["classification"],
+            result["requested_action"],
+            result["scope"],
+            result["confidence"],
+            result["explanation"],
+            result["clarification_question"],
+            _json(result["reasons"]),
+            _json(result["raw_response"]),
+            plan.release_requested
+            or plan.binding_feedback
+            or bool(plan.persistent_action),
+        )
+        original_message_id = context.get("original_message_id")
+        list_action = _choice_list_action(choice)
+        if original_message_id:
+            sender = label_sender(
+                context.get("from_header"), context.get("envelope_from")
+            )
+            await apply_human_decision(
+                connection,
+                HumanDecision(
+                    message_id=str(original_message_id),
+                    participant_email=str(context["participant_email"]),
+                    sender=sender,
+                    subject=str(context.get("subject") or "")[:998] or None,
+                    classification=plan.feedback_classification,
+                    list_action=list_action,
+                    policy_source=(
+                        f"authenticated_smtp_choice_{str(choice).casefold()}"
+                    ),
+                    label_context={
+                        "interpretation": (
+                            "confirmed_by_explicit_user_text"
+                            if explicit_classification
+                            else "authenticated_release_implies_legitimate"
+                        ),
+                        "binding": True,
+                        "conversation_message_id": str(message["id"]),
+                        "user_reason": user_reason[:2000],
+                        "llm_explanation": str(
+                            result.get("explanation") or ""
+                        )[:2000],
+                        "feedback_reason_code": result.get("feedback_reason_code"),
+                        "llm_reasons": [
+                            str(value)[:500]
+                            for value in result.get("reasons") or []
+                        ][:12],
+                    },
+                    model_name=model_name,
+                    model_version=PROMPT_VERSION,
+                    case_id=context.get("case_id"),
+                    close_current=plan.reject_current,
+                    close_details={
+                        "closed_by": "authenticated_smtp_user_feedback",
+                        "classification": plan.feedback_classification,
+                        "conversation_message_id": str(message["id"]),
+                    },
+                    audit_choice=str(choice) if list_action else None,
+                ),
+            )
+        await connection.execute(
+            "UPDATE conversation_messages SET processing_status='complete' WHERE id=$1",
+            message["id"],
+        )
+        if plan.reject_current:
+            await connection.execute(
+                """
+                INSERT INTO audit_log(actor,action,payload)
+                VALUES ('assistant','smtp_feedback.current_message_rejected',$1::jsonb)
+                """,
+                _json(
+                    {
+                        "case_id": str(context["case_id"]),
+                        "message_id": str(context["original_message_id"]),
+                        "classification": plan.feedback_classification,
+                    }
+                ),
+            )
+        if plan.persistent_action:
+            sender = label_sender(
+                context.get("from_header"), context.get("envelope_from")
+            )
+            if not sender or "@" not in sender or not original_message_id:
+                raise ValueError("sender identity unavailable for persistent policy")
+            if plan.persistent_action == "suppress_future":
+                await block_proven_sender(
+                    connection,
+                    str(context["participant_email"]),
+                    str(original_message_id),
+                    source="authenticated_smtp_suppression",
+                )
+            else:
+                identity = await read_proven_identity(
+                    connection, str(original_message_id)
+                )
+                targets = [sender]
+                if identity and identity.block_target:
+                    targets.append(identity.block_target[1])
+                await connection.execute(
+                    """
+                    UPDATE sender_policies SET active=false,updated_at=now()
+                    WHERE sentimail_same_client(participant_email,$1)
+                      AND value_normalized=ANY($2::text[]) AND action='hold'
+                    """,
+                    context["participant_email"],
+                    targets,
+                )
+
+
+@dataclass(frozen=True)
+class DirectiveInterpretation:
+    result: dict[str, object]
+    policy_gate: dict[str, object]
+    metadata: dict[str, object]
+    choice: str | None
+    directive_text: str
+    user_text: str
+    llm_event_id: int | None
+    # Une phrase, C ou le texte compris par le modèle dérivent la décision
+    # des mots ; une lettre ou un bouton l'écrivent. Seules les premières sont
+    # redemandées sur un message dangereux.
+    derived: bool = False
+
+
+def _decision_path(interpretation: DirectiveInterpretation) -> str:
+    """Par où la décision est arrivée, pour le journal de la garde."""
+    if not interpretation.derived:
+        return "literal"
+    if interpretation.policy_gate.get("origin") == "phrase":
+        return "phrase"
+    return "c_text" if interpretation.choice == "C_TEXT" else "llm"
+
+
+async def _interpret_inbound_directive(
+    pool: asyncpg.Pool[Any],
+    client: httpx.AsyncClient,
+    settings: Settings,
+    message: asyncpg.Record,
+    context: dict[str, object],
+) -> DirectiveInterpretation | None:
+    """Reconnaît la forme, réserve le quota et produit une interprétation bornée.
+
+    ``None`` signifie qu'une réponse locale terminale a déjà été appliquée :
+    réglage d'accusé, hors périmètre ou quota atteint.
+    """
+    user_text = str(message["user_text"] or "").strip()
+    if not user_text:
+        raise ValueError("empty user directive")
+    choice, directive_text = _preformatted_choice(user_text)
+    if choice in {"A", "B"}:
+        result, policy_gate = _choice_interpretation(choice)
+        metadata = dict(result["api_metadata"])
+        reasons = list(result["reasons"])
+        if directive_text:
+            reasons.append("user_precision_kept_without_llm")
+        bouton, signature = prefilled_reply(user_text)
+        if bouton in {"A", "B"} and signature:
+            reasons.append("prefilled_reply_with_trailer")
+        result["reasons"] = reasons[:12]
+        return DirectiveInterpretation(
+            result,
+            policy_gate,
+            metadata,
+            choice,
+            directive_text,
+            user_text,
+            None,
+            derived=False,
+        )
+    phrase = _phrase_choice(directive_text) if choice is None else None
+    if phrase:
+        result, policy_gate = _choice_interpretation(phrase)
+        policy_gate["origin"] = "phrase"
+        result["reasons"] = [*result["reasons"], "phrase_choice_without_letter"][:12]
+        return DirectiveInterpretation(
+            result,
+            policy_gate,
+            dict(result["api_metadata"]),
+            phrase,
+            directive_text,
+            user_text,
+            None,
+            derived=True,
+        )
+    directive_for_llm = (
+        _freeform_choice_prompt(directive_text)
+        if choice == "C_TEXT"
+        else directive_text or user_text
+    )
+    local_scope = (
+        "mail"
+        if choice == "C_TEXT" and context.get("original_message_id")
+        else conversation_scope(
+            directive_for_llm,
+            has_email_case=bool(context.get("original_message_id")),
+        )
+    )
+    bascule = (
+        parse_receipt_toggle(directive_for_llm) if choice != "C_TEXT" else None
+    )
+    if bascule is not None:
+        await _apply_receipt_toggle(pool, settings, message, context, bascule)
+        return None
+    if choice != "C_TEXT" and local_scope == "out_of_scope":
+        await _reject_without_llm(pool, settings, message, context, "out_of_scope")
+        return None
+    llm_event_id, quota = await _reserve_llm_call(
+        pool,
+        settings,
+        str(message["conversation_id"]),
+        str(context["participant_email"]),
+    )
+    if quota:
+        await _reject_without_llm(pool, settings, message, context, quota)
+        return None
+    try:
+        with llm_scope(
+            message_id=context.get("original_message_id") or message["message_id"],
+            conversation_id=str(message["conversation_id"]), purpose="interpretation",
+            reserve_call=_reservation_with_first(pool, settings, str(message["conversation_id"]),
+                                                  str(context["participant_email"]), llm_event_id),
+        ):
+            result = await _interpret(pool, client, settings, directive_for_llm, context)
+        metadata = dict(result["api_metadata"])
+        if not metadata.get("quota_event_id"):
+            await pool.execute(
+                """UPDATE llm_call_events SET status='complete',provider=$2,
+                   model_name=$3,completed_at=now() WHERE id=$1""",
+                llm_event_id, metadata.get("provider"), metadata.get("model"),
+            )
+    except Exception as exc:
+        await pool.execute(
+            """UPDATE llm_call_events SET status='error',error_type=$2,
+               completed_at=now() WHERE id=$1""",
+            llm_event_id,
+            type(exc).__name__,
+        )
+        raise
+    if local_scope == "mail":
+        result["domain_scope"] = "mail"
+    if choice == "C_TEXT":
+        policy_gate = _apply_freeform_choice_guard(result)
+    else:
+        if result["domain_scope"] == "out_of_scope":
+            result["classification"] = None
+            result["requested_action"] = "none"
+        policy_gate = apply_directive_gate(directive_text, result)
+    return DirectiveInterpretation(
+        result,
+        policy_gate,
+        metadata,
+        choice,
+        directive_text,
+        user_text,
+        llm_event_id,
+        derived=True,
+    )
+
+
+async def _remember_feedback_context(
+    pool: asyncpg.Pool[Any], message_id: str, classification: str | None
+) -> None:
+    """Enrichissements consultatifs après un spam humain, toujours fail-soft."""
+    if classification not in {"spam", "dangerous"}:
+        return
+    try:
+        await record_hostile_source(
+            pool, message_id, "user_feedback_" + classification
+        )
+    except Exception as exc:  # noqa: BLE001 - registre en bonus
+        _log("hostile_source.record_error", error=type(exc).__name__)
+    try:
+        await remember_campaign(pool, message_id, classification)
+    except Exception as exc:  # noqa: BLE001 - mémoire en bonus
+        _log("campaign_memory.record_error", error=type(exc).__name__)
+
+
+async def _complete_decision(
+    pool: asyncpg.Pool[Any],
+    settings: Settings,
+    identite: Identity,
+    message: asyncpg.Record,
+    context: dict[str, object],
+    result: dict[str, object],
+    plan: DecisionPlan,
+    explicit_classification: object,
+    confirmation: tuple[str, str] | None = None,
+) -> bool:
+    """Exécute la livraison éventuelle et répond ou clôt la conversation.
+
+    ``confirmation`` porte le message et le motif d'une confiance redemandée.
+    Le jeton de l'avis d'origine a été consommé par cette réponse : la
+    question dit donc de répondre à ce courrier-ci, qui porte le sien.
+    """
+    action_status = "Aucune action de livraison n’a été demandée."
+    if confirmation is not None:
+        action_status = (
+            "Le message reste retenu : rien n’a été livré."
+            if context.get("delivery_status") == "held"
+            else "Je n’ai rien changé."
+        )
+    elif plan.release_requested:
+        delivery_status = await release_original(
+            pool,
+            settings,
+            str(context["original_message_id"]),
+            reason="authenticated_smtp_user_reply",
+            user_requested=True,
+        )
+        action_status = (
+            "L’original vient d’être livré."
+            if delivery_status == "released"
+            else "L’original avait déjà été livré."
+        )
+    elif plan.persistent_action == "suppress_future":
+        action_status = "Les prochains messages de cet expéditeur seront retenus."
+    elif plan.persistent_action == "cancel_suppression":
+        action_status = "La retenue future de cet expéditeur est annulée."
+    elif (
+        explicit_classification in {"spam", "dangerous"}
+        and context.get("delivery_status") == "delivered"
+    ):
+        action_status = (
+            "J’enregistre ton verdict. Si tu veux aussi retenir les prochains, "
+            "réponds « ne livre plus les emails de cet expéditeur »."
+        )
+    receipt_enabled = await get_receipt_enabled(
+        pool, str(context["participant_email"])
+    )
+    needs_response = not plan.release_requested and (
+        receipt_enabled or bool(result.get("clarification_question"))
+    )
+    conversation_id = str(message["conversation_id"])
+    if not needs_response:
+        await pool.execute(
+            "UPDATE conversations SET status='closed',updated_at=now() WHERE id=$1::uuid",
+            conversation_id,
+        )
+        return False
+    learned = bool(
+        context.get("original_message_id") and plan.feedback_classification
+    )
+    offer_redelivery = (
+        bool(context.get("original_message_id"))
+        and context.get("delivery_status") != "delivered"
+    )
+    async with pool.acquire() as connection, connection.transaction():
+        await queue_response(
+            connection,
+            conversation_id,
+            context.get("case_id"),
+            str(context["participant_email"]),
+            identite.assistant_sender,
+            identite.action_address,
+            f"Re: {message['subject'] or '[SentiMail] Conversation'}",
+            _reply_text(
+                result,
+                context.get("subject"),
+                action_status,
+                learned=learned,
+                offer_redelivery=offer_redelivery,
+            ),
+            purpose=CONFIRM_PURPOSE if confirmation else None,
+            context_extra=(
+                {
+                    "confirm_original_message_id": confirmation[0],
+                    "motif": confirmation[1],
+                }
+                if confirmation
+                else None
+            ),
+            body_html=(
+                None
+                if result.get("clarification_question")
+                else receipt_html(
+                    str(result["explanation"]),
+                    context.get("subject"),
+                    action_status,
+                    learned=learned,
+                    offer_redelivery=offer_redelivery,
+                    action_address=identite.action_address,
+                )
+            ),
+        )
+    return True
+
+
 async def _process_inbound(
     pool: asyncpg.Pool[Any], client: httpx.AsyncClient, settings: Settings
 ) -> bool:
@@ -1301,6 +2024,7 @@ async def _process_inbound(
         return False
     identite = await instance_identity(pool, settings)
     processing_started = time.perf_counter()
+    question_deadline = time.monotonic() + getattr(settings, "assistant_question_deadline_seconds", 120)
     conversation_id = str(message["conversation_id"])
     _log(
         "directive.processing_started",
@@ -1311,7 +2035,9 @@ async def _process_inbound(
         prompt_version=PROMPT_VERSION,
     )
     context: dict[str, object] | None = None
+    metadata: dict[str, Any] = {}
     llm_event_id: int | None = None
+    persisted = False
     try:
         # Une réponse au récapitulatif porte plusieurs dossiers : elle se traite
         # dossier par dossier, avec la numérotation de l'envoi auquel elle
@@ -1323,84 +2049,18 @@ async def _process_inbound(
             )
             return True
         context = await _context(pool, conversation_id)
-        user_text = str(message["user_text"] or "").strip()
-        if not user_text:
-            raise ValueError("empty user directive")
-        choice, directive_text = _preformatted_choice(user_text)
-        if choice in {"A", "B", "C"}:
-            # La sémantique de A, B et C sans texte est écrite ici : aucun appel
-            # au fournisseur n'est nécessaire. Une panne, une clé expirée ou un
-            # quota atteint ne peuvent donc plus perdre une réponse dont la
-            # signification est déjà connue localement.
-            result, policy_gate = _choice_interpretation(choice)
-            metadata = dict(result["api_metadata"])
-            if directive_text:
-                result["reasons"] = [
-                    *result["reasons"],
-                    "user_precision_kept_without_llm",
-                ][:12]
-        else:
-            directive_for_llm = (
-                _freeform_choice_prompt(directive_text)
-                if choice == "C_TEXT"
-                else directive_text or user_text
-            )
-            local_scope = (
-                "mail"
-                if choice == "C_TEXT" and context.get("original_message_id")
-                else conversation_scope(
-                    directive_for_llm,
-                    has_email_case=bool(context.get("original_message_id")),
-                )
-            )
-            # Un réglage se lit par sa forme et s'applique sans modèle : mal
-            # deviné, il serait pire qu'ignoré. La bascule est toujours
-            # confirmée - c'est le changement d'état qui l'est, pas la
-            # directive.
-            bascule = parse_receipt_toggle(directive_for_llm)
-            if bascule is not None:
-                await _apply_receipt_toggle(
-                    pool, settings, message, context, bascule
-                )
-                return True
-            if choice != "C_TEXT" and local_scope == "out_of_scope":
-                await _reject_without_llm(
-                    pool, settings, message, context, "out_of_scope"
-                )
-                return True
-            llm_event_id, quota = await _reserve_llm_call(
-                pool,
-                settings,
-                conversation_id,
-                str(context["participant_email"]),
-            )
-            if quota:
-                await _reject_without_llm(pool, settings, message, context, quota)
-                return True
-            result = await _interpret(
-                pool,
-                client,
-                settings,
-                directive_for_llm,
-                context,
-            )
-            metadata = result["api_metadata"]
-            await pool.execute(
-                """UPDATE llm_call_events SET status='complete',provider=$2,
-                   model_name=$3,completed_at=now() WHERE id=$1""",
-                llm_event_id,
-                metadata.get("provider"),
-                metadata.get("model"),
-            )
-            if local_scope == "mail":
-                result["domain_scope"] = "mail"
-            if choice == "C_TEXT":
-                policy_gate = _apply_freeform_choice_guard(result)
-            else:
-                if result["domain_scope"] == "out_of_scope":
-                    result["classification"] = None
-                    result["requested_action"] = "none"
-                policy_gate = apply_directive_gate(directive_text, result)
+        interpretation = await _interpret_inbound_directive(
+            pool, client, settings, message, context
+        )
+        if interpretation is None:
+            return True
+        result = interpretation.result
+        policy_gate = interpretation.policy_gate
+        metadata = interpretation.metadata
+        choice = interpretation.choice
+        directive_text = interpretation.directive_text
+        user_text = interpretation.user_text
+        llm_event_id = interpretation.llm_event_id
         if (
             result["requested_action"] == "answer_question"
             and result["domain_scope"] == "mail"
@@ -1412,6 +2072,8 @@ async def _process_inbound(
                 message,
                 context,
                 directive_text or user_text,
+                deadline=question_deadline,
+                prior_attempts=int(metadata.get("attempt_count") or 1),
             )
             return True
         if result["requested_action"] in MANAGEMENT_ACTIONS:
@@ -1426,355 +2088,100 @@ async def _process_inbound(
                 processing_started,
             )
             return True
-        explicit_action = policy_gate.get("explicit_action")
+        plan = _decision_plan(result, policy_gate, context)
+        # Livrer est irréversible, et faire confiance est durable. Sur un
+        # message dangereux, ou que le Code tient pour matériellement
+        # dangereux, une décision dérivée des mots ne suffit pas : on pose la
+        # question, et rien n'est écrit avant un « A ». Une erreur ici tombe
+        # dans le repli commun plus bas : ni livraison ni écriture.
+        path = _decision_path(interpretation)
+        motif, confirmed = await _trust_check(
+            pool,
+            message["message_id"],
+            context,
+            plan,
+            choice,
+            derived=interpretation.derived,
+        )
+        confirmation: tuple[str, str] | None = None
+        trust_event: tuple[str, dict[str, object]] | None = None
+        surface = "held" if context.get("delivery_status") == "held" else "delivered"
+        if motif:
+            original = str(context["original_message_id"])
+            result, policy_gate = _ask_trust_confirmation(
+                result, policy_gate, motif, held=surface == "held"
+            )
+            choice = None
+            plan = _decision_plan(result, policy_gate, context)
+            confirmation = (original, motif)
+            trust_event = (
+                "directive.trust_confirmation_requested",
+                {
+                    "message_id": original,
+                    "conversation_message_id": str(message["id"]),
+                    "motif": motif,
+                    "path": path,
+                    "surface": surface,
+                },
+            )
+        elif confirmed and _trust_requested(plan, choice):
+            trust_event = (
+                "directive.trust_confirmed",
+                {
+                    "message_id": str(context["original_message_id"]),
+                    "conversation_message_id": str(message["id"]),
+                    "surface": surface,
+                },
+            )
+        # Lu après la garde : une question posée ne doit rien qualifier.
         explicit_classification = policy_gate.get("explicit_classification")
-        conflict_free = not str(policy_gate["status"]).startswith("blocked")
-        release_requested = bool(
-            conflict_free
-            and explicit_action == "release_original"
-            and result["requested_action"] == "release_original"
-            and context.get("original_message_id")
-            and context.get("delivery_status") == "held"
+        await _persist_decision(
+            pool,
+            settings,
+            message,
+            context,
+            result,
+            metadata,
+            policy_gate,
+            plan,
+            choice,
+            directive_text or user_text,
         )
-        persistent_action = (
-            explicit_action
-            if conflict_free
-            and explicit_action in {"suppress_future", "cancel_suppression"}
-            and result["requested_action"] == explicit_action
-            and context.get("original_message_id")
-            else None
-        )
-        feedback_classification = explicit_classification
-        if (
-            feedback_classification is None
-            and release_requested
-            and result["classification"] == "legitimate"
-            and float(result["confidence"]) >= 0.85
-        ):
-            feedback_classification = "legitimate"
-        binding_feedback = bool(conflict_free and feedback_classification)
-        reject_current = bool(
-            not release_requested
-            and feedback_classification in {"spam", "dangerous", "suspect"}
-            and context.get("delivery_status") == "held"
-            and context.get("case_id")
-        )
-        async with pool.acquire() as connection, connection.transaction():
-            await connection.execute(
-                """
-                INSERT INTO assistant_interpretations (
-                    conversation_message_id, model_name, prompt_version, intent,
-                    classification, requested_action, scope, confidence, explanation,
-                    clarification_question, reasons, raw_response, binding
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13)
-                ON CONFLICT (conversation_message_id) DO UPDATE SET
-                    model_name=excluded.model_name,
-                    prompt_version=excluded.prompt_version,
-                    intent=excluded.intent,
-                    classification=excluded.classification,
-                    requested_action=excluded.requested_action,
-                    scope=excluded.scope,
-                    confidence=excluded.confidence,
-                    explanation=excluded.explanation,
-                    clarification_question=excluded.clarification_question,
-                    reasons=excluded.reasons,
-                    raw_response=excluded.raw_response,
-                    status='corrected',
-                    binding=excluded.binding,
-                    created_at=now()
-                """,
-                message["id"],
-                str(metadata.get("model") or settings.deepseek_assistant_model),
-                PROMPT_VERSION,
-                result["intent"],
-                result["classification"],
-                result["requested_action"],
-                result["scope"],
-                result["confidence"],
-                result["explanation"],
-                result["clarification_question"],
-                _json(result["reasons"]),
-                _json(result["raw_response"]),
-                release_requested or binding_feedback or bool(persistent_action),
-            )
-            if context.get("original_message_id") and feedback_classification:
-                # Les indices présents au moment du feedback sont recopiés avec
-                # lui : c'est ce qui permet plus tard de reconnaître un message
-                # du même genre, et pas seulement le même expéditeur.
-                observed_signals = [
-                    str(row["clue_code"])
-                    for row in await connection.fetch(
-                        """
-                        SELECT DISTINCT c.clue_code
-                        FROM clues c
-                        JOIN investigations i ON i.id=c.investigation_id
-                        WHERE i.message_id=$1::uuid AND c.direction <> 'neutral'
-                        ORDER BY c.clue_code
-                        """,
-                        context["original_message_id"],
-                    )
-                ][:40]
-                # Le correspondant, le destinataire et l'objet témoin sont
-                # recopiés dans le label : la règle apprise reste lisible et
-                # exploitable après la purge du message d'origine.
-                await connection.execute(
-                    """
-                    INSERT INTO labels (
-                        message_id, source, label, confidence, is_ground_truth,
-                        model_name, model_version, context,
-                        sender_normalized, participant_email, subject
-                    ) VALUES (
-                        $1,'smtp_feedback_user',$2,1,true,$3,$4,$5::jsonb,$6,$7,$8
-                    )
-                    ON CONFLICT DO NOTHING
-                    """,
-                    context["original_message_id"],
-                    feedback_classification,
-                    str(metadata.get("model") or settings.deepseek_assistant_model),
-                    PROMPT_VERSION,
-                    _json(
-                        {
-                            "interpretation": (
-                                "confirmed_by_explicit_user_text"
-                                if explicit_classification
-                                else "authenticated_release_implies_legitimate"
-                            ),
-                            "binding": True,
-                            "conversation_message_id": str(message["id"]),
-                            "user_reason": (directive_text or user_text)[:2000],
-                            "llm_explanation": str(result.get("explanation") or "")[:2000],
-                            "feedback_reason_code": result.get("feedback_reason_code"),
-                            "signals": observed_signals,
-                            "llm_reasons": [
-                                str(value)[:500] for value in result.get("reasons") or []
-                            ][:12],
-                        }
-                    ),
-                    label_sender(
-                        context.get("from_header"), context.get("envelope_from")
-                    ),
-                    str(context["participant_email"]).casefold(),
-                    str(context.get("subject") or "")[:998] or None,
-                )
-            if context.get("original_message_id") and feedback_classification:
-                # La qualification humaine emporte avec elle la forme du dossier
-                # qui l'a motivee : sans cela, la retention effacerait la
-                # matiere d'entrainement avant qu'elle ne serve.
-                await connection.execute(
-                    """
-                    INSERT INTO training_samples (
-                        label_id, message_id, kind, dossier, dossier_sha256,
-                        human_label, schema_version
-                    )
-                    SELECT l.id, $1::uuid, 'ground_truth', vr.input_snapshot,
-                           encode(sha256(vr.input_snapshot::text::bytea),'hex'),
-                           $2, $3
-                    FROM verdict_runs vr
-                    JOIN investigations i ON i.id=vr.investigation_id
-                    LEFT JOIN labels l
-                      ON l.message_id=$1::uuid AND l.source='smtp_feedback_user'
-                    WHERE i.message_id=$1::uuid AND vr.input_snapshot IS NOT NULL
-                    ORDER BY vr.completed_at DESC NULLS LAST, l.id DESC
-                    LIMIT 1
-                    ON CONFLICT (kind, dossier_sha256) DO UPDATE
-                        SET human_label=EXCLUDED.human_label,
-                            label_id=EXCLUDED.label_id
-                    """,
-                    context["original_message_id"],
-                    feedback_classification,
-                    TRAINING_SCHEMA,
-                )
-            list_action = _choice_list_action(choice)
-            if list_action and context.get("original_message_id"):
-                sender = label_sender(
-                    context.get("from_header"), context.get("envelope_from")
-                )
-                await set_sender_list_policy(
-                    connection,
-                    str(context["participant_email"]),
-                    sender,
-                    list_action,
-                    source=f"authenticated_smtp_choice_{choice.casefold()}",
-                )
-                await connection.execute(
-                    "INSERT INTO audit_log(actor,action,payload) VALUES "
-                    "('assistant','sender_list.choice_applied',$1::jsonb)",
-                    _json(
-                        {
-                            "participant": str(context["participant_email"]),
-                            "sender": sender,
-                            "choice": choice,
-                            "list_action": list_action,
-                            "message_id": str(context["original_message_id"]),
-                        }
-                    ),
-                )
-            await connection.execute(
-                "UPDATE conversation_messages SET processing_status='complete' WHERE id=$1",
-                message["id"],
-            )
-            if reject_current:
-                await connection.execute(
-                    """
-                    UPDATE delivery_cases
-                    SET state='closed', original_delivery_allowed=false,
-                        updated_at=now(),
-                        details=details || $2::jsonb
-                    WHERE id=$1
-                    """,
-                    context["case_id"],
-                    _json(
-                        {
-                            "closed_by": "authenticated_smtp_user_feedback",
-                            "classification": feedback_classification,
-                            "conversation_message_id": str(message["id"]),
-                        }
-                    ),
-                )
-                await connection.execute(
-                    """
-                    INSERT INTO audit_log(actor,action,payload)
-                    VALUES ('assistant','smtp_feedback.current_message_rejected',$1::jsonb)
-                    """,
-                    _json(
-                        {
-                            "case_id": str(context["case_id"]),
-                            "message_id": str(context["original_message_id"]),
-                            "classification": feedback_classification,
-                        }
-                    ),
-                )
-            if persistent_action:
-                sender = label_sender(
-                    context.get("from_header"), context.get("envelope_from")
-                )
-                if not sender or "@" not in sender:
-                    raise ValueError("sender identity unavailable for persistent policy")
-                if persistent_action == "suppress_future":
-                    await set_sender_list_policy(
-                        connection,
-                        str(context["participant_email"]),
-                        sender,
-                        "hold",
-                        source="authenticated_smtp_suppression",
-                    )
-                else:
-                    await connection.execute(
-                        """
-                        UPDATE sender_policies SET active=false,updated_at=now()
-                        WHERE participant_email=$1 AND scope='sender'
-                          AND value_normalized=$2 AND action='hold'
-                        """,
-                        context["participant_email"],
-                        sender,
-                    )
-        if feedback_classification in {"spam", "dangerous"} and context.get(
-            "original_message_id"
-        ):
-            # La qualification humaine vaut confirmation : la source SMTP
-            # entre au registre des serveurs hostiles. En échec, le registre
-            # attendra - jamais la directive.
-            try:
-                await record_hostile_source(
-                    pool,
-                    str(context["original_message_id"]),
-                    "user_feedback_" + str(feedback_classification),
-                )
-            except Exception as exc:  # noqa: BLE001 - registre en bonus
-                _log("hostile_source.record_error", error=type(exc).__name__)
-            # Le gabarit qualifié par l'humain entre en mémoire de campagne.
-            try:
-                await remember_campaign(
-                    pool,
-                    str(context["original_message_id"]),
-                    str(feedback_classification),
-                )
-            except Exception as exc:  # noqa: BLE001 - mémoire en bonus
-                _log("campaign_memory.record_error", error=type(exc).__name__)
-        action_status = "Aucune action de livraison n’a été demandée."
-        if release_requested:
-            delivery_status = await release_original(
+        persisted = True
+        if context.get("original_message_id"):
+            await _remember_feedback_context(
                 pool,
-                settings,
                 str(context["original_message_id"]),
-                reason="authenticated_smtp_user_reply",
-                user_requested=True,
+                plan.feedback_classification,
             )
-            action_status = (
-                "L’original vient d’être livré."
-                if delivery_status == "released"
-                else "L’original avait déjà été livré."
-            )
-        elif persistent_action == "suppress_future":
-            action_status = "Les prochains messages de cet expéditeur seront retenus."
-        elif persistent_action == "cancel_suppression":
-            action_status = "La retenue future de cet expéditeur est annulée."
-        elif (
-            explicit_classification in {"spam", "dangerous"}
-            and context.get("delivery_status") == "delivered"
-        ):
-            action_status = (
-                "J’enregistre ton verdict. Si tu veux aussi retenir les prochains, "
-                "réponds « ne livre plus les emails de cet expéditeur »."
-            )
-        # Une directive exécutée mérite une réponse : elle confirme ce qui a
-        # été fait et surtout rouvre un canal. Sans elle, le jeton du dossier
-        # est consommé et l'utilisateur ne peut plus se raviser. Une livraison
-        # fait exception : l'original livré porte déjà son propre retour SMTP.
-        # L'accusé se tait si le destinataire l'a désactivé - mais jamais une
-        # clarification : sans elle, la question de MAIA partirait dans le
-        # vide et le doute resterait doute.
-        receipt_enabled = await get_receipt_enabled(
-            pool, str(context["participant_email"])
+        needs_response = await _complete_decision(
+            pool,
+            settings,
+            identite,
+            message,
+            context,
+            result,
+            plan,
+            explicit_classification,
+            confirmation,
         )
-        needs_response = not release_requested and (
-            receipt_enabled or bool(result.get("clarification_question"))
-        )
-        if needs_response:
-            # La relivraison n'est proposée que si un original existe et n'est
-            # pas déjà dans la boîte ; l'apprentissage n'est annoncé que si le
-            # label vient réellement d'être posé (même condition que l'INSERT).
-            learned = bool(
-                context.get("original_message_id") and feedback_classification
-            )
-            offer_redelivery = (
-                bool(context.get("original_message_id"))
-                and context.get("delivery_status") != "delivered"
-            )
-            async with pool.acquire() as connection, connection.transaction():
-                await queue_response(
-                    connection,
-                    conversation_id,
-                    context.get("case_id"),
-                    str(context["participant_email"]),
-                    identite.assistant_sender,
-                    identite.action_address,
-                    f"Re: {message['subject'] or '[SentiMail] Conversation'}",
-                    _reply_text(
-                        result,
-                        context.get("subject"),
-                        action_status,
-                        learned=learned,
-                        offer_redelivery=offer_redelivery,
-                    ),
-                    body_html=(
-                        None
-                        if result.get("clarification_question")
-                        else receipt_html(
-                            str(result["explanation"]),
-                            context.get("subject"),
-                            action_status,
-                            learned=learned,
-                            offer_redelivery=offer_redelivery,
-                            action_address=identite.action_address,
-                        )
-                    ),
+        if trust_event is not None:
+            # Écrit après la décision : le journal ne compte que les questions
+            # mises en file et les confiances enregistrées, pas les tentatives.
+            try:
+                await pool.execute(
+                    "INSERT INTO audit_log(actor,action,payload) "
+                    "VALUES ('assistant',$1,$2::jsonb)",
+                    trust_event[0],
+                    _json(trust_event[1]),
                 )
-        else:
-            await pool.execute(
-                "UPDATE conversations SET status='closed',updated_at=now() WHERE id=$1::uuid",
-                conversation_id,
-            )
+            except Exception as audit_exc:  # noqa: BLE001 - ne pas doubler la réponse déjà en file
+                _log(
+                    "directive.trust_audit_error",
+                    conversation_message_id=message["id"],
+                    conversation_id=conversation_id,
+                    error=type(audit_exc).__name__,
+                )
         _log(
             "directive.interpreted",
             conversation_message_id=message["id"],
@@ -1796,14 +2203,52 @@ async def _process_inbound(
             usage=metadata.get("usage") or {},
             duration_ms=round((time.perf_counter() - processing_started) * 1000, 2),
             binding=(
-                release_requested
-                or binding_feedback
-                or bool(persistent_action)
-                or reject_current
+                plan.release_requested
+                or plan.binding_feedback
+                or bool(plan.persistent_action)
+                or plan.reject_current
             ),
             response_queued=needs_response,
         )
     except Exception as exc:  # noqa: BLE001 - le dialogue est fail-soft
+        if persisted:
+            # La décision a déjà été validée en base : ne jamais prétendre
+            # qu'aucune action n'a été exécutée ni repasser le message en erreur.
+            if context is not None:
+                try:
+                    async with pool.acquire() as connection, connection.transaction():
+                        await queue_response(
+                            connection,
+                            conversation_id,
+                            context.get("case_id"),
+                            str(context["participant_email"]),
+                            identite.assistant_sender,
+                            identite.action_address,
+                            f"Re: {message['subject'] or '[SentiMail] Conversation'}",
+                            "Ta décision a bien été enregistrée, mais son exécution finale "
+                            "(livraison ou confirmation) a rencontré une erreur temporaire. "
+                            "Elle sera reprise automatiquement sans que tu aies besoin de "
+                            "renvoyer ta réponse.\n\n- MAIA, SentiMail V3",
+                        )
+                except Exception as reply_exc:  # noqa: BLE001 - fail-soft sur la réponse d'erreur
+                    _log(
+                        "directive.completion_reply_error",
+                        conversation_message_id=message["id"],
+                        conversation_id=conversation_id,
+                        error=type(reply_exc).__name__,
+                    )
+            _log(
+                "directive.completion_error",
+                conversation_message_id=message["id"],
+                conversation_id=conversation_id,
+                message_id=message["message_id"],
+                model=metadata.get("model") or settings.deepseek_assistant_model,
+                prompt_version=PROMPT_VERSION,
+                error=type(exc).__name__,
+                detail=str(exc)[:300],
+                duration_ms=round((time.perf_counter() - processing_started) * 1000, 2),
+            )
+            return True
         if llm_event_id is not None:
             await pool.execute(
                 """UPDATE llm_call_events SET status='error',error_type=$2,
@@ -1828,7 +2273,7 @@ async def _process_inbound(
                     "Je n’ai pas réussi à interpréter cette directive avec assez de "
                     "fiabilité. Peux-tu la reformuler en précisant ce que tu penses "
                     "du message et ce que tu veux que SentiMail apprenne ?\n\n"
-                    "Aucune action n’a été exécutée.\n\n— MAIA, SentiMail V3",
+                    "Aucune action n’a été exécutée.\n\n- MAIA, SentiMail V3",
                 )
         _log(
             "directive.error",
@@ -1854,13 +2299,55 @@ async def _claim_outbox(pool: asyncpg.Pool[Any]) -> asyncpg.Record | None:
         WITH candidate AS (
             SELECT id FROM assistant_outbox
             WHERE status IN ('pending','error') AND attempts < 5
-              AND created_at < now() - (attempts * interval '10 seconds')
+              AND coalesce(last_attempt_at,created_at)
+                    <= now() - (attempts * interval '10 seconds')
             ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
         )
         UPDATE assistant_outbox o
         SET status='sending',attempts=attempts+1,last_attempt_at=now()
-        FROM candidate WHERE o.id=candidate.id RETURNING o.*
+        FROM candidate WHERE o.id=candidate.id
+        RETURNING o.*,
+                  (SELECT sa.context->>'nonce' FROM smtp_actions sa WHERE sa.id=o.action_id)
+                      AS action_nonce
         """
+    )
+
+
+# Les trois icônes de l'indice de confiance vivent dans le paquet : ce sont des
+# images du dépôt, pas des données d'un message. Elles sont jointes au corps
+# quand celui-ci les cite - jamais servies depuis un serveur, ce qui signalerait
+# l'ouverture de l'avis et se ferait bloquer par la moitié des clients.
+_ICONES_CONFIANCE = (
+    Path(__file__).resolve().parents[1] / "assets" / "confiance"
+)
+_CID_INDICE = re.compile(r"cid:(sm-indice-([a-z]+))")
+
+
+def attach_confidence_icon(email: EmailMessage, body_html: str) -> None:
+    """Rattache l'icône de l'indice au corps HTML qui la référence.
+
+    Une icône manquante n'empêche pas l'avis de partir : le mot - DANGEREUX,
+    DOUTEUX, SAIN - porte déjà le sens, l'image ne fait que le montrer.
+    """
+    trouve = _CID_INDICE.search(body_html or "")
+    if not trouve:
+        return
+    fichier = _ICONES_CONFIANCE / f"{trouve.group(2)}.png"
+    try:
+        contenu = fichier.read_bytes()
+    except OSError:
+        logger.warning("icone_confiance_absente niveau=%s", trouve.group(2))
+        return
+    parties = email.get_payload()
+    if not isinstance(parties, list) or not parties:
+        return
+    parties[-1].add_related(
+        contenu,
+        maintype="image",
+        subtype="png",
+        cid=f"<{trouve.group(1)}>",
+        filename=f"{trouve.group(2)}.png",
+        disposition="inline",
     )
 
 
@@ -1878,7 +2365,11 @@ async def _send_outbox(pool: asyncpg.Pool[Any], settings: Settings) -> bool:
     domain = identite.action_address.rsplit("@", 1)[-1]
     # Un aléa par émission : le jeton d'un message n'est plus dérivable du
     # seul identifiant de l'action, même si le secret d'instance venait à fuir.
-    nonce = new_nonce() if action_id else None
+    # En cas de reprise après un arrêt entre l'envoi SMTP et la mise à jour de
+    # la file, on réutilise le nonce déjà posé pour ne pas invalider le jeton
+    # d'un courrier déjà parti.
+    existing_nonce = item.get("action_nonce") if action_id else None
+    nonce = str(existing_nonce) if existing_nonce else (new_nonce() if action_id else None)
     token = (
         _action_token(settings.assistant_token_secret, action_id, nonce)
         if action_id
@@ -1891,7 +2382,12 @@ async def _send_outbox(pool: asyncpg.Pool[Any], settings: Settings) -> bool:
     email["From"] = item["sender"]
     email["To"] = item["recipient"]
     email["Reply-To"] = item["reply_to"]
-    email["Subject"] = item["subject"]
+    email["Subject"] = une_ligne(item["subject"])
+    # La RFC n'impose que deux en-têtes : `From` et `Date`. Sans le second, un
+    # client range l'avis hors de la liste que l'œil parcourt - souvent tout en
+    # bas - et il passe pour perdu alors qu'il est arrivé. Les filtres anti-spam
+    # comptent aussi son absence contre nous.
+    email["Date"] = formatdate(localtime=True)
     email["Message-ID"] = internet_message_id
     email["X-Sentinel-Mode"] = "decision"
     email.set_content(item["body_text"])
@@ -1903,16 +2399,15 @@ async def _send_outbox(pool: asyncpg.Pool[Any], settings: Settings) -> bool:
         if token:
             rendu = rendu.replace(ACTION_TOKEN_PLACEHOLDER, f"S3-ACTION:{token}")
         email.add_alternative(rendu, subtype="html")
+        attach_confidence_icon(email, rendu)
     attachment = item.get("attachment_content")
     if isinstance(attachment, bytes) and item.get("attachment_filename"):
         content_type = str(item.get("attachment_content_type") or "application/octet-stream")
         maintype, _, subtype = content_type.partition("/")
         rendu_html = str(item.get("body_html") or "")
-        # La page référence la capture : l'image affichée doit être rattachée au
-        # corps HTML, sinon le client montre une image cassée. C'est la
-        # miniature qui tient ce rôle - légère, elle ne fait que se montrer.
-        # Sans miniature, l'original tient ce rôle plutôt que de laisser l'avis
-        # sans image.
+        # Un avis déjà en file avant la présentation compacte peut encore
+        # référencer une capture. Elle reste rattachée au corps pour que ce
+        # courrier historique ne parte pas avec une image cassée.
         inline = item.get("inline_content")
         affichee = inline if isinstance(inline, bytes) and inline else attachment
         affichee_type = str(
@@ -1934,30 +2429,46 @@ async def _send_outbox(pool: asyncpg.Pool[Any], settings: Settings) -> bool:
                 filename=affichee_nom,
                 disposition="inline",
             )
-        # Une image montrée dans le corps ne part plus aussi en pièce jointe :
-        # elle doublait le poids de l'avis sur un téléphone pour un fichier que
-        # personne n'ouvrait, et son texte reste trompeur de toute façon. Les
-        # autres pièces - un relevé, un export - restent jointes.
         if not (maintype == "image" and f"cid:{PREVIEW_CID}" in rendu_html):
+            # Une pièce qui n'est pas montrée dans le corps - un relevé, un
+            # export - reste jointe.
             email.add_attachment(
                 attachment,
                 maintype=maintype or "application",
                 subtype=subtype or "octet-stream",
                 filename=str(item["attachment_filename"]),
             )
+        elif affichee is inline:
+            # Même compatibilité pour l'ancien format : sa miniature reste
+            # visible et sa capture pleine reste ouvrable.
+            email.add_attachment(
+                attachment,
+                maintype=maintype or "image",
+                subtype=subtype or "png",
+                filename="message-en-grand.png",
+            )
     try:
         if action_id:
-            await pool.execute(
+            updated = await pool.execute(
                 """
                 UPDATE smtp_actions
                 SET token_hash=$2,
                     context = context || jsonb_build_object('nonce', $3::text)
                 WHERE id=$1::uuid
+                  AND (token_hash IS NULL OR context->>'nonce'=$3)
                 """,
                 action_id,
                 token_hash(token),
                 nonce,
             )
+            if updated == "UPDATE 0":
+                raise RuntimeError("smtp_action_token_conflict")
+            if "S3-BALLOT-" in str(item.get("body_html") or ""):
+                rendu = await bind_digest_ballots(
+                    pool, action_id, str(item["body_html"]), settings.assistant_token_secret
+                )
+                rendu = rendu.replace(ACTION_TOKEN_PLACEHOLDER, f"S3-ACTION:{token}")
+                email.get_body(preferencelist=("html",)).set_content(rendu, subtype="html")
         send_result = await aiosmtplib.send(
             require_sender(email, str(item["recipient"])),
             sender=parseaddr(str(item["sender"]))[1],
@@ -2069,38 +2580,24 @@ async def _send_outbox(pool: asyncpg.Pool[Any], settings: Settings) -> bool:
     return True
 
 
-async def main() -> None:
-    settings = load_settings()
-    if not settings.conversation_enabled:
-        raise RuntimeError("conversation assistant is disabled")
-    if len(settings.assistant_token_secret) < 32:
-        raise RuntimeError("ASSISTANT_TOKEN_SECRET must contain at least 32 characters")
-    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=4)
-    await pool.execute(
-        """
-        UPDATE conversation_messages SET processing_status='pending'
-        WHERE direction='inbound' AND processing_status='processing'
-        """
-    )
-    await pool.execute(
-        "UPDATE assistant_outbox SET status='error' WHERE status='sending'"
-    )
-    _log(
-        "worker.started",
-        component="assistant",
-        model=settings.deepseek_assistant_model,
-        prompt_version=PROMPT_VERSION,
-        interval_seconds=settings.assistant_interval_seconds,
-        max_outbox_attempts=5,
-    )
-    next_lifecycle = 0.0
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(settings.deepseek_timeout_seconds)
-    ) as client:
-        while True:
+async def _run_workers(
+    pool: asyncpg.Pool[Any], client: httpx.AsyncClient, settings: Settings
+) -> None:
+    """Expédie les avis sans attendre qu'une conversation ait fini de réfléchir."""
+    progressed: set[str] = set()
+
+    def progress(worker: str) -> None:
+        progressed.add(worker)
+        # Le battement commun ne masque aucune boucle arrêtée : la santé
+        # actuelle expire après 240 s sans progression des deux traitements.
+        if progressed == {"inbound", "outbox"}:
             pulse("assistant")
+            progressed.clear()
+
+    async def inbound() -> None:
+        next_lifecycle = 0.0
+        while True:
             worked = await _process_inbound(pool, client, settings)
-            worked = await _send_outbox(pool, settings) or worked
             if time.monotonic() >= next_lifecycle:
                 next_lifecycle = (
                     time.monotonic() + settings.hold_lifecycle_interval_seconds
@@ -2113,9 +2610,56 @@ async def main() -> None:
                         error=type(exc).__name__,
                         detail=str(exc)[:300],
                     )
-            pulse("assistant")
+            progress("inbound")
             if not worked:
                 await asyncio.sleep(settings.assistant_interval_seconds)
+
+    async def outbox() -> None:
+        while True:
+            worked = await _send_outbox(pool, settings)
+            progress("outbox")
+            if not worked:
+                await asyncio.sleep(settings.assistant_interval_seconds)
+
+    pulse("assistant")
+    # Deux tâches fixes partagent le pool borné. Une panne inattendue ou un
+    # arrêt annule aussi la tâche sœur avant de fermer leurs ressources.
+    async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(inbound(), name="assistant-inbound")
+        tasks.create_task(outbox(), name="assistant-outbox")
+
+
+async def main() -> None:
+    settings = load_settings()
+    if not settings.conversation_enabled:
+        raise RuntimeError("conversation assistant is disabled")
+    if len(settings.assistant_token_secret) < 32:
+        raise RuntimeError("ASSISTANT_TOKEN_SECRET must contain at least 32 characters")
+    pool = await asyncpg.create_pool(settings.database_url, min_size=1, max_size=4)
+    try:
+        await pool.execute(
+            """
+            UPDATE conversation_messages SET processing_status='pending'
+            WHERE direction='inbound' AND processing_status='processing'
+            """
+        )
+        await pool.execute(
+            "UPDATE assistant_outbox SET status='error' WHERE status='sending'"
+        )
+        _log(
+            "worker.started",
+            component="assistant",
+            model=settings.deepseek_assistant_model,
+            prompt_version=PROMPT_VERSION,
+            interval_seconds=settings.assistant_interval_seconds,
+            max_outbox_attempts=5,
+        )
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.deepseek_timeout_seconds)
+        ) as client:
+            await _run_workers(pool, client, settings)
+    finally:
+        await pool.close()
 
 
 if __name__ == "__main__":

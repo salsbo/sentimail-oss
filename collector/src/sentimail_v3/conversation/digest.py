@@ -20,12 +20,20 @@ import logging
 import re
 import secrets
 from dataclasses import dataclass
+from email.utils import parseaddr
 from typing import Any
 
 import asyncpg
 
 from sentimail_v3.config import Settings
+from sentimail_v3.code.plain_words import (
+    identity_card,
+    plain_limits,
+    sender_addresses,
+    short_points,
+)
 from sentimail_v3.identity import instance_identity
+from sentimail_v3.conversation.choice_registry import fold_lone_accented_a
 from sentimail_v3.conversation.digest_letter import (
     build_text,
     render_digest_html,
@@ -63,6 +71,11 @@ class BallotReading:
 
     decisions: list[DigestDecision]
     conflicts: list[int]
+    # La réponse était une suite de lettres : le texte est consommé, rien n'y
+    # reste à interpréter.
+    sequence: bool = False
+    # Ce qu'il faut redire à la personne quand la suite ne colle pas à la liste.
+    note: str = ""
 
 
 # La référence d'un récapitulatif : « D-3f9c1a ». Elle n'est pas un secret, elle
@@ -182,6 +195,44 @@ def lone_choice(text: str) -> DigestDecision | None:
     return DigestDecision(0, choice, detail[:500])
 
 
+# Une suite de lettres, et rien d'autre : « ABAAB », « a, b, a », une lettre
+# par ligne. A et B seulement : un C appelle une explication, qu'une suite ne
+# porte pas.
+_SUITE = re.compile(r"[abAB\s,;/.\-–]+")
+_LETTRE = re.compile(r"[abAB]")
+
+
+def sequence_choices(text: str, mapping_size: int) -> tuple[list[DigestDecision], str]:
+    """Une suite de lettres décide les dossiers dans l'ordre du récapitulatif.
+
+    Sur un téléphone, cocher entre deux crochets est pénible ; écrire « ABAAB »
+    ne l'est pas. La n-ième lettre décide le n-ième dossier, et l'ordre est
+    tout : c'est pourquoi une suite plus longue que la liste ne décide rien et
+    le dit, quand une suite plus courte décide les premiers seulement.
+
+    Deux lettres au moins : une lettre seule, quand plusieurs dossiers
+    attendent, ne dit pas duquel elle parle.
+
+    Rend les décisions, ou une phrase à redire quand la suite ne colle pas.
+    """
+    brut = (text or "").strip()
+    if not brut or _SUITE.fullmatch(brut) is None:
+        return [], ""
+    lettres = _LETTRE.findall(brut)
+    if len(lettres) < 2:
+        return [], ""
+    if len(lettres) > mapping_size:
+        return [], (
+            f"J’ai lu {len(lettres)} lettres pour {mapping_size} message(s) "
+            "en attente : je n’ai rien décidé, l’ordre compte. Écris une lettre "
+            "par message, dans l’ordre de ma liste."
+        )
+    return [
+        DigestDecision(numero, lettre.upper(), "")
+        for numero, lettre in enumerate(lettres, start=1)
+    ], ""
+
+
 def parse_digest_reply(text: str) -> list[DigestDecision]:
     """Lit les couples numéro/lettre d'une réponse, dans l'ordre où ils viennent.
 
@@ -206,12 +257,14 @@ def read_reply(
 ) -> BallotReading:
     """Tout ce qu'une réponse décide, quelle que soit la forme employée.
 
-    Trois formes coexistent, et l'ordre entre elles n'est pas arbitraire :
+    Quatre formes coexistent, et l'ordre entre elles n'est pas arbitraire :
 
     - ce qui est écrit au-dessus de la citation vient en dernier dans le temps,
       donc en premier ici : c'est là que se corrige une croix déjà posée ;
     - les cases cochées viennent ensuite, pour les dossiers dont rien n'a été
       dit ailleurs ;
+    - la suite de lettres ne vaut que si rien d'autre n'a décidé : elle ne
+      contredit jamais une croix posée ;
     - la lettre seule ne vaut que si un seul dossier attend : sinon personne ne
       sait de quoi elle parle.
     """
@@ -219,38 +272,75 @@ def read_reply(
     deja = {value.number for value in decisions}
     bulletin = parse_ballot(full_text, reference)
     decisions.extend(value for value in bulletin.decisions if value.number not in deja)
+    conflits = [value for value in bulletin.conflicts if value not in deja]
+    if not decisions and not conflits:
+        suite, note = sequence_choices(user_text, mapping_size)
+        if suite:
+            return BallotReading(suite, [], sequence=True)
+        if note:
+            return BallotReading([], [], note=note)
     if not decisions and mapping_size == 1:
-        seule = lone_choice(user_text)
+        # « À » seul est le « a » corrigé par un clavier français. Plié ici
+        # seulement : dans « 1 à 3 », la même lettre ne vaut pas A.
+        seule = lone_choice(fold_lone_accented_a(user_text))
         if seule is not None:
             decisions = [seule]
-    conflits = [value for value in bulletin.conflicts if value not in deja]
     return BallotReading(decisions, conflits)
 
 
+# Un dossier n'entre au récapitulatif qu'une fois son avis unitaire parti et
+# reposé. Le compte annoncé dans l'objet et la liste de la lettre viennent de
+# deux requêtes : elles portent la même condition, sinon l'objet promet trois
+# messages là où la lettre en montre deux.
+AVIS_MUR = """
+              SELECT 1 FROM smtp_actions sa
+              JOIN assistant_outbox ao ON ao.action_id=sa.id
+              WHERE sa.case_id=dc.id AND ao.status='sent'
+                AND coalesce(ao.sent_at, ao.created_at)
+                    < now() - ($QUIET * interval '1 hour')
+"""
+
+
 async def pending_cases(
-    pool: asyncpg.Pool[Any], participant: str, limit: int = MAX_ITEMS
+    pool: asyncpg.Pool[Any],
+    participant: str,
+    quiet_hours: int,
+    limit: int = MAX_ITEMS,
 ) -> list[asyncpg.Record]:
-    """Dossiers retenus dont l'avis est parti et qui attendent encore."""
+    """Dossiers dont l'avis est parti, reposé, et qui attendent encore."""
     return await pool.fetch(
         """
         SELECT m.id::text AS message_id, m.subject, m.from_header, m.captured_at,
-               dc.id AS case_id, c.id::text AS conversation_id
+               m.envelope_from, m.reply_to_header,
+               dc.id AS case_id, c.id::text AS conversation_id,
+               (
+                   SELECT jsonb_agg(to_jsonb(evidence) ORDER BY strength DESC,id)
+                   FROM (
+                       SELECT DISTINCT ON (cl.clue_code,cl.direction)
+                              cl.clue_code,cl.direction,cl.strength,
+                              cl.statement,cl.facts,cl.id
+                       FROM clues cl
+                       JOIN investigations i ON i.id=cl.investigation_id
+                       WHERE i.message_id=m.id
+                         AND cl.direction IN ('adverse','neutral')
+                       ORDER BY cl.clue_code,cl.direction,cl.strength DESC,cl.id
+                   ) evidence
+               ) AS evidence
         FROM messages m
         JOIN delivery_cases dc ON dc.message_id=m.id
         JOIN conversations c ON c.case_id=dc.id
         WHERE m.delivery_status='held'
           AND dc.state IN ('review_notice_pending','awaiting_reply')
           AND lower(c.participant_email)=lower($1)
-          AND EXISTS (
-              SELECT 1 FROM smtp_actions sa
-              JOIN assistant_outbox ao ON ao.action_id=sa.id
-              WHERE sa.case_id=dc.id AND ao.status='sent'
-          )
+          AND EXISTS ("""
+        + AVIS_MUR.replace("$QUIET", "$3")
+        + """)
         ORDER BY m.captured_at
         LIMIT $2
         """,
         participant,
         limit,
+        quiet_hours,
     )
 
 
@@ -260,11 +350,43 @@ def digest_items(rows: list[asyncpg.Record]) -> list[dict[str, object]]:
         {
             "number": number,
             "subject": str(row["subject"] or "(sans objet)")[:90],
-            "sender": str(row["from_header"] or "(expéditeur inconnu)")[:70],
+            "sender": str(
+                row["from_header"] or row.get("envelope_from") or "(expéditeur inconnu)"
+            ),
             "received": f"{row['captured_at']:%d/%m à %H:%M}",
+            **_digest_evidence(row),
         }
         for number, row in enumerate(rows, start=1)
     ]
+
+
+def _digest_evidence(row: asyncpg.Record) -> dict[str, object]:
+    """Les faits déjà observés, sans nouveau jugement ni appel au modèle."""
+    evidence = row.get("evidence") or []
+    if isinstance(evidence, str):
+        evidence = json.loads(evidence)
+    clues = [value for value in evidence if isinstance(value, dict)]
+    claimed, displayed = parseaddr(str(row["from_header"] or ""))
+    identities = []
+    if claimed:
+        identities.append(f"Identité annoncée : {claimed}")
+    if displayed:
+        identities.append(f"Adresse affichée : {displayed}")
+    adverse = [clue for clue in clues if clue.get("direction") == "adverse"]
+    card = identity_card(adverse)
+    if card and card.get("official"):
+        identities.append("Domaines officiels observés : " + " ou ".join(card["official"]))
+    addresses = sender_addresses(
+        row["from_header"], row.get("envelope_from"), row.get("reply_to_header")
+    )
+    return {
+        "identities": identities,
+        "addresses": addresses,
+        "concerns": short_points(adverse, 3),
+        "limits": plain_limits(
+            [clue for clue in clues if clue.get("direction") == "neutral"], 1
+        ),
+    }
 
 
 def new_reference() -> str:
@@ -321,17 +443,21 @@ async def send_daily_digests(
                 AND lower(a.payload->>'participant')=lower(c.participant_email)
                 AND a.created_at > now() - ($1 * interval '1 hour')
           )
+          AND EXISTS ("""
+        + AVIS_MUR.replace("$QUIET", "$3")
+        + """)
         GROUP BY 1
         HAVING count(*) >= $2
         """,
         settings.digest_interval_hours,
         settings.digest_minimum_cases,
+        settings.digest_quiet_hours,
     )
     identite = await instance_identity(pool, settings)
     sent = 0
     for row in participants:
         participant = str(row["participant"])
-        rows = await pending_cases(pool, participant)
+        rows = await pending_cases(pool, participant, settings.digest_quiet_hours)
         if not rows:
             continue
         mapping = {
@@ -441,8 +567,14 @@ def acknowledgement(
     question: str | None = None,
     needs_confirmation: list[tuple[DigestDecision, str]] | None = None,
     ambiguous: list[int] | None = None,
+    dangerous_numbers: set[int] | None = None,
 ) -> str:
-    """Dit ce qui a été fait, ce qui n'a pas été compris, et ce qui reste."""
+    """Dit ce qui a été fait, ce qui n'a pas été compris, et ce qui reste.
+
+    ``dangerous_numbers`` désigne les messages redemandés parce que le verdict
+    les classe dangereux, sans preuve matérielle : la phrase dit alors ce qui
+    est vrai, et non une preuve que le Code n'a pas retenue.
+    """
     lines: list[str] = []
     if applied:
         lines.append("C’est noté :")
@@ -463,13 +595,18 @@ def acknowledgement(
             ]
         )
     for decision, subject in needs_confirmation or []:
+        analyse = (
+            "le classe dangereux"
+            if decision.number in (dangerous_numbers or set())
+            else "retient une preuve matérielle de danger"
+        )
         lines.extend(
             [
                 "",
                 f"Je n’ai pas livré le {decision.number}. {subject[:70]}",
                 (
                     "J’ai cru comprendre que tu voulais le livrer, mais son "
-                    "analyse retient une preuve matérielle de danger. Si c’est "
+                    f"analyse {analyse}. Si c’est "
                     f"bien ce que tu veux, réponds simplement « {decision.number} A »."
                 ),
             ]
@@ -523,9 +660,16 @@ def residual_text(text: str, decisions: list[DigestDecision]) -> str:
     en silence — ce qui revient à perdre une décision de l'utilisateur — on le
     donne à comprendre au modèle.
     """
+    freeform_choices = " ".join(
+        f"{value.number} C : {value.detail}".strip()
+        for value in decisions
+        if value.choice == "C"
+    )
     rest = _DECISION.sub(" ", text or "")
     rest = re.sub(r"^\s*[-–—>|]+", " ", rest, flags=re.MULTILINE)
     rest = re.sub(r"\s+", " ", rest).strip()
+    if freeform_choices:
+        return " ".join(value for value in (freeform_choices, rest) if value).strip()
     if not rest:
         return ""
     known = {value.number for value in decisions}

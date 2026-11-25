@@ -16,8 +16,15 @@ from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 
+MAX_FORM_BODY_BYTES = 256 * 1024  # 256 KiB
+
+
 class OrigineRefusee(Exception):
     """Requête refusée : elle ne vient pas de la console."""
+
+
+class CorpsTropGrand(Exception):
+    """Corps de requête dépassant la taille maximale autorisée."""
 
 
 def expected_origins(host_header: str | None, configured: tuple[str, ...]) -> set[str]:
@@ -28,6 +35,57 @@ def expected_origins(host_header: str | None, configured: tuple[str, ...]) -> se
     if not host:
         return set()
     return {f"http://{host}", f"https://{host}"}
+
+
+def trusted_hosts(configured: tuple[str, ...]) -> set[str]:
+    """Hôtes (netloc en minuscules) déduits des origines de confiance."""
+    hosts: set[str] = set()
+    for origin in configured:
+        parts = urlsplit(origin.strip())
+        if parts.netloc:
+            hosts.add(parts.netloc.casefold())
+    return hosts
+
+
+def check_trusted_host(
+    headers: Mapping[str, str],
+    configured: tuple[str, ...] = (),
+    *,
+    path: str = "",
+    peer: str | None = None,
+) -> None:
+    """Refuse un en-tête ``Host`` hors des origines de confiance configurées.
+
+    Quand ``ADMIN_TRUSTED_ORIGINS`` est vide (tests, développement local),
+    aucune restriction supplémentaire n'est appliquée. En production, toute
+    requête portant un ``Host`` interne (ex. ``admin:8093`` depuis ``data_net``)
+    est rejetée, à l'exception du contrôle de santé ``/sante`` depuis la boucle
+    locale du conteneur.
+    """
+    if not configured:
+        return
+    if path == "/sante" and (peer or "").strip() in {"127.0.0.1", "::1"}:
+        return
+    lowered = {key.casefold(): value for key, value in headers.items()}
+    host = lowered.get("host", "").strip().casefold()
+    if not host or host not in trusted_hosts(configured):
+        raise OrigineRefusee("L'hôte de la requête n'est pas autorisé.")
+
+
+def check_content_length(
+    headers: Mapping[str, str], max_bytes: int = MAX_FORM_BODY_BYTES
+) -> None:
+    """Lève ``CorpsTropGrand`` si ``Content-Length`` dépasse ``max_bytes``."""
+    lowered = {key.casefold(): value for key, value in headers.items()}
+    raw = lowered.get("content-length", "").strip()
+    if not raw:
+        return
+    try:
+        length = int(raw)
+    except ValueError:
+        return
+    if length > max_bytes:
+        raise CorpsTropGrand("Le formulaire envoyé est trop volumineux.")
 
 
 def _origin_of(value: str) -> str:
@@ -61,7 +119,11 @@ def check_same_origin(
     raise OrigineRefusee("L'origine de la requête n'est pas vérifiable.")
 
 
-def parse_form(content_type: str | None, body: bytes) -> dict[str, str]:
+def parse_form(
+    content_type: str | None,
+    body: bytes,
+    max_bytes: int = MAX_FORM_BODY_BYTES,
+) -> dict[str, str]:
     """Lit un formulaire urlencodé, et rien d'autre.
 
     Refuser les autres types coupe la voie du formulaire inter-site en
@@ -69,6 +131,8 @@ def parse_form(content_type: str | None, body: bytes) -> dict[str, str]:
     """
     from urllib.parse import parse_qsl
 
+    if len(body) > max_bytes:
+        raise CorpsTropGrand("Le formulaire envoyé est trop volumineux.")
     media_type = (content_type or "").split(";", 1)[0].strip().casefold()
     if media_type != "application/x-www-form-urlencoded":
         raise OrigineRefusee("Ce formulaire n'a pas été envoyé par la console.")

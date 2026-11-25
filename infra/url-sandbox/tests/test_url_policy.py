@@ -20,6 +20,7 @@ from url_policy import BlockedUrlError, resolve_global_addresses, validate_url
         "http://[fec0::1]/",
         "http://[2002:7f00:1::1]/",
         "http://[64:ff9b::7f00:1]/",
+        "http://[64:ff9b::e000:1]/",
     ],
 )
 async def test_rejects_non_global_ipv4_ipv6_and_embedded_addresses(url: str) -> None:
@@ -52,6 +53,31 @@ async def test_accepts_global_ipv4_and_ipv6_literals(url: str, expected: str) ->
 )
 def test_rejects_schemes_credentials_and_ambiguous_hosts(url: str) -> None:
     with pytest.raises(BlockedUrlError):
+        validate_url(url)
+
+
+def test_spaces_in_path_and_query_are_percent_encoded() -> None:
+    target = validate_url(
+        "https://example.com/Home Improvement?SearchText=Home Improvement"
+    )
+    assert target.url == (
+        "https://example.com/Home%20Improvement?SearchText=Home%20Improvement"
+    )
+    assert target.request_target == (
+        "/Home%20Improvement?SearchText=Home%20Improvement"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://exa mple.com/path",
+        "https://example.com\t/path",
+        "https://example.com/path\r\nHost:internal",
+    ],
+)
+def test_authority_and_control_characters_remain_rejected(url: str) -> None:
+    with pytest.raises(BlockedUrlError, match="invalid_characters"):
         validate_url(url)
 
 

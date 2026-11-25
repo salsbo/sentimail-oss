@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import unittest
 
 from sentimail_v3.conversation.review_notice import render_notice_html
@@ -8,50 +7,45 @@ from sentimail_v3.conversation.review_notice import render_notice_html
 BASE = {
     "subject": "Facture N°54847120",
     "sender": "compta@exemple.fr",
+    "status_text": "L’email ci-dessous n’a pas été livré.",
     "concerns": ["Le domaine ne correspond pas."],
-    "reassurances": [],
-    "decision": "Je préfère te demander.",
+    "badge": {
+        "word": "DOUTEUX",
+        "detail": "1 écart relevé",
+        "color": "#b45309",
+        "cid": "sm-indice-doubt",
+    },
     "action_address": "maia@sentinel.mondomaine.example",
 }
 
 
-class BandeauTests(unittest.TestCase):
-    """Le bandeau dit ce qui s'est passé et ce qu'on attend de toi.
+class SansBandeauTests(unittest.TestCase):
+    """La fiche utile remplace entièrement l'ancien bandeau."""
 
-    « Il attend ta réponse » laissait croire que le message répondrait de
-    lui-même. Ce qu'on attend est une directive, et c'est la première ligne
-    lue : elle doit être la plus grosse.
-    """
+    def test_le_statut_et_l_ancien_expediteur_disparaissent(self) -> None:
+        html = render_notice_html(dict(BASE))
+        for absent in (BASE["status_text"], BASE["sender"]):
+            self.assertNotIn(absent, html)
 
-    def _html(self, statut: str) -> str:
-        return render_notice_html({**BASE, "status_text": statut})
+    def test_le_sujet_revient_dans_les_informations(self) -> None:
+        """L'objet reste en tête des métadonnées pour reconnaître le message."""
+        html = render_notice_html(dict(BASE))
+        self.assertIn(BASE["subject"], html)
+        self.assertLess(html.index("Objet"), html.index(BASE["subject"]))
 
-    def test_le_statut_de_retenue_est_le_nouveau_texte(self) -> None:
-        from sentimail_v3.conversation.conversation import HOLD_STATUS_TEXT
+    def test_l_indice_est_le_premier_bloc_visible(self) -> None:
+        html = render_notice_html(dict(BASE))
+        self.assertLess(
+            html.index("ACTION REQUISE · MESSAGE RETENU"), html.index("Objet")
+        )
+        self.assertLess(html.index("DOUTEUX"), html.index("Pourquoi j&#x27;hésite"))
 
-        self.assertIn("n’a pas été livré", HOLD_STATUS_TEXT)
-        self.assertIn("directives", HOLD_STATUS_TEXT)
-        self.assertNotIn("il attend ta réponse", HOLD_STATUS_TEXT)
-
-    def test_le_bandeau_est_plus_gros_que_le_reste(self) -> None:
-        from sentimail_v3.conversation.conversation import HOLD_STATUS_TEXT
-
-        html = self._html(HOLD_STATUS_TEXT)
-        bloc = re.search(r'<div style="background:#[0-9a-f]{6};color:#ffffff;[^"]*"', html)
-        self.assertIsNotNone(bloc, "bandeau introuvable")
-        taille = re.search(r"font-size:(\d+)px", bloc.group(0))
-        self.assertIsNotNone(taille, "aucune taille sur le bandeau")
-        self.assertGreaterEqual(int(taille.group(1)), 18)
-
-    def test_la_couleur_d_alerte_suit_le_nouveau_texte(self) -> None:
-        # Le bandeau change de couleur selon que le message est retenu ou non :
-        # la détection se fait sur le texte, elle doit suivre sa reformulation.
-        from sentimail_v3.conversation.conversation import HOLD_STATUS_TEXT
-
-        retenu = self._html(HOLD_STATUS_TEXT)
-        livre = self._html("Ce message t’a été livré ; ta réponse me sert à mieux faire.")
-        self.assertIn("#b45309", retenu)
-        self.assertIn("#15803d", livre)
+    def test_un_ancien_statut_livre_ne_change_plus_la_presentation(self) -> None:
+        retenu = render_notice_html(dict(BASE))
+        livre = render_notice_html(
+            {**BASE, "status_text": "Ce message t’a été livré."}
+        )
+        self.assertEqual(retenu, livre)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import re
 import unittest
 
 from sentimail_v3.conversation.junk_notice import render_junk_html
 from sentimail_v3.conversation.review_notice import (
     PREVIEW_CID,
-    capture_block,
     render_notice_html,
 )
 
@@ -15,8 +13,10 @@ RETENU = {
     "sender": "Espace Client <facturation@exemple.test>",
     "status_text": "Ce message n’a pas été livré : il attend ta réponse.",
     "concerns": ["Le domaine ne correspond pas à la marque annoncée."],
-    "reassurances": ["L’expéditeur est authentifié."],
-    "decision": "Je préfère te demander.",
+    "badge": {
+        "level": "danger", "word": "DANGEREUX", "color": "#b91c1c",
+        "detail": "1 écart relevé", "cid": "sm-indice-danger",
+    },
     "action_address": "maia@sentinel.mondomaine.example",
     "has_preview": True,
 }
@@ -31,77 +31,64 @@ CLASSE = {
 }
 
 
-class MemeModeleTests(unittest.TestCase):
-    """Les deux avis doivent se lire de la même façon.
+class DeuxUsagesTests(unittest.TestCase):
+    """Les deux avis montrent la même photo, au même endroit du récit."""
 
-    Un message retenu et un message classé posent la même question à la même
-    personne. Deux mises en page différentes obligent à réapprendre où
-    regarder, alors que seule la décision change.
-    """
+    def test_les_deux_avis_montrent_la_capture(self) -> None:
+        retenu = render_notice_html(dict(RETENU))
+        classe = render_junk_html(dict(CLASSE))
+        self.assertIn(f'src="cid:{PREVIEW_CID}"', retenu)
+        self.assertIn(f'src="cid:{PREVIEW_CID}"', classe)
 
-    def test_les_deux_montrent_la_capture_dans_le_corps(self) -> None:
-        for rendu, nom in ((render_notice_html(dict(RETENU)), "retenu"),
-                           (render_junk_html(dict(CLASSE)), "classé")):
-            with self.subTest(avis=nom):
-                self.assertIn(f'src="cid:{PREVIEW_CID}"', rendu)
+    def test_l_avis_classe_tient_a_l_identite_l_objet_et_la_raison(self) -> None:
+        classe = render_junk_html(dict(CLASSE))
+        self.assertIn(">De<", classe)
+        self.assertIn(">Objet<", classe)
+        self.assertIn(">Motifs</div>", classe)
 
-    def test_le_bloc_de_capture_est_le_meme(self) -> None:
-        # Un seul endroit le dessine : deux copies divergeraient.
-        motif = re.compile(
-            r'<div style="[^"]*"><img src="cid:[^"]+"[^>]*/>'
-            r'<div style="[^"]*">[^<]*</div></div>'
-        )
-        retenu = motif.search(render_notice_html(dict(RETENU)))
-        classe = motif.search(render_junk_html(dict(CLASSE)))
-        self.assertIsNotNone(retenu)
-        self.assertIsNotNone(classe)
-        self.assertEqual(retenu.group(0), classe.group(0))
-
-    def test_aucun_des_deux_ne_parle_de_piece_jointe(self) -> None:
-        for rendu, nom in ((render_notice_html(dict(RETENU)), "retenu"),
-                           (render_junk_html(dict(CLASSE)), "classé")):
-            with self.subTest(avis=nom):
-                self.assertNotIn("pièce jointe", rendu)
+    def test_sans_capture_pleine_aucun_avis_ne_parle_de_piece_jointe(self) -> None:
+        self.assertNotIn("pièce jointe", render_notice_html(dict(RETENU)))
+        self.assertNotIn("pièce jointe", render_junk_html(dict(CLASSE)))
 
 
-class PlaceDeLaCaptureTests(unittest.TestCase):
-    """La photo vient après l'en-tête et avant l'explication."""
+class OrdreDesBlocsTests(unittest.TestCase):
+    """L'état en tête, puis les métadonnées, les motifs, la photo et les boutons."""
 
-    def test_dans_l_avis_retenu_elle_precede_les_colonnes(self) -> None:
+    def test_dans_l_avis_retenu_l_indice_precede_les_ecarts(self) -> None:
         rendu = render_notice_html(dict(RETENU))
-        self.assertLess(rendu.index("cid:"), rendu.index("Ce qui me gêne"))
+        self.assertLess(rendu.index("DANGEREUX"), rendu.index("Pourquoi j&#x27;hésite"))
 
-    def test_dans_l_avis_classe_elle_precede_la_raison(self) -> None:
+    def test_dans_l_avis_retenu_la_photo_precede_les_ecarts(self) -> None:
+        rendu = render_notice_html(dict(RETENU))
+        self.assertLess(rendu.index("Pourquoi j&#x27;hésite"), rendu.index(PREVIEW_CID))
+        self.assertLess(rendu.index(PREVIEW_CID), rendu.index('data-choice="A"'))
+
+    def test_dans_l_avis_retenu_le_sujet_est_dans_les_informations(self) -> None:
+        rendu = render_notice_html(dict(RETENU))
+        self.assertIn(str(RETENU["subject"]), rendu)
+
+    def test_dans_l_avis_classe_la_photo_precede_la_raison(self) -> None:
         rendu = render_junk_html(dict(CLASSE))
-        self.assertLess(rendu.index("cid:"), rendu.index("Pourquoi je l’ai classé"))
+        self.assertLess(rendu.index(">Motifs</div>"), rendu.index(PREVIEW_CID))
+        self.assertLess(rendu.index(PREVIEW_CID), rendu.index('data-choice="A"'))
 
-    def test_dans_l_avis_classe_elle_suit_l_expediteur(self) -> None:
+    def test_dans_l_avis_classe_l_expediteur_precede_la_raison(self) -> None:
         rendu = render_junk_html(dict(CLASSE))
-        self.assertLess(rendu.index("Promo"), rendu.index("cid:"))
+        self.assertLess(rendu.index("Promo"), rendu.index(">Motifs</div>"))
 
 
-class MiniatureTests(unittest.TestCase):
-    """Une miniature, pas une pleine page."""
+class AbsenceDeCaptureTests(unittest.TestCase):
+    """Un rendu impossible ne laisse jamais d'image cassée."""
 
-    def test_la_capture_occupe_la_moitie_de_la_largeur(self) -> None:
-        self.assertIn("width:50%", capture_block(True))
-
-    def test_la_capture_est_cerclee_de_rouge(self) -> None:
-        # Sans cadre, la miniature se lit comme une illustration de l'avis.
-        # Entourée, elle se lit comme ce dont l'avis parle.
-        bloc = capture_block(True)
-        self.assertIn("border:2px solid #dc2626", bloc)
-
-    def test_le_cadre_est_legende(self) -> None:
-        self.assertIn("Le message dont je te parle", capture_block(True))
-
-    def test_sans_capture_aucun_bloc_n_est_produit(self) -> None:
-        self.assertEqual(capture_block(False), "")
-
-    def test_sans_capture_l_avis_classe_le_dit(self) -> None:
+    def test_l_avis_classe_sans_capture_n_en_parle_pas(self) -> None:
         rendu = render_junk_html(dict(CLASSE, has_preview=False))
         self.assertNotIn("cid:", rendu)
-        self.assertIn("photographier", rendu)
+        self.assertNotIn("photographier", rendu)
+
+    def test_l_avis_retenu_sans_capture_n_en_parle_pas(self) -> None:
+        rendu = render_notice_html(dict(RETENU, has_preview=False))
+        self.assertNotIn(PREVIEW_CID, rendu)
+        self.assertNotIn("Le message dont je te parle", rendu)
 
 
 if __name__ == "__main__":

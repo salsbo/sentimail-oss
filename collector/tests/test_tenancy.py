@@ -110,6 +110,49 @@ class TenancyIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self._enrol("late.tenancy.test", "active")
         self.assertTrue(await is_protected(self.pool, "a@late.tenancy.test"))
 
+    async def test_same_client_accepts_only_the_same_mailbox_across_domains(self) -> None:
+        await self._enrol("first.tenancy.test", "active")
+        await self._enrol("second.tenancy.test", "active")
+        first_client = await self.pool.fetchval(
+            "SELECT client_id FROM domains WHERE fqdn='first.tenancy.test'"
+        )
+        await self.pool.execute(
+            "UPDATE domains SET client_id=$1 WHERE fqdn='second.tenancy.test'",
+            first_client,
+        )
+        self.assertTrue(
+            await self.pool.fetchval(
+                "SELECT sentimail_same_client_mailbox($1,$2)",
+                "camille@first.tenancy.test",
+                "camille@second.tenancy.test",
+            )
+        )
+        self.assertFalse(
+            await self.pool.fetchval(
+                "SELECT sentimail_same_client_mailbox($1,$2)",
+                "camille@first.tenancy.test",
+                "elisabeth@second.tenancy.test",
+            )
+        )
+
+    async def test_sender_rules_span_every_domain_of_the_client(self) -> None:
+        await self._enrol("rules-a.tenancy.test", "active")
+        await self._enrol("rules-b.tenancy.test", "active")
+        client_id = await self.pool.fetchval(
+            "SELECT client_id FROM domains WHERE fqdn='rules-a.tenancy.test'"
+        )
+        await self.pool.execute(
+            "UPDATE domains SET client_id=$1 WHERE fqdn='rules-b.tenancy.test'",
+            client_id,
+        )
+        self.assertTrue(
+            await self.pool.fetchval(
+                "SELECT sentimail_same_client($1,$2)",
+                "one@rules-a.tenancy.test",
+                "two@rules-b.tenancy.test",
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

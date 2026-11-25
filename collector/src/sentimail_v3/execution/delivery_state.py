@@ -24,21 +24,27 @@ DEFERRED = "deferred"
 DELIVERED = "delivered"
 CONSUMED = "consumed"
 UNDELIVERABLE = "undeliverable"
+SUPPRESSED = "suppressed"
 
 # Un message livré ou consommé ne revient pas en arrière : la boîte du
 # destinataire ne se reprend pas, et une réponse SMTP n'est pas un dossier.
 # Un message sans destinataire non plus : le relais final a refusé l'adresse
 # de façon définitive, aucune tentative ultérieure ne la fera exister.
-TERMINAL = frozenset({DELIVERED, CONSUMED, UNDELIVERABLE})
+TERMINAL = frozenset({DELIVERED, CONSUMED, UNDELIVERABLE, SUPPRESSED})
 
 ORIGINS: dict[str, tuple[str, ...]] = {
     ANALYZING: (CAPTURED, ANALYZING),
-    HELD: (CAPTURED, ANALYZING, HELD),
+    # Une livraison dont le courrier n'a pas pu être composé revient à la
+    # retenue. Seul release_original le fait, avant tout envoi, pour un message
+    # que le Code tient pour dangereux. Les deux autres chemins vers HELD, dans
+    # la conversation, sortent avant pour un message en release_pending.
+    HELD: (CAPTURED, ANALYZING, HELD, RELEASE_PENDING),
     RELEASE_PENDING: (CAPTURED, ANALYZING, HELD, DEFERRED),
     DEFERRED: (CAPTURED, ANALYZING, RELEASE_PENDING, DEFERRED),
     DELIVERED: (CAPTURED, ANALYZING, HELD, RELEASE_PENDING, DEFERRED),
     CONSUMED: (CAPTURED, ANALYZING),
     UNDELIVERABLE: (CAPTURED, ANALYZING, HELD, RELEASE_PENDING, DEFERRED),
+    SUPPRESSED: (CAPTURED, ANALYZING, HELD),
 }
 
 
@@ -72,7 +78,7 @@ async def move(
         """
         UPDATE messages
         SET delivery_status=$2,
-            delivered_at=CASE WHEN $2 IN ('delivered','consumed')
+            delivered_at=CASE WHEN $2 IN ('delivered','consumed','suppressed')
                               THEN now() ELSE delivered_at END,
             delivery_attempts=CASE WHEN $2='release_pending'
                                    THEN delivery_attempts + 1

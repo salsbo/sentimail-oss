@@ -10,6 +10,7 @@ aucune de ces requêtes.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any, NamedTuple
 
 
@@ -21,26 +22,56 @@ class Query(NamedTuple):
 # --- Domaines protégés ------------------------------------------------------
 
 DOMAIN_COLUMNS = (
-    "id, fqdn, status, admin_email, verification_token, "
+    "id, fqdn, status, admin_email, verification_token, client_id, "
     "verified_at, created_at, updated_at"
 )
 
 
 def list_domains() -> Query:
     return Query(
-        f"SELECT {DOMAIN_COLUMNS} FROM domains ORDER BY (status = 'active') DESC, fqdn",
+        "SELECT d.id,d.fqdn,d.status,d.admin_email,d.verification_token,"
+        "d.client_id,c.name AS client_name,d.verified_at,d.created_at,d.updated_at "
+        "FROM domains d JOIN clients c ON c.id=d.client_id "
+        "ORDER BY (d.status = 'active') DESC, d.fqdn",
         (),
     )
 
 
-def insert_domain(fqdn: str, admin_email: str | None) -> Query:
+def list_clients() -> Query:
+    return Query(
+        "SELECT c.id,c.name,count(d.id) AS domain_count "
+        "FROM clients c LEFT JOIN domains d ON d.client_id=c.id "
+        "GROUP BY c.id,c.name ORDER BY lower(c.name)",
+        (),
+    )
+
+
+def insert_client(name: str) -> Query:
+    return Query(
+        "INSERT INTO clients(name) VALUES ($1) "
+        "ON CONFLICT (lower(name)) DO NOTHING RETURNING id,name",
+        (name,),
+    )
+
+
+def assign_domain_client(domain_id: str, client_id: str) -> Query:
+    return Query(
+        "UPDATE domains d SET client_id=c.id,updated_at=now() FROM clients c "
+        "WHERE d.id=$1 AND c.id=$2 RETURNING d.fqdn,d.client_id",
+        (domain_id, client_id),
+    )
+
+
+def insert_domain(
+    fqdn: str, admin_email: str | None, client_id: str | None = None
+) -> Query:
     """Ajout d'un domaine. Il naît en attente : l'activation est un geste à part."""
     return Query(
-        "INSERT INTO domains (fqdn, status, admin_email) "
-        "VALUES ($1, 'pending', $2) "
+        "INSERT INTO domains (fqdn, status, admin_email, client_id) "
+        "VALUES ($1, 'pending', $2, $3) "
         "ON CONFLICT (fqdn) DO NOTHING "
         f"RETURNING {DOMAIN_COLUMNS}",
-        (fqdn, admin_email),
+        (fqdn, admin_email, client_id),
     )
 
 
@@ -69,7 +100,38 @@ def suspend_domain(domain_id: str) -> Query:
     )
 
 
+def is_domain_unverified(domain_id: str) -> Query:
+    """Indique si un domaine existe encore sans vérification DNS."""
+    return Query(
+        "SELECT verified_at IS NULL FROM domains WHERE id = $1",
+        (domain_id,),
+    )
+
+
 # --- État d'exploitation ----------------------------------------------------
+
+
+def health_check() -> Query:
+    """Sonde minimale de disponibilité PostgreSQL."""
+    return Query("SELECT 1", ())
+
+
+def pipeline_health() -> Query:
+    """Dernier relevé du pipeline de bout en bout écrit par le superviseur."""
+    return Query(
+        "SELECT details, observed_at FROM operational_status "
+        "WHERE component = $1",
+        ("sentimail-v3",),
+    )
+
+
+def supervisor_health() -> Query:
+    """Dernier verdict complet du superviseur."""
+    return Query(
+        "SELECT status, details, observed_at FROM operational_status "
+        "WHERE component = $1",
+        ("sentimail-v3",),
+    )
 
 
 def operational_status() -> Query:
@@ -149,6 +211,10 @@ def learning_participants() -> Query:
     )
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def participant_policies(
     participant_email: str, recherche: str = "", limit: int = 200
 ) -> Query:
@@ -157,10 +223,10 @@ def participant_policies(
         "SELECT scope, value_normalized, action, active, source, "
         "created_at, updated_at, count(*) OVER () AS total "
         "FROM sender_policies "
-        "WHERE lower(participant_email) = $1 "
-        "  AND ($2 = '' OR value_normalized ILIKE '%' || $2 || '%') "
+        "WHERE sentimail_same_client(participant_email,$1) "
+        "  AND ($2 = '' OR value_normalized ILIKE '%' || $2 || '%' ESCAPE '\\') "
         "ORDER BY active DESC, action, value_normalized LIMIT $3",
-        (participant_email, recherche, limit),
+        (participant_email, _escape_like(recherche), limit),
     )
 
 
@@ -168,7 +234,8 @@ def participant_labels(participant_email: str, limit: int) -> Query:
     return Query(
         "SELECT label, source, sender_normalized, subject, confidence, "
         "active, created_at FROM labels "
-        "WHERE lower(participant_email) = $1 AND is_ground_truth = true "
+        "WHERE sentimail_same_client(participant_email,$1) "
+        "AND is_ground_truth = true "
         "ORDER BY created_at DESC LIMIT $2",
         (participant_email, limit),
     )
@@ -285,7 +352,7 @@ def set_role_provider(
     model: str,
     token_limit_param: str,
     secret_filename: str,
-    body_extras: dict[str, object],
+    body_extras: Mapping[str, object],
     actor: str,
 ) -> Query:
     """Enregistre le moteur d'un rôle. La clé vit sur disque, jamais ici.
@@ -310,7 +377,7 @@ def set_role_provider(
         "RETURNING role, provider, model_name",
         (
             role, provider, base_url, model, token_limit_param, secret_filename,
-            json.dumps(body_extras or {}, sort_keys=True), actor,
+            json.dumps(dict(body_extras) if body_extras else {}, sort_keys=True), actor,
         ),
     )
 
@@ -370,11 +437,11 @@ def list_hostile_sources(recherche: str = "") -> Query:
         "  WHEN last_seen > now() - interval '30 days' THEN 'surveillee' "
         "  ELSE 'expiree' END AS etat "
         "FROM hostile_smtp_sources "
-        "WHERE $1 = '' OR ip::text ILIKE '%' || $1 || '%' "
-        "   OR last_reason ILIKE '%' || $1 || '%' "
-        "   OR coalesce(rdns, '') ILIKE '%' || $1 || '%' "
+        "WHERE $1 = '' OR ip::text ILIKE '%' || $1 || '%' ESCAPE '\\' "
+        "   OR last_reason ILIKE '%' || $1 || '%' ESCAPE '\\' "
+        "   OR coalesce(rdns, '') ILIKE '%' || $1 || '%' ESCAPE '\\' "
         "ORDER BY hits DESC, last_seen DESC LIMIT 500",
-        (recherche,),
+        (_escape_like(recherche),),
     )
 
 
@@ -499,4 +566,26 @@ def acknowledge_discrepancy(discrepancy_id: str, who: str) -> Query:
         "UPDATE discrepancies SET acknowledged_at = now(), acknowledged_by = $2 "
         "WHERE id = $1::uuid AND acknowledged_at IS NULL RETURNING id::text",
         (discrepancy_id, who),
+    )
+
+
+# --- Revues du classifieur local ---------------------------------------------
+
+
+def submit_classifier_review(
+    review_id: Any,
+    label: str,
+    reason_code: str,
+    operator: str,
+) -> Query:
+    """Soumet une qualification de revue si la file est ouverte et le contenu encore présent."""
+    return Query(
+        "UPDATE classifier_review_queue q SET "
+        "status='submitted',label=$2,reason_code=$3,operator=$4,submitted_at=now() "
+        "WHERE id=$1 AND status='queued' AND EXISTS ("
+        "  SELECT 1 FROM training_samples t JOIN messages m ON m.id=t.message_id "
+        "  WHERE t.id=q.sample_id AND (coalesce(m.body_text,'')<>'' OR coalesce(m.body_html,'')<>'' "
+        "    OR EXISTS(SELECT 1 FROM external_analyses e WHERE e.message_id=m.id "
+        "              AND coalesce(e.result->>'extracted_text','')<>''))) RETURNING id",
+        (review_id, label, reason_code, operator),
     )

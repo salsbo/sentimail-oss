@@ -1,50 +1,97 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import logging
 import re
 import statistics
+from collections.abc import Callable
 from datetime import datetime, timezone
-from email import policy
 from email.message import EmailMessage
-from email.parser import BytesParser
 from email.utils import parseaddr
-from html.parser import HTMLParser
+from time import monotonic
+from types import SimpleNamespace
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 
 import asyncpg
 import httpx
-import tldextract
 
-from sentimail_v3.code.attachment_facts import attachment_clues
-from sentimail_v3.code.correlation import correlations
-from sentimail_v3.execution.campaign_memory import match_campaign
-from sentimail_v3.observation.parser import parse_message
-from sentimail_v3.llm import provider_chat_json
-from types import SimpleNamespace
-
-from sentimail_v3.observation.deep_hooks import DEEP_HOOKS, run_deep_hooks
 from sentimail_v3.code.activity_coherence import (
     COHERENCE_PROMPT,
     coherence_clue,
     coherence_question,
     should_ask,
 )
-from sentimail_v3.code.sender_site import (
-    activity_registers,
-    is_interstitial,
-)
+from sentimail_v3.code.attachment_facts import attachment_clues
+from sentimail_v3.code.correlation import correlations, identity_facts
+from sentimail_v3.code.mail_profile import crowd_mailbox_domain, profile_history
 from sentimail_v3.code.organisation import (
     nameserver_signature,
     organisation_signature,
     same_organisation_destinations,
 )
-from sentimail_v3.config import Settings
-from sentimail_v3.crypto import load_key, reveal
 from sentimail_v3.code.reference import nommer_dossier
+from sentimail_v3.code.sender_identity import read_proven_identity
+from sentimail_v3.code.sender_policy import authenticated_hold
+from sentimail_v3.code.sender_site import (
+    activity_registers,
+    is_interstitial,
+)
+from sentimail_v3.code.opaque_landing import is_opaque_landing
+from sentimail_v3.code.verification_gate import is_fake_verification_gate
+from sentimail_v3.observation.attachment_text import attachment_text_signals
+from sentimail_v3.config import Settings
+from sentimail_v3.conversation.review_preferences import asks_only_on_real_doubt
+from sentimail_v3.crypto import load_key, reveal
+from sentimail_v3.execution.campaign_memory import match_campaign
+from sentimail_v3.llm import provider_chat_json
+from sentimail_v3.observation.deep_hooks import DEEP_HOOKS, run_deep_hooks
+from sentimail_v3.observation.domain_age import domain_age
+from sentimail_v3.observation.html_destinations import (
+    BASE_URLS,
+    MAX_URLS,
+    TRANSIENT_URL_ERRORS,
+    URLS_PER_APEX,
+    _GENERIC_LINK_LABEL,
+    _HtmlDestinations,
+    _PRIMARY_ACTION_LINK_TEXT,
+    _SECONDARY_LINK_TEXT,
+    _SENSITIVE_QUERY_KEYS,
+    _SIDE_EFFECT_LINK_TEXT,
+    _SINGLE_USE_PATH,
+    _TEXT_URL,
+    _VISIBLE_DOMAIN,
+    _apex,
+    _bounded,
+    _candidate_apex,
+    _candidate_group_key,
+    _candidate_priority,
+    _contextualize_equivalent_url_limits,
+    _decoded_part_text,
+    _diverse_order,
+    _explained_authenticated_redirect_limit,
+    _explained_authenticated_same_apex_fetch_error,
+    _extract,
+    _is_definitive_target_failure,
+    _message_url_candidates,
+    _normalized_link_label,
+    _plain_link_label,
+    _representative_candidates,
+    _select_url_candidates,
+    _url_summary,
+    is_navigation_failure,
+    is_single_use_or_side_effect_url,
+    is_transient_url_error,
+)
+from sentimail_v3.observation.observation_cache import observation_fingerprint, load_observation, save_observation
+from sentimail_v3.observation.visible_content import VISIBLE_CONTENT_VERSION
+from sentimail_v3.postgres_values import pg_jsonsafe, pg_text
+from sentimail_v3.observation.dossier.hooks.bruit_dans_les_mots import sans_bruit
+from sentimail_v3.observation.dossier.hooks.visible_text import readable_text
+from sentimail_v3.observation.parser import parse_email, is_attachment_part, parse_message
 
 _LOGGER = logging.getLogger("sentimail-v3-deep-analysis")
 
@@ -67,104 +114,23 @@ def _log(event: str, **fields: object) -> None:
         )
     )
 
-BASE_URLS = 20
-MAX_URLS = 40
-URLS_PER_APEX = 2
-# Délais du sandbox : ils décrivent le réseau, pas la destination. Ils méritent
-# une seconde tentative avant d'être retenus comme une inspection manquante.
-TRANSIENT_URL_ERRORS = frozenset({"hop_timeout", "sandbox_total_timeout"})
 MAX_ATTACHMENTS = 10
+MAX_IMAGE_ATTACHMENTS = 100
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_ATTACHMENTS_SECONDS = 120
+# « image/x-png » et « image/jpg » ne sont pas des types enregistrés, mais des
+# expéditeurs authentifiés les déclarent encore. Absents d'ici, leurs images
+# comptaient comme documents : au-delà de la dixième, plus d'inspection, et
+# le message était retenu (trois lettres d'un même fournisseur, octobre 2026).
+RASTER_IMAGE_TYPES = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp",
+    "image/tiff", "image/avif", "image/x-icon", "image/vnd.microsoft.icon",
+    "image/x-png", "image/jpg",
+})
 # En deçà de cet âge, une destination inter-apex reste suspecte même sous
 # authentification : les newsletters légitimes renvoient vers des apex établis,
 # pas vers un domaine enregistré la veille.
 FRESH_DESTINATION_DAYS = 30
-_extract = tldextract.TLDExtract(suffix_list_urls=())
-_SINGLE_USE_PATH = re.compile(
-    r"(?:^|[/_.-])(otp|one[-_]?time|magic[-_]?link|verify|verification|confirm|"
-    r"confirmation|activate|activation|reset|recover|unsubscribe|oneclick|callback)(?:$|[/_.-])",
-    re.IGNORECASE,
-)
-_SENSITIVE_QUERY_KEYS = {
-    "code", "key", "nonce", "otp", "password_reset", "reset_token", "ticket",
-    "token", "unsubscribe", "verification", "verify",
-}
-_TEXT_URL = re.compile(r"https?://[^\s<>'\"\)]+", re.IGNORECASE)
-_VISIBLE_DOMAIN = re.compile(r"(?:[a-z0-9-]+\.)+[a-z]{2,63}", re.IGNORECASE)
-_SECONDARY_LINK_TEXT = re.compile(
-    r"\b(facebook|instagram|linkedin|youtube|tiktok|twitter|app store|"
-    r"google play|mentions l[ée]gales|politique de confidentialit[ée]|privacy)\b",
-    re.IGNORECASE,
-)
-_SIDE_EFFECT_LINK_TEXT = re.compile(
-    r"\b(d[ée]sabonn(?:er|ement|ez|e|[ée])?|unsubscribe|"
-    r"g[ée]rer (?:mes |vos )?pr[ée]f[ée]rences|"
-    r"email preferences|opt[- ]?out)\b",
-    re.IGNORECASE,
-)
-_PRIMARY_ACTION_LINK_TEXT = re.compile(
-    r"\b(connexion|connecter|login|sign[ -]?in|v[ée]rifier|verify|confirmer|confirm|"
-    r"activer|activate|payer|pay|r[ée]gler|facture|invoice|t[ée]l[ée]charger|download|"
-    r"ouvrir|open|voir|view|continuer|continue|r[ée]initialiser|reset)\b",
-    re.IGNORECASE,
-)
-_GENERIC_LINK_LABEL = re.compile(
-    r"^(?:read more|learn more|click here|en savoir plus|lire la suite|voir|ouvrir|open|view)$",
-    re.IGNORECASE,
-)
-
-
-class _HtmlDestinations(HTMLParser):
-    """Sépare les destinations activables des simples ressources de rendu."""
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.links: list[tuple[str, str, str]] = []
-        self.forms: list[str] = []
-        self.resources: list[str] = []
-        self._href: str | None = None
-        self._text: list[str] = []
-        self._footer_depth = 0
-        self._link_context = "primary"
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        lowered = tag.casefold()
-        values = {name.casefold(): value for name, value in attrs if value}
-        if lowered == "footer":
-            self._footer_depth += 1
-        if lowered == "a" and values.get("href"):
-            self._href = values["href"]
-            self._text = []
-            self._link_context = "footer" if self._footer_depth else "primary"
-        elif lowered == "img" and self._href is not None and values.get("alt"):
-            self._text.append(values["alt"])
-        elif lowered == "form" and values.get("action"):
-            self.forms.append(values["action"])
-        elif lowered in {"img", "source", "video"}:
-            resource = values.get("src") or values.get("poster")
-            if resource:
-                self.resources.append(resource)
-
-    def handle_data(self, data: str) -> None:
-        if self._href is not None:
-            self._text.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag.casefold() == "a" and self._href is not None:
-            visible = " ".join(self._text).strip()
-            context = (
-                "secondary_navigation"
-                if _SECONDARY_LINK_TEXT.search(visible)
-                else self._link_context
-            )
-            self.links.append((self._href, visible, context))
-            self._href = None
-            self._text = []
-            self._link_context = "primary"
-        if tag.casefold() == "footer":
-            self._footer_depth = max(0, self._footer_depth - 1)
 
 
 def _json(value: object) -> str:
@@ -177,29 +143,8 @@ def _json(value: object) -> str:
 
 
 def _postgres_json_safe(value: object) -> object:
-    """Retire les caractères que PostgreSQL JSONB refuse de stocker.
-
-    JSON autorise ``\u0000`` mais PostgreSQL interdit ce caractère dans une
-    valeur ``jsonb``. Les extracteurs PDF/OCR peuvent légitimement en produire.
-    Le remplacement est fait à la frontière de persistance, récursivement, afin
-    qu'une erreur de stockage ne soit jamais requalifiée en échec d'analyse.
-    """
-    if isinstance(value, str):
-        return value.replace("\x00", "\ufffd")
-    if isinstance(value, list):
-        return [_postgres_json_safe(item) for item in value]
-    if isinstance(value, tuple):
-        return [_postgres_json_safe(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            (
-                key.replace("\x00", "\ufffd")
-                if isinstance(key, str)
-                else key
-            ): _postgres_json_safe(item)
-            for key, item in value.items()
-        }
-    return value
+    """Même projection PostgreSQL à la capture et lors des preuves profondes."""
+    return pg_jsonsafe(value)
 
 
 def _json_object(value: object) -> dict[str, object]:
@@ -210,352 +155,6 @@ def _json_object(value: object) -> dict[str, object]:
         if isinstance(decoded, dict):
             return decoded
     raise TypeError("cached analysis result is not a JSON object")
-
-
-def _apex(domain: str) -> str:
-    parsed = _extract(domain.casefold().rstrip("."))
-    return ".".join(part for part in (parsed.domain, parsed.suffix) if part)
-
-
-def _explained_authenticated_redirect_limit(
-    data: dict[str, object], authenticated: bool
-) -> bool:
-    """Reconnaît une limite de navigation confinée à une destination stable.
-
-    Un prestataire de suivi peut rediriger vers un portail authentique qui
-    boucle ensuite dans une salle d'attente ou un parcours de connexion. La
-    limite du sandbox n'est pas une preuve manquante matérielle si la chaîne
-    HTTPS n'effectue qu'une transition d'apex, reste ensuite sur l'apex final
-    et répète un point de navigation : le sandbox a observé une boucle, pas une
-    destination ultérieure inconnue.
-    """
-    if not authenticated or data.get("error") != "too_many_redirects":
-        return False
-    chain = data.get("chain")
-    if not isinstance(chain, list) or not chain:
-        return False
-
-    urls = [str(data.get("initial_url") or "")]
-    for item in chain:
-        if not isinstance(item, dict) or not item.get("url"):
-            return False
-        urls.append(str(item["url"]))
-
-    apexes: list[str] = []
-    endpoints: list[tuple[str, str]] = []
-    for url in urls:
-        parsed = urlsplit(url)
-        if parsed.scheme.casefold() != "https" or not parsed.hostname:
-            return False
-        apex = _apex(parsed.hostname)
-        if not apex:
-            return False
-        if not apexes or apexes[-1] != apex:
-            apexes.append(apex)
-        endpoints.append((apex, f"{parsed.hostname.casefold()}{parsed.path}"))
-
-    final_apex = str(data.get("final_apex") or "")
-    if not final_apex and data.get("final_host"):
-        final_apex = _apex(str(data["final_host"]))
-    final_endpoints = [endpoint for apex, endpoint in endpoints if apex == final_apex]
-    observed_cycle = len(set(final_endpoints)) < len(final_endpoints)
-    return bool(
-        final_apex
-        and len(apexes) <= 2
-        and apexes[-1] == final_apex
-        and observed_cycle
-    )
-
-
-def is_navigation_failure(error: object) -> bool:
-    """Distingue une panne de navigation d'un signal défavorable observé.
-
-    Un délai dépassé pendant la navigation décrit l'état du réseau, pas le
-    contenu de la destination. Il appartient donc à la même famille que les
-    erreurs de fetch, quelle que soit l'étape de la chaîne où il survient. Une
-    panne de notre propre sandbox n'en fait pas partie : elle reste une
-    inspection manquante.
-    """
-    value = str(error or "")
-    return value.startswith(("fetch_error:", "timeout:")) or value in TRANSIENT_URL_ERRORS
-
-
-def _explained_authenticated_same_apex_fetch_error(
-    data: dict[str, object], authenticated: bool
-) -> bool:
-    """Une panne HTTP même-apex authentifiée est une limite, pas un danger absent."""
-    initial_url = str(data.get("initial_url") or "")
-    initial_apex = str(data.get("initial_apex") or "")
-    final_apex = str(data.get("final_apex") or "")
-    return bool(
-        authenticated
-        and is_navigation_failure(data.get("error"))
-        and initial_url.casefold().startswith("https://")
-        and initial_apex
-        and initial_apex == final_apex
-    )
-
-
-def _bounded(value: object, *, depth: int = 0) -> object:
-    if depth >= 4:
-        return "[depth-limited]"
-    if isinstance(value, str):
-        return value[:1500]
-    if isinstance(value, list):
-        return [_bounded(item, depth=depth + 1) for item in value[:20]]
-    if isinstance(value, dict):
-        return {
-            str(key)[:100]: _bounded(item, depth=depth + 1)
-            for key, item in list(value.items())[:40]
-        }
-    return value
-
-
-def _url_summary(
-    data: dict[str, object],
-    key: str,
-    candidate: dict[str, str] | None = None,
-) -> dict[str, object]:
-    forms = data.get("forms")
-    visible_links = data.get("visible_links")
-    comparaison = data.get("profile_comparison")
-    initial_apex = str(data.get("initial_apex") or "")
-    final_apex = str(data.get("final_apex") or "")
-    return {
-        "url_hash": key,
-        "role": (candidate or {}).get("role"),
-        "link_context": (candidate or {}).get("link_context"),
-        "visible_text": (candidate or {}).get("visible_text"),
-        "displayed_apex": (candidate or {}).get("displayed_apex"),
-        "initial_url": str(data.get("initial_url") or "")[:2048],
-        "initial_host": data.get("initial_host"),
-        "initial_apex": data.get("initial_apex"),
-        "final_host": data.get("final_host"),
-        "final_apex": data.get("final_apex"),
-        "final_status": data.get("final_status"),
-        # Le sandbox historique appelle "cloaking" tout changement d'apex.
-        # On conserve le fait sous son vrai nom : une redirection ne démontre
-        # ni dissimulation conditionnelle, ni intention malveillante.
-        "cross_apex_redirect": bool(
-            initial_apex and final_apex and initial_apex != final_apex
-        ),
-        "sandbox_cross_apex_flag": bool(data.get("cloaking")),
-        # Le service conditionnel, lui, est établi : le même lien a été demandé
-        # sous deux identités et les réponses divergent structurellement. Le
-        # dire même quand la réponse est non permet à l'examen de distinguer
-        # « pas de cloaking » de « pas cherché ».
-        "profiles_compared": bool(
-            isinstance(comparaison, dict)
-            and not comparaison.get("comparison_incomplete")
-        ),
-        "cloaking_detected": bool(
-            isinstance(comparaison, dict) and comparaison.get("cloaking_detected")
-        ),
-        "cloaking_divergences": list(
-            (comparaison or {}).get("divergences") or []
-        ) if isinstance(comparaison, dict) else [],
-        "cloaking_evidence": _bounded(
-            (comparaison or {}).get("evidence") if isinstance(comparaison, dict) else None
-        ),
-        "same_apex_redirect": data.get("same_apex_redirect"),
-        "form_count": len(forms) if isinstance(forms, list) else int(bool(forms)),
-        "forms": _bounded(forms),
-        "redirect_chain": _bounded(data.get("chain")),
-        "network_hops": _bounded(data.get("hops")),
-        "qr_codes": _bounded(data.get("qr_codes")),
-        "visible_link_count": (
-            len(visible_links) if isinstance(visible_links, list) else 0
-        ),
-        "body_excerpt": str(data.get("body_excerpt") or "")[:1500],
-        "error": _bounded(data.get("error")),
-        "navigation_limit_explained": bool(
-            data.get("navigation_limit_explained")
-        ),
-        "navigation_limit_reason": data.get("navigation_limit_reason"),
-        "analysis_incomplete": bool(data.get("analysis_incomplete")),
-        "analysis_skipped": bool(data.get("analysis_skipped")),
-        "skip_reason": data.get("skip_reason"),
-    }
-
-
-def _decoded_part_text(part: EmailMessage) -> str:
-    try:
-        value = part.get_content()
-        if isinstance(value, str):
-            return value
-    except Exception:  # noqa: BLE001 - MIME exotique, extraction fail-soft
-        pass
-    payload = part.get_payload(decode=True)
-    if not isinstance(payload, bytes):
-        return ""
-    charset = part.get_content_charset() or "utf-8"
-    try:
-        return payload.decode(charset, errors="replace")
-    except LookupError:
-        return payload.decode("utf-8", errors="replace")
-
-
-def _message_url_candidates(raw: bytes) -> tuple[list[dict[str, str]], int]:
-    """Priorise ce que l'utilisateur peut ouvrir, puis les images à inspecter.
-
-    Les DTD, namespaces, CSS et pixels ne rendent plus une preuve incomplète.
-    Les ressources de rendu peuvent encore être inspectées pour les QR codes si
-    le budget restant le permet.
-    """
-    root: EmailMessage = BytesParser(policy=policy.default).parsebytes(raw)
-    actionable: list[dict[str, str]] = []
-    resources: list[dict[str, str]] = []
-
-    def add(
-        target: list[dict[str, str]],
-        url: str,
-        role: str,
-        visible: str = "",
-        link_context: str = "primary",
-    ) -> None:
-        value = url.strip().rstrip(".,;:!?")
-        if not value.casefold().startswith(("http://", "https://")):
-            return
-        try:
-            if not urlsplit(value).hostname:
-                return
-        except ValueError:
-            return
-        displayed = _VISIBLE_DOMAIN.search(visible)
-        target.append(
-            {
-                "url": value,
-                "role": role,
-                "displayed_apex": _apex(displayed.group(0)) if displayed else "",
-                "visible_text": " ".join(visible.split())[:240],
-                "link_context": link_context,
-            }
-        )
-
-    for part in root.walk():
-        if part.is_multipart() or part.get_content_disposition() == "attachment":
-            continue
-        content_type = part.get_content_type()
-        if content_type not in {"text/plain", "text/html"}:
-            continue
-        value = _decoded_part_text(part)
-        if content_type == "text/plain":
-            for match in _TEXT_URL.finditer(value[:1_000_000]):
-                add(
-                    actionable,
-                    match.group(0),
-                    "plain_text",
-                    _plain_link_label(value, match.start()),
-                )
-            continue
-        parser = _HtmlDestinations()
-        try:
-            parser.feed(value[:2_000_000])
-        except Exception:  # noqa: BLE001 - HTML malformé, analyse fail-soft
-            continue
-        for href, visible, link_context in parser.links:
-            add(actionable, href, "html_link", visible, link_context)
-        for action in parser.forms:
-            add(actionable, action, "html_form")
-        for resource in parser.resources:
-            add(resources, resource, "render_resource")
-
-    unique_actionable: list[dict[str, str]] = []
-    positions: dict[str, int] = {}
-    priority = {"plain_text": 1, "html_link": 2, "html_form": 3}
-    for candidate in actionable:
-        existing_position = positions.get(candidate["url"])
-        if existing_position is not None:
-            existing = unique_actionable[existing_position]
-            if priority.get(candidate["role"], 0) > priority.get(existing["role"], 0):
-                unique_actionable[existing_position] = candidate
-            continue
-        positions[candidate["url"]] = len(unique_actionable)
-        unique_actionable.append(candidate)
-    resource_total = 0
-    unique_resources: list[dict[str, str]] = []
-    for candidate in resources:
-        if candidate["url"] in positions:
-            continue
-        resource_total += 1
-        positions[candidate["url"]] = len(positions)
-        unique_resources.append(candidate)
-    return unique_actionable + unique_resources, resource_total
-
-
-def _plain_link_label(value: str, start: int) -> str:
-    """Associe une URL texte à son libellé voisin sans conserver son secret.
-
-    Les alternatives texte écrivent souvent ``Download invoice (https://...)``.
-    Conserver les quelques mots précédents permet de rapprocher cette variante
-    de l'ancre HTML équivalente, sans exposer le chemin ou les paramètres URL.
-    """
-    before = value[max(0, start - 180) : start]
-    before = _TEXT_URL.sub(" ", before)
-    segment = re.split(r"[\r\n\]\)>]+", before)[-1]
-    words = re.findall(r"[^\s\[\](){}<>]+", segment)
-    return " ".join(words[-6:])[:160]
-
-
-def _normalized_link_label(value: object) -> str:
-    label = " ".join(str(value or "").casefold().split())
-    return re.sub(r"[^\w]+", " ", label, flags=re.UNICODE).strip()
-
-
-def _contextualize_equivalent_url_limits(
-    results: list[dict[str, object]], authenticated: bool
-) -> None:
-    """Explique une panne sur une variante MIME couverte par son équivalent.
-
-    Une alternative texte et une alternative HTML peuvent représenter le même
-    bouton avec deux URL différentes (lien direct et lien de suivi). La panne
-    d'une variante n'est pas une lacune supplémentaire lorsque : le libellé est
-    identique, les deux URL restent sur le même apex HTTPS et l'autre variante
-    a été inspectée ou possède déjà une limite même-apex expliquée. Une variante
-    vers un autre apex reste toujours à inspecter.
-    """
-    if not authenticated:
-        return
-    for value in results:
-        if not value.get("error") or value.get("navigation_limit_explained"):
-            continue
-        label = _normalized_link_label(value.get("visible_text"))
-        initial_apex = str(value.get("initial_apex") or "")
-        initial_url = str(value.get("initial_url") or "")
-        if not label or not initial_apex or not initial_url.casefold().startswith("https://"):
-            continue
-        for other in results:
-            if other is value or _normalized_link_label(other.get("visible_text")) != label:
-                continue
-            if str(other.get("initial_apex") or "") != initial_apex:
-                continue
-            if str(other.get("final_apex") or "") != initial_apex:
-                continue
-            if other.get("analysis_incomplete"):
-                continue
-            if other.get("error") and not other.get("navigation_limit_explained"):
-                continue
-            value["navigation_limit_explained"] = True
-            value["navigation_limit_reason"] = (
-                "authenticated_equivalent_mime_link_same_apex"
-            )
-            break
-
-
-def is_single_use_or_side_effect_url(url: str) -> bool:
-    """Détecte les URL qu'un GET de sécurité pourrait consommer ou déclencher."""
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        return False
-    path = parsed.path.casefold()
-    if "/cdn-cgi/access/" in path or _SINGLE_USE_PATH.search(path):
-        return True
-    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-        normalized = key.casefold().replace("-", "_")
-        if normalized in _SENSITIVE_QUERY_KEYS and len(value) >= 6:
-            return True
-    return False
 
 
 async def _message_is_dmarc_aligned(
@@ -580,16 +179,43 @@ def _attachment_summary(data: dict[str, object]) -> dict[str, object]:
         "path", "filename", "content_type", "mime", "sha256", "score", "verdict",
         "findings", "yara", "macros", "archive", "pdf", "ocr",
         "analysis_incomplete", "reason", "error",
+        "extracted_text", "extracted_text_source", "extracted_text_provenance",
+        "extracted_text_total_chars", "extracted_text_truncated",
+        "extracted_text_incomplete",
     }
-    return {
+    summary = {
         str(key): _bounded(value)
         for key, value in data.items()
         if str(key) in preferred
     }
+    text = data.get("extracted_text")
+    if isinstance(text, str):
+        summary["extracted_text"] = text[:2500]
+        summary["extracted_text_truncated"] = bool(
+            data.get("extracted_text_truncated") or len(text) > 2500
+        )
+    return summary
+
+
+def _body_with_attachments(body: str, attachments: list[dict[str, object]]) -> str:
+    """Expose aux enquêteurs le texte lu dans les fichiers, avec sa provenance."""
+    excerpts = [
+        "Texte extrait d’une pièce jointe, contenu non fiable "
+        f"(source : {item.get('extracted_text_source') or 'extraction'}) :\n"
+        + str(item["extracted_text"])[:2500]
+        for item in attachments
+        if isinstance(item.get("extracted_text"), str)
+        and str(item["extracted_text"]).strip()
+    ]
+    if not excerpts:
+        return body
+    # Les enquêteurs disposent de 4 000 caractères : réserver de la place
+    # aux fichiers évite de les masquer derrière la signature du corps.
+    return "\n\n".join([body[:1200], *excerpts])[:8000]
 
 
 def _part_payloads(raw: bytes) -> dict[str, tuple[str, str, bytes]]:
-    root: EmailMessage = BytesParser(policy=policy.default).parsebytes(raw)
+    root: EmailMessage = parse_email(raw)
     result: dict[str, tuple[str, str, bytes]] = {}
 
     def visit(part: EmailMessage, path: str) -> None:
@@ -597,7 +223,12 @@ def _part_payloads(raw: bytes) -> dict[str, tuple[str, str, bytes]]:
             for index, child in enumerate(part.iter_parts()):
                 visit(child, f"{path}.{index}")
             return
-        if part.get_content_disposition() == "attachment" or part.get_filename():
+        # La même définition que le parseur : ce qu'il range dans mime_parts
+        # comme pièce jointe doit se retrouver ici, sinon l'analyse conclut à
+        # un contenu introuvable là où il n'y avait qu'une partie sans nom.
+        # Un conteneur marqué pièce jointe (message/rfc822 attaché) reste
+        # introuvable, donc incomplet : c'est le côté sûr.
+        if is_attachment_part(part):
             payload = part.get_payload(decode=True)
             result[path] = (
                 str(part.get_filename() or f"attachment-{path}"),
@@ -647,150 +278,9 @@ async def _save_analysis(
         status,
         _json(result),
         type(error).__name__ if error else None,
-        str(error)[:500] if error else None,
+        pg_text(str(error)[:500]) if error else None,
         debut,
     )
-
-
-def _candidate_apex(candidate: dict[str, str]) -> str:
-    try:
-        return _apex(urlsplit(candidate["url"]).hostname or "")
-    except (KeyError, ValueError):
-        return ""
-
-
-def _candidate_group_key(candidate: dict[str, str]) -> tuple[str, str, str]:
-    """Regroupe les variantes équivalentes sans fusionner des liens ambigus.
-
-    Un libellé descriptif identique sur le même apex représente généralement la
-    même action dans les alternatives texte et HTML. Les libellés génériques
-    comme « lire la suite » conservent le chemin afin que deux articles distincts
-    ne soient jamais assimilés.
-    """
-    apex = _candidate_apex(candidate)
-    label = _normalized_link_label(candidate.get("visible_text"))
-    try:
-        path = urlsplit(candidate["url"]).path.casefold().rstrip("/") or "/"
-    except (KeyError, ValueError):
-        path = candidate.get("url", "")[:500]
-    identity = label if label and not _GENERIC_LINK_LABEL.fullmatch(label) else path
-    return apex, candidate.get("link_context", "primary"), identity[:500]
-
-
-def _representative_candidates(
-    candidates: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    representatives: list[dict[str, str]] = []
-    positions: dict[tuple[str, str, str], int] = {}
-    role_priority = {
-        "render_resource": 0,
-        "plain_text": 1,
-        "html_link": 2,
-        "html_form": 3,
-    }
-    for candidate in candidates:
-        key = _candidate_group_key(candidate)
-        position = positions.get(key)
-        if position is None:
-            positions[key] = len(representatives)
-            representatives.append(candidate)
-            continue
-        existing = representatives[position]
-        if role_priority.get(candidate.get("role", ""), 0) > role_priority.get(
-            existing.get("role", ""), 0
-        ):
-            representatives[position] = candidate
-    return representatives
-
-
-def _candidate_priority(candidate: dict[str, str]) -> tuple[int, int]:
-    if candidate.get("role") == "html_form":
-        return 0, 0
-    if _PRIMARY_ACTION_LINK_TEXT.search(candidate.get("visible_text", "")):
-        return 0, 1
-    if candidate.get("link_context") == "primary":
-        return 1, 0
-    if candidate.get("link_context") == "footer":
-        return 2, 0
-    if candidate.get("link_context") == "secondary_navigation":
-        return 3, 0
-    return 4, 0
-
-
-def _diverse_order(candidates: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Échantillonne d'abord chaque apex, puis approfondit chaque destination."""
-    buckets: dict[str, list[dict[str, str]]] = {}
-    for candidate in sorted(candidates, key=_candidate_priority):
-        buckets.setdefault(_candidate_apex(candidate), []).append(candidate)
-    ordered: list[dict[str, str]] = []
-    while any(buckets.values()):
-        for bucket in buckets.values():
-            if bucket:
-                ordered.append(bucket.pop(0))
-    return ordered
-
-
-def _select_url_candidates(
-    candidates: list[dict[str, str]],
-) -> tuple[list[dict[str, str]], dict[str, object]]:
-    actionable = [value for value in candidates if value["role"] != "render_resource"]
-    resources = [value for value in candidates if value["role"] == "render_resource"]
-    representatives = _representative_candidates(actionable)
-    primary = [
-        value
-        for value in representatives
-        if value.get("link_context") not in {"footer", "secondary_navigation"}
-    ]
-    secondary = [
-        value
-        for value in representatives
-        if value.get("link_context") in {"footer", "secondary_navigation"}
-    ]
-    actionable_apexes = {_candidate_apex(value) for value in representatives}
-    actionable_apexes.discard("")
-    adaptive_budget = min(
-        MAX_URLS,
-        max(BASE_URLS, len(actionable_apexes) * URLS_PER_APEX),
-    )
-    ordered = _diverse_order(primary) + _diverse_order(secondary)
-    selected = ordered[:adaptive_budget]
-    if len(selected) < adaptive_budget:
-        selected.extend(resources[: adaptive_budget - len(selected)])
-    selected_actionable = [
-        value for value in selected if value.get("role") != "render_resource"
-    ]
-    selected_apexes = {_candidate_apex(value) for value in selected_actionable}
-    selected_apexes.discard("")
-    coverage: dict[str, object] = {
-        "strategy": "adaptive-contextual-representatives-v1",
-        "base_budget": BASE_URLS,
-        "hard_budget": MAX_URLS,
-        "adaptive_budget": adaptive_budget,
-        "actionable_total": len(actionable),
-        "actionable_representatives_total": len(representatives),
-        "actionable_representatives_analyzed": len(selected_actionable),
-        "exact_or_equivalent_urls_collapsed": len(actionable) - len(representatives),
-        "primary_actionable_total": len(primary),
-        "actionable_apexes_total": len(actionable_apexes),
-        "actionable_apexes_analyzed": len(selected_apexes),
-        "uninspected_representatives": max(
-            0, len(representatives) - len(selected_actionable)
-        ),
-        "coverage_limited": len(selected_actionable) < len(representatives),
-        "render_resources_total": len(resources),
-        "render_resources_analyzed": sum(
-            value.get("role") == "render_resource" for value in selected
-        ),
-    }
-    return selected, coverage
-
-
-def is_transient_url_error(data: object) -> bool:
-    """Un délai réseau n'est pas un résultat d'inspection : il peut être rejoué."""
-    if not isinstance(data, dict):
-        return False
-    error = str(data.get("error") or "")
-    return error in TRANSIENT_URL_ERRORS or error.startswith("sandbox_request:")
 
 
 async def _fetch_url_analysis(
@@ -836,6 +326,7 @@ async def fetch_url_analysis_with_retry(
     url: str,
     key: str,
     apex_deja_muets: set[str] | None = None,
+    on_attempt: Callable[[], None] | None = None,
 ) -> tuple[dict[str, object], str, Exception | None]:
     """Rejoue une seule fois un délai réseau, sauf si l'apex s'est déjà tu.
 
@@ -846,7 +337,11 @@ async def fetch_url_analysis_with_retry(
     n'est plus un aléa - c'est un domaine durablement muet, et le rejeu double
     le coût précisément là où il ne rapportera rien. Le 18 août, seize URL d'un
     même apex ont été inspectées deux fois chacune sans jamais rien ramener.
+
+    ``on_attempt`` marque le début de la tentative dont la durée compte.
     """
+    if on_attempt is not None:
+        on_attempt()
     data, status, exc = await _fetch_url_analysis(client, settings, url, key)
     if not is_transient_url_error(data):
         return data, status, exc
@@ -858,6 +353,11 @@ async def fetch_url_analysis_with_retry(
             renonce["retry_skip_reason"] = "apex_deja_muet"
             return renonce, status, exc
         apex_deja_muets.add(apex)
+    # Le chrono ne repart que si le bac à sable a tenu son plafond et l'a dit.
+    # Un délai côté client (sandbox_request:*) reste compté : c'est lui que la
+    # mesure doit montrer, même quand le rejeu réussit.
+    if on_attempt is not None and str(data.get("error") or "") in TRANSIENT_URL_ERRORS:
+        on_attempt()
     retried, retried_status, retried_exc = await _fetch_url_analysis(
         client, settings, url, key
     )
@@ -868,137 +368,127 @@ async def fetch_url_analysis_with_retry(
     return persistent, retried_status, retried_exc
 
 
-def _is_definitive_target_failure(error: object) -> bool:
-    """Le lien est défaillant, pas notre analyse.
-
-    Un domaine qui ne résout pas en DNS est une réponse, pas une panne : le
-    bac à sable a fait son travail et constaté que la destination n'existe
-    pas. Chez un spammeur, le lien mort est même un classique - domaine déjà
-    désactivé, ou pas encore publié. Compter ce constat comme une analyse
-    incomplète interdisait de classer le message et forçait une demande
-    d'avis pour un fait qui, en réalité, accable l'expéditeur.
-    """
-    return str(error or "").startswith("blocked_url:dns_resolution_failed")
-
-
 async def _analyze_urls(
-    pool: asyncpg.Pool[Any],
-    client: httpx.AsyncClient,
-    settings: Settings,
-    message_id: str,
-    raw: bytes,
+    pool: asyncpg.Pool[Any], client: httpx.AsyncClient, settings: Settings,
+    message_id: str, raw: bytes, *, deadline: float | None = None,
 ) -> tuple[list[dict[str, object]], bool, dict[str, object]]:
     candidates, resource_total = _message_url_candidates(raw)
     selected, coverage = _select_url_candidates(candidates)
     coverage["render_resources_total"] = resource_total
-    results: list[dict[str, object]] = []
-    # Les apex qui se sont déjà tus dans ce message : le rejeu ne s'obstine pas
-    # sur eux. La mémoire vit le temps d'un message, jamais au-delà - un domaine
-    # muet ce matin peut répondre cet après-midi.
+    local_deadline = monotonic() + max(0.001, float(getattr(settings, "url_analysis_deadline_seconds", 90)))
+    deadline = min(deadline, local_deadline) if deadline is not None else local_deadline
+    concurrency = max(1, min(4, int(getattr(settings, "url_analysis_concurrency", 2))))
+    slots = asyncio.Semaphore(concurrency)
+    hosts: dict[str, asyncio.Lock] = {}
     apex_deja_muets: set[str] = set()
-    # Combien de liens ont déjà été redemandés sous une seconde identité.
-    comparaisons = 0
     authenticated = await _message_is_dmarc_aligned(pool, message_id)
-    for candidate in selected:
+
+    async def inspect(candidate: dict[str, str]) -> tuple[dict[str, object], str, bool]:
         url = candidate["url"]
         key = hashlib.sha256(url.encode()).hexdigest()
-        if is_single_use_or_side_effect_url(url) or _SIDE_EFFECT_LINK_TEXT.search(
-            candidate.get("visible_text", "")
-        ):
-            data = {
-                "initial_url": url,
-                "analysis_skipped": True,
-                "skip_reason": "protected_single_use_or_side_effect_url",
-                "sender_dmarc_aligned": authenticated,
-            }
-            await _save_analysis(
-                pool, message_id, "url", key, "url-sandbox", "skipped", data
-            )
-            results.append(_url_summary(data, key, candidate))
-            continue
-        if candidate.get("link_context") in {"footer", "secondary_navigation"}:
-            data = {
-                "initial_url": url,
-                "analysis_skipped": True,
-                "skip_reason": "non_primary_navigation",
-                "sender_dmarc_aligned": authenticated,
-            }
-            await _save_analysis(
-                pool, message_id, "url", key, "url-sandbox", "skipped", data
-            )
-            results.append(_url_summary(data, key, candidate))
-            continue
+        reason = ""
+        if is_single_use_or_side_effect_url(url) or _SIDE_EFFECT_LINK_TEXT.search(candidate.get("visible_text", "")):
+            reason = "protected_single_use_or_side_effect_url"
+        elif candidate.get("link_context") in {"footer", "secondary_navigation"}:
+            reason = "non_primary_navigation"
+        if reason:
+            data = {"initial_url": url, "analysis_skipped": True, "skip_reason": reason,
+                    "sender_dmarc_aligned": authenticated}
+            await _save_analysis(pool, message_id, "url", key, "url-sandbox", "skipped", data)
+            return data, key, False
         cached = await pool.fetchrow(
-            """
-            SELECT status, result FROM external_analyses
-            WHERE message_id=$1::uuid AND subject_kind='url'
-              AND subject_key=$2 AND source='url-sandbox'
-            """,
-            message_id,
-            key,
+            """SELECT status,result FROM external_analyses
+               WHERE message_id=$1::uuid AND subject_kind='url'
+                 AND subject_key=$2 AND source='url-sandbox'""", message_id, key,
         )
-        cached_result = _json_object(cached["result"]) if cached is not None else {}
-        if (
-            cached is not None
-            and cached["status"] == "ok"
-            and not is_transient_url_error(cached_result)
-        ):
-            data = cached_result
-        else:
-            debut = datetime.now(timezone.utc)
-            data, status, exc = await fetch_url_analysis_with_retry(
-                client, settings, url, key, apex_deja_muets=apex_deja_muets
+        data = _json_object(cached["result"]) if cached is not None else {}
+        if cached is not None and cached["status"] == "ok" and not is_transient_url_error(data):
+            comparison = data.get("profile_comparison")
+            profile_complete = isinstance(comparison, dict) and comparison.get("comparison_incomplete") is False
+            # Un primaire enregistré ne prouve pas que le second regard a
+            # abouti : son interruption reprend ici sans repayer le primaire.
+            return data, key, not profile_complete
+        # La durée enregistrée exclut la file, et le premier essai quand le bac
+        # à sable a tenu son plafond. Un lien resté dans la file n'a pas de
+        # début mesuré : sa durée vaut zéro en base.
+        started: datetime | None = None
+
+        def attempt_begins() -> None:
+            nonlocal started
+            started = datetime.now(timezone.utc)
+
+        host = _candidate_apex(candidate) or str(urlsplit(url).hostname or "")
+        lock = hosts.setdefault(host, asyncio.Lock())
+        try:
+            # L'attente d'une place compte dans le budget. Un même apex garde
+            # son ordre de visite et sa mémoire des pannes passagères.
+            async with asyncio.timeout(max(0.001, deadline - monotonic())):
+                async with lock, slots:
+                    data, status, failure = await fetch_url_analysis_with_retry(
+                        client, settings, url, key, apex_deja_muets=apex_deja_muets,
+                        on_attempt=attempt_begins,
+                    )
+        except TimeoutError as error:
+            data = {"initial_url": url, "initial_host": urlsplit(url).hostname or "",
+                    "initial_apex": host, "analysis_incomplete": True,
+                    "error": "sandbox_request:TimeoutError", "budget_exhausted": True}
+            status, failure = "error", error
+        # La preuve obtenue survit à l'échec d'une autre destination. Une
+        # panne SQL reste une panne opérationnelle et interrompt le run.
+        await _save_analysis(pool, message_id, "url", key, "url-sandbox", status, data, failure, started_at=started)
+        return data, key, status == "ok"
+
+    tasks = [asyncio.create_task(inspect(candidate)) for candidate in selected]
+    try:
+        inspected = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    results: list[dict[str, object]] = []
+    comparisons = 0
+    for candidate, (data, key, profile_pending) in zip(selected, inspected):
+        # Les regards secondaires gardent l'ordre de sélection : la vitesse
+        # d'un serveur ne choisit pas quels liens obtiennent les trois places.
+        profile_selected = should_compare_profiles(data, authenticated=authenticated, deja_compares=comparisons)
+        if profile_selected:
+            comparisons += 1
+        if profile_pending and profile_selected:
+            profile_started = monotonic()
+            try:
+                async with asyncio.timeout(max(0.001, deadline - monotonic())):
+                    other, _, _ = await _fetch_url_analysis(client, settings, candidate["url"], key, profile="browser")
+            except TimeoutError:
+                other = {"error": "url_analysis_budget_exhausted", "analysis_incomplete": True}
+            data = dict(data)
+            data["profile_comparison"] = compare_profiles(data, other)
+            data["profile_comparison"]["duration_ms"] = round((monotonic()-profile_started)*1000, 3)
+            # Le second regard enrichit le résultat sans effacer les dates de
+            # l'inspection primaire. Sa propre durée est conservée séparément.
+            await pool.execute(
+                "UPDATE external_analyses SET result=$3::jsonb "
+                "WHERE message_id=$1::uuid AND subject_kind='url' AND subject_key=$2 AND source='url-sandbox'",
+                message_id, key, _json(data),
             )
-            # Second regard sous une autre identité, quand il peut apprendre
-            # quelque chose. Un site qui sert deux pages différentes selon qui
-            # demande ne se voit pas autrement : un seul profil reçoit la page
-            # que le site a choisi de lui montrer, et la croit unique.
-            if should_compare_profiles(
-                data, authenticated=authenticated, deja_compares=comparaisons
-            ):
-                comparaisons += 1
-                autre, _, _ = await _fetch_url_analysis(
-                    client, settings, url, key, profile="browser"
-                )
-                data = dict(data)
-                data["profile_comparison"] = compare_profiles(data, autre)
-            # Une panne de persistance est opérationnelle : elle doit faire
-            # échouer/rejouer le run, jamais se déguiser en finding sandbox.
-            await _save_analysis(
-                pool, message_id, "url", key, "url-sandbox", status, data, exc,
-                started_at=debut,
-            )
-        explained_limit = _explained_authenticated_redirect_limit(data, authenticated)
-        explained_fetch_error = _explained_authenticated_same_apex_fetch_error(
-            data, authenticated
-        )
-        explained_limit = explained_limit or explained_fetch_error
-        if explained_limit:
+        explained_fetch = _explained_authenticated_same_apex_fetch_error(data, authenticated)
+        if _explained_authenticated_redirect_limit(data, authenticated) or explained_fetch:
             data = dict(data)
             data["navigation_limit_explained"] = True
             data["navigation_limit_reason"] = (
-                "authenticated_same_apex_fetch_error"
-                if explained_fetch_error
+                "authenticated_same_apex_fetch_error" if explained_fetch
                 else "authenticated_https_chain_stable_on_final_apex"
             )
         results.append(_url_summary(data, key, candidate))
     _contextualize_equivalent_url_limits(results, authenticated)
-    complete = all(
-        value.get("role") == "render_resource"
-        or value.get("analysis_skipped")
-        or value.get("navigation_limit_explained")
-        or _is_definitive_target_failure(value.get("error"))
-        or not (value.get("error") or value.get("analysis_incomplete"))
-        for value in results
-    )
-    coverage["actionable_analyzed"] = sum(
-        value.get("role") != "render_resource" for value in results
-    )
-    coverage["render_resources_analyzed"] = sum(
-        value.get("role") == "render_resource" for value in results
-    )
+    complete = all(value.get("role") == "render_resource" or value.get("analysis_skipped")
+                   or value.get("navigation_limit_explained") or _is_definitive_target_failure(value.get("error"))
+                   or not (value.get("error") or value.get("analysis_incomplete")) for value in results)
+    coverage["actionable_analyzed"] = sum(value.get("role") != "render_resource" for value in results)
+    coverage["render_resources_analyzed"] = sum(value.get("role") == "render_resource" for value in results)
+    coverage["budget_exhausted"] = any(data.get("budget_exhausted") for data, _, _ in inspected)
+    coverage["concurrency_limit"] = concurrency
     return results, complete, coverage
-
 
 async def _analyze_attachments(
     pool: asyncpg.Pool[Any],
@@ -1006,6 +496,7 @@ async def _analyze_attachments(
     settings: Settings,
     message_id: str,
     raw: bytes,
+    *, deadline: float | None = None,
 ) -> tuple[list[dict[str, object]], bool]:
     parts = _part_payloads(raw)
     rows = await pool.fetch(
@@ -1017,12 +508,29 @@ async def _analyze_attachments(
         message_id,
     )
     results: list[dict[str, object]] = []
-    complete = len(rows) <= MAX_ATTACHMENTS
-    for row in rows[:MAX_ATTACHMENTS]:
+    complete = True
+    local_deadline = monotonic() + MAX_ATTACHMENTS_SECONDS
+    deadline = min(deadline, local_deadline) if deadline is not None else local_deadline
+    total_bytes = 0
+    images = documents = 0
+    for row in rows:
         path = str(row["path"])
         key = str(row["decoded_sha256"] or path)
         item = parts.get(path)
+        image = item is not None and item[1] in RASTER_IMAGE_TYPES
+        images += int(image)
+        documents += int(not image)
+        total_bytes += len(item[2]) if item else 0
+        reason = ""
         if item is None or len(item[2]) > MAX_ATTACHMENT_BYTES:
+            reason = "payload_unavailable_or_too_large"
+        elif images > MAX_IMAGE_ATTACHMENTS or documents > MAX_ATTACHMENTS:
+            reason = "attachment_count_budget_exceeded"
+        elif total_bytes > MAX_ATTACHMENT_BYTES:
+            reason = "attachment_total_bytes_exceeded"
+        elif monotonic() >= deadline:
+            reason = "attachment_time_budget_exceeded"
+        if reason:
             complete = False
             data = {
                 "path": path,
@@ -1030,7 +538,7 @@ async def _analyze_attachments(
                 "content_type": row["content_type"],
                 "sha256": key,
                 "analysis_incomplete": True,
-                "reason": "payload_unavailable_or_too_large",
+                "reason": reason,
             }
             await _save_analysis(
                 pool, message_id, "attachment", key, "file-sandbox", "skipped", data
@@ -1051,14 +559,15 @@ async def _analyze_attachments(
             data = _json_object(cached["result"])
         else:
             try:
-                response = await client.post(
-                    f"{settings.file_sandbox_url}/analyze",
-                    json={
-                        "filename": filename,
-                        "content_b64": base64.b64encode(payload).decode("ascii"),
-                    },
-                    timeout=35,
-                )
+                async with asyncio.timeout(max(0.001, deadline - monotonic())):
+                    response = await client.post(
+                        f"{settings.file_sandbox_url}/analyze",
+                        json={
+                            "filename": filename,
+                            "content_b64": base64.b64encode(payload).decode("ascii"),
+                        },
+                        timeout=min(35, max(0.001, deadline - monotonic())),
+                    )
                 response.raise_for_status()
                 value = response.json()
                 if not isinstance(value, dict):
@@ -1148,6 +657,9 @@ def _attachment_limit_reason(value: dict[str, object]) -> str:
             "contenu indisponible ou supérieur au budget d’analyse"
         ),
         "file_sandbox_request_failed": "service d’inspection fichier indisponible",
+        "attachment_count_budget_exceeded": "nombre maximal de fichiers à inspecter dépassé",
+        "attachment_total_bytes_exceeded": "taille totale des fichiers à inspecter dépassée",
+        "attachment_time_budget_exceeded": "durée maximale d’inspection des fichiers atteinte",
     }
     if reason in labels:
         return labels[reason]
@@ -1244,7 +756,7 @@ async def _learned_signals(
                 coalesce(l.context->'signals','[]'::jsonb)
             ) AS code(value)
             WHERE l.is_ground_truth=true AND l.active=true
-              AND lower(l.participant_email)=lower($2)
+              AND sentimail_same_client(l.participant_email,$2)
             GROUP BY code.value
         )
         SELECT learned.* FROM learned
@@ -1287,22 +799,25 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
     address = (address or str(current["envelope_from"])).casefold()
     domain = address.rsplit("@", 1)[-1] if "@" in address else ""
     participant = str((current["envelope_recipients"] or [""])[0]).casefold()
+    # L'adresse se cherche telle quelle, jamais dans un motif LIKE : « _ » et
+    # « % » y sont des jokers, et « jean_dupont@webmail.example », ouvrable par
+    # n'importe qui, héritait du passé de « jean.dupont@webmail.example ».
     rows = await pool.fetch(
         """
         SELECT m.raw_size_bytes, m.captured_at,
                (m.facts->>'attachment_count')::int AS attachment_count
         FROM messages m
         WHERE m.id<>$1::uuid
-          AND (lower(m.envelope_from)=$2 OR lower(m.from_header) LIKE $3)
+          AND (lower(m.envelope_from)=$2 OR strpos(lower(m.from_header), $3) > 0)
           AND EXISTS (
               SELECT 1 FROM unnest(m.envelope_recipients) recipient
-              WHERE lower(recipient)=$4
+              WHERE sentimail_same_client(recipient,$4)
           )
         ORDER BY m.captured_at DESC LIMIT 200
         """,
         message_id,
         address,
-        f"%<{address}>%",
+        f"<{address}>",
         participant,
     )
     # Les labels sont lus par leurs colonnes propres : un apprentissage reste
@@ -1313,20 +828,21 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         FROM labels l LEFT JOIN messages m ON m.id=l.message_id
         WHERE l.is_ground_truth=true AND l.active=true
           AND (
-              (l.sender_normalized=$1 AND lower(l.participant_email)=$3)
+              (l.sender_normalized=$1
+               AND sentimail_same_client(l.participant_email,$3))
               OR (
                   l.sender_normalized IS NULL
-                  AND (lower(m.envelope_from)=$1 OR lower(m.from_header) LIKE $2)
+                  AND (lower(m.envelope_from)=$1 OR strpos(lower(m.from_header), $2) > 0)
                   AND EXISTS (
                       SELECT 1 FROM unnest(m.envelope_recipients) recipient
-                      WHERE lower(recipient)=$3
+                      WHERE sentimail_same_client(recipient,$3)
                   )
               )
           )
         GROUP BY l.label
         """,
         address,
-        f"%<{address}>%",
+        f"<{address}>",
         participant,
     )
     feedback_rows = await pool.fetch(
@@ -1339,20 +855,21 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         FROM labels l LEFT JOIN messages m ON m.id=l.message_id
         WHERE l.is_ground_truth=true AND l.active=true
           AND (
-              (l.sender_normalized=$1 AND lower(l.participant_email)=$3)
+              (l.sender_normalized=$1
+               AND sentimail_same_client(l.participant_email,$3))
               OR (
                   l.sender_normalized IS NULL
-                  AND (lower(m.envelope_from)=$1 OR lower(m.from_header) LIKE $2)
+                  AND (lower(m.envelope_from)=$1 OR strpos(lower(m.from_header), $2) > 0)
                   AND EXISTS (
                       SELECT 1 FROM unnest(m.envelope_recipients) recipient
-                      WHERE lower(recipient)=$3
+                      WHERE sentimail_same_client(recipient,$3)
                   )
               )
           )
         ORDER BY l.created_at DESC LIMIT 20
         """,
         address,
-        f"%<{address}>%",
+        f"<{address}>",
         participant,
     )
     sizes = [int(row["raw_size_bytes"]) for row in rows]
@@ -1363,24 +880,11 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         size_zscore = (current_size - statistics.mean(sizes)) / statistics.pstdev(sizes)
     usual_hours = sorted(set(hours))
     label_counts = {str(row["label"]): int(row["count"]) for row in labels}
-    persistent_hold = await pool.fetchval(
-        """
-        SELECT EXISTS (
-            SELECT 1 FROM sender_policies sp
-            WHERE EXISTS (
-                SELECT 1 FROM messages m, unnest(m.envelope_recipients) recipient
-                WHERE m.id=$1::uuid
-                  AND lower(recipient)=lower(sp.participant_email)
-            )
-              AND sp.active=true AND sp.action='hold'
-              AND ((sp.scope='sender' AND sp.value_normalized=$2)
-                OR (sp.scope='domain' AND sp.value_normalized=$3))
-        )
-        """,
-        message_id,
-        address,
-        domain,
-    )
+    # Une règle B supprime sans avis : elle ne s'applique qu'à une identité
+    # prouvée. Un From usurpé ne fait ni tomber la victime sous la règle posée
+    # contre l'usurpateur, ni échapper l'usurpateur à la sienne.
+    identity = await read_proven_identity(pool, message_id)
+    persistent_hold = await authenticated_hold(pool, message_id, identity)
     persistent_allow = await pool.fetchval(
         """
         SELECT EXISTS (
@@ -1388,7 +892,7 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
             WHERE EXISTS (
                 SELECT 1 FROM messages m, unnest(m.envelope_recipients) recipient
                 WHERE m.id=$1::uuid
-                  AND lower(recipient)=lower(sp.participant_email)
+                  AND sentimail_same_client(recipient,sp.participant_email)
             )
               AND sp.active=true AND sp.action='allow'
               AND ((sp.scope='sender' AND sp.value_normalized=$2)
@@ -1403,7 +907,7 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         """
         SELECT en.status,
                en.data->>'creation_date' AS creation_date,
-               (en.data->>'age_days')::int AS age_days,
+               en.data->>'age_days' AS age_days,
                ARRAY(
                    SELECT jsonb_array_elements_text(
                        coalesce(en.data->'countries','[]'::jsonb)
@@ -1440,7 +944,7 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         ) country
         WHERE m.id<>$1::uuid AND e.entity_type='ip'
           AND e.role LIKE 'header:received%'
-          AND (lower(m.envelope_from)=$2 OR lower(m.from_header) LIKE $3)
+          AND (lower(m.envelope_from)=$2 OR strpos(lower(m.from_header), $3) > 0)
           AND EXISTS (
               SELECT 1 FROM unnest(m.envelope_recipients) recipient
               WHERE lower(recipient)=$4
@@ -1449,7 +953,7 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         """,
         message_id,
         address,
-        f"%<{address}>%",
+        f"<{address}>",
         participant,
     )
     current_country_values = sorted(str(row["country"]) for row in current_countries)
@@ -1468,17 +972,33 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
     # historique (`rows` non vide) : les deux requêtes ci-dessous ne
     # payent donc leur coût que pour une adresse réellement nouvelle, au lieu
     # de tourner sur chaque message.
-    if rows:
-        apex_delivered_count = 0
-        apex_track_record_age_days: int | None = None
-        apex_adverse_labels = 0
-    else:
+    # Le compte se lisait seulement pour une adresse jamais vue. Une adresse
+    # connue - Nintendo, livrée deux fois - restait donc sans aucun fait de
+    # livraison sur son apex, et son domaine s'accusait comme un inconnu.
+    # Un message rangé dans les indésirables est « livré » pour le transport,
+    # pas pour le destinataire : le compter faisait blanchir un domaine par son
+    # propre spam. Le 25 septembre 2026, un faux renouvellement Prime Video
+    # classé spam à 11:28 a « attesté » son domaine, et le suivant, à 11:30, a
+    # vu son identité empruntée passer neutre puis a été livré comme légitime.
+    # Un envoi que l'utilisateur a lui-même déclaré spam ou dangereux n'atteste
+    # rien non plus. Le 3 novembre 2026, un faux reçu Amazon (M-fc7f44) a vu son
+    # usurpation mise sans charge : la seule livraison d'outlook.com était un
+    # hameçonnage du 20 août, livré puis étiqueté spam par le mainteneur.
+    if True:
         apex_track_record = await pool.fetchrow(
             """
             SELECT count(*) AS delivered_count, min(m.captured_at) AS first_seen
             FROM messages m
+            LEFT JOIN delivery_cases d ON d.message_id=m.id
             WHERE m.id<>$1::uuid
               AND m.delivery_status='delivered'
+              AND coalesce(d.state,'')<>'original_filed_as_junk'
+              AND coalesce(d.assessed_classification,'') NOT IN ('spam','dangerous')
+              AND NOT EXISTS (
+                  SELECT 1 FROM labels l
+                  WHERE l.message_id=m.id AND l.is_ground_truth=true AND l.active=true
+                    AND l.label IN ('spam','suspect','dangerous')
+              )
               AND (
                   lower(split_part(m.envelope_from,'@',2))=$2
                   OR lower(split_part(m.envelope_from,'@',2)) LIKE $3
@@ -1487,6 +1007,28 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
             message_id,
             apex,
             f"%.{apex}",
+        )
+        # Sur une messagerie publique, le domaine réunit des inconnus sans lien
+        # entre eux : seule l'adresse exacte a un passé qui lui appartient.
+        sender_delivered_count = await pool.fetchval(
+            """
+            SELECT count(*)
+            FROM messages m
+            LEFT JOIN delivery_cases d ON d.message_id=m.id
+            WHERE m.id<>$1::uuid
+              AND m.delivery_status='delivered'
+              AND coalesce(d.state,'')<>'original_filed_as_junk'
+              AND coalesce(d.assessed_classification,'') NOT IN ('spam','dangerous')
+              AND NOT EXISTS (
+                  SELECT 1 FROM labels l
+                  WHERE l.message_id=m.id AND l.is_ground_truth=true AND l.active=true
+                    AND l.label IN ('spam','suspect','dangerous')
+              )
+              AND (lower(m.envelope_from)=$2 OR strpos(lower(m.from_header), $3) > 0)
+            """,
+            message_id,
+            address,
+            f"<{address}>",
         )
         apex_adverse_labels = await pool.fetchval(
             """
@@ -1510,8 +1052,13 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         )
     # Ancienneté de sept jours minimum : sans elle, un envoi massif d'adresses
     # fraîches sous un même apex s'auto-blanchirait en quelques minutes.
+    # Une messagerie publique ne s'éprouve pas : trois inconnus livrés depuis
+    # gmail.com ne disent rien d'un quatrième.
+    sender_apex_crowd = crowd_mailbox_domain(apex) if apex else False
     apex_established_locally = bool(
-        apex_delivered_count >= 3
+        not rows
+        and not sender_apex_crowd
+        and apex_delivered_count >= 3
         and isinstance(apex_track_record_age_days, int)
         and apex_track_record_age_days >= 7
         and int(apex_adverse_labels or 0) == 0
@@ -1568,8 +1115,10 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         "sender_domain": domain,
         "sender_apex": apex,
         "previous_message_count": len(rows),
+        "previous_active_days": len({row["captured_at"].date() for row in rows}),
         "first_seen": rows[-1]["captured_at"] if rows else current["captured_at"],
         "ground_truth_labels": label_counts,
+        "mail_profile_history": await profile_history(pool, message_id, participant),
         "ground_truth_feedback": [
             {
                 "label": str(row["label"]),
@@ -1583,6 +1132,9 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         ],
         "persistent_hold": bool(persistent_hold),
         "persistent_allow": bool(persistent_allow),
+        "ask_only_on_real_doubt": await asks_only_on_real_doubt(
+            pool, list(current["envelope_recipients"] or [])
+        ),
         "usual_hours_utc": usual_hours,
         "current_hour_utc": current["captured_at"].hour,
         "hour_previously_seen": current["captured_at"].hour in usual_hours,
@@ -1599,7 +1151,10 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
         "sender_domain_creation_date": (
             domain_profile["creation_date"] if domain_profile else None
         ),
-        "sender_domain_age_days": domain_profile["age_days"] if domain_profile else None,
+        "sender_domain_age_days": (
+            domain_age(dict(domain_profile), current["captured_at"])
+            if domain_profile else None
+        ),
         "sender_domain_countries": list(domain_profile["countries"] or []) if domain_profile else [],
         "current_transport_countries": current_country_values,
         "historical_transport_countries": known_country_values,
@@ -1607,6 +1162,8 @@ async def _history(pool: asyncpg.Pool[Any], message_id: str) -> dict[str, object
             set(current_country_values) - set(known_country_values)
         ),
         "apex_delivered_count": apex_delivered_count,
+        "sender_delivered_count": int(sender_delivered_count or 0),
+        "sender_apex_crowd": sender_apex_crowd,
         "apex_track_record_age_days": apex_track_record_age_days,
         "apex_adverse_label_count": int(apex_adverse_labels or 0),
         "apex_established_locally": apex_established_locally,
@@ -1656,6 +1213,262 @@ def _sensitive_form_categories(value: dict[str, object]) -> list[str]:
     return sorted(categories)
 
 
+def _attachment_signals(
+    attachments: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Traduit les constats du bac à sable fichier, sans décider du verdict."""
+    signals = attachment_clues(attachments)
+    incomplete = [value for value in attachments if value.get("analysis_incomplete")]
+    if incomplete:
+        signals.append(
+            {
+                "article_code": "DEEP-005",
+                "kind": "file_incomplete",
+                "occurrences": len(incomplete),
+                "attachment_references": [
+                    {
+                        "file_ref": str(value.get("sha256") or "")[:12],
+                        "filename": value.get("filename"),
+                        "content_type": value.get("content_type")
+                        or value.get("mime"),
+                        "reason": value.get("reason"),
+                        "error": value.get("error"),
+                        "technical_reason": _attachment_limit_reason(value),
+                    }
+                    for value in incomplete[:10]
+                ],
+            }
+        )
+    return signals
+
+
+def attested_locally(history: dict[str, object], *, authenticated: bool) -> bool:
+    """Ce domaine, authentifié, a-t-il déjà été livré ici ?
+
+    Ce n'est pas une preuve d'identité : un domaine authentique peut se faire
+    passer pour un autre. C'est un fait qui retire à la graphie seule le droit
+    d'accuser - nintendo-europe.com, aligné DMARC et livré deux fois, s'est vu
+    reprocher le 3 septembre 2026 d'« ajouter un mot » à nintendo.com.
+    """
+    if not authenticated:
+        return False
+    # Une messagerie publique (outlook.com, gmail.com...) réunit des inconnus :
+    # une livraison d'un de ses comptes n'atteste rien d'un autre. Le 3 novembre
+    # 2026, une adresse outlook.com jamais vue a ainsi emprunté Amazon sans
+    # charge (M-fc7f44). Un historique sans compte par adresse n'atteste pas.
+    crowd = history.get("sender_apex_crowd")
+    if crowd is None:
+        crowd = crowd_mailbox_domain(str(history.get("sender_apex") or ""))
+    if crowd:
+        return int(history.get("sender_delivered_count") or 0) >= 1
+    return int(history.get("apex_delivered_count") or 0) >= 1
+
+
+def _history_clue_codes(
+    history: dict[str, object], nature: dict[str, object] | None
+) -> set[str]:
+    """Les codes d'indice que l'historique produira, avant qu'il ne les produise.
+
+    Les indices d'historique naissent après les enquêteurs profonds et ne sont
+    écrits en base qu'à la fin : un enquêteur qui relit les indices en base ne
+    les voit donc jamais. Le contrôle d'identité, censé se taire devant un
+    expéditeur explicitement autorisé, vérifiait celui-ci comme un inconnu -
+    c'est ce qui a retenu un envoi autorisé le 3 septembre 2026.
+    """
+    signals, _ = _history_signals(history, nature)
+    codes: set[str] = set()
+    for signal in signals:
+        rule = _SIGNAL_RULES.get(str(signal.get("article_code") or ""))
+        if rule:
+            codes.add(rule[0])
+    return codes
+
+
+def _history_signals(
+    history: dict[str, object], nature: dict[str, object] | None
+) -> tuple[list[dict[str, object]], int | None]:
+    """Indices tirés de l'historique isolé du destinataire et de l'expéditeur."""
+    signals: list[dict[str, object]] = []
+    labels = history.get("ground_truth_labels") or {}
+    legitimate = int(labels.get("legitimate", 0)) if isinstance(labels, dict) else 0
+    adverse = sum(
+        int(labels.get(name, 0))
+        for name in ("spam", "suspect", "dangerous")
+        if isinstance(labels, dict)
+    )
+    if legitimate >= 3 and adverse == 0:
+        signals.append(
+            {"article_code": "HIST-001", "kind": "confirmed_sender", "count": legitimate}
+        )
+    profile_memory = history.get("mail_profile_history") or {}
+    profile_labels = profile_memory.get("labels") or {}
+    profile_legitimate = int(profile_labels.get("legitimate", 0))
+    profile_adverse = sum(
+        int(profile_labels.get(name, 0))
+        for name in ("spam", "suspect", "dangerous", "undetermined")
+    )
+    if (
+        profile_legitimate >= 2 and profile_adverse == 0
+        and not adverse and legitimate < 3
+    ):
+        signals.append({
+            "article_code": "HIST-006", "kind": "confirmed_mail_profile",
+            "count": profile_legitimate, "profile": profile_memory.get("profile"),
+        })
+    if (
+        isinstance(nature, dict)
+        and nature.get("sending_mode") == "bulk"
+        and int(history.get("previous_message_count") or 0) == 0
+        and legitimate == 0
+    ):
+        signals.append(
+            {
+                "article_code": "NATURE-002",
+                "kind": "unsolicited_bulk",
+                "sender_address": history.get("sender_address"),
+                "sender_apex": history.get("sender_apex"),
+                "unsubscribe_offered": bool(nature.get("unsubscribe_offered")),
+                "claim_registers": list(nature.get("claim_registers") or []),
+            }
+        )
+    if int(history.get("previous_message_count") or 0) == 0:
+        signals.append({"article_code": "HIST-002", "kind": "first_seen"})
+        if history.get("apex_established_locally"):
+            signals.append(
+                {
+                    "article_code": "HIST-004",
+                    "kind": "apex_established_locally",
+                    "apex": history.get("sender_apex"),
+                    "delivered_count": history.get("apex_delivered_count"),
+                    "apex_track_record_age_days": history.get(
+                        "apex_track_record_age_days"
+                    ),
+                }
+            )
+    current_language = (nature or {}).get("language")
+    recipient_language_total = int(history.get("recipient_language_total") or 0)
+    recipient_language_dominance = float(
+        history.get("recipient_language_dominance") or 0
+    )
+    if (
+        current_language
+        and current_language == history.get("recipient_dominant_language")
+        and recipient_language_total >= 10
+        and recipient_language_dominance >= 0.7
+    ):
+        signals.append(
+            {
+                "article_code": "HIST-005",
+                "kind": "recipient_usual_language",
+                "language": current_language,
+                "recipient_language_total": recipient_language_total,
+                "recipient_language_dominance": recipient_language_dominance,
+            }
+        )
+    if history.get("persistent_allow"):
+        signals.append(
+            {"article_code": "POLICY-002", "kind": "authenticated_sender_allow"}
+        )
+    domain_age = history.get("sender_domain_age_days")
+    if isinstance(domain_age, int) and domain_age < 90:
+        signals.append(
+            {
+                "article_code": "DOMAIN-001",
+                "kind": "recent_sender_domain",
+                "age_days": domain_age,
+                "creation_date": history.get("sender_domain_creation_date"),
+            }
+        )
+    elif isinstance(domain_age, int) and domain_age >= 730:
+        signals.append(
+            {
+                "article_code": "DOMAIN-002",
+                "kind": "established_sender_domain",
+                "age_days": domain_age,
+                "creation_date": history.get("sender_domain_creation_date"),
+            }
+        )
+    elif not history.get("sender_domain_enriched"):
+        signals.append(
+            {
+                "article_code": "DOMAIN-003",
+                "kind": "sender_domain_age_unavailable",
+                "sender_domain": history.get("sender_domain"),
+            }
+        )
+    zscore = history.get("size_zscore")
+    mean_size = history.get("mean_size_bytes")
+    current_size = history.get("current_size_bytes")
+    # Une habitude se lit sur des jours, pas sur des messages : douze envois
+    # en quatre jours, dont cinq dans la même minute, ne font pas d'horaire
+    # habituel (M-e36c20, 15 octobre 2026, 11 h 33 pris pour un écart).
+    habit = (
+        int(history.get("previous_message_count") or 0) >= 10
+        and int(history.get("previous_active_days") or 0) >= 10
+    )
+    usual_hours_utc = history.get("usual_hours_utc") or []
+    # Le z-score de taille s'emballe quand les tailles passées se ressemblent
+    # trop : une newsletter 1,26x plus lourde que d'habitude donnait un écart
+    # de 8,8 (M-a5b072, FlightAware). On n'y voit une anomalie que sur un
+    # historique fourni ET un écart franc en valeur, hors fourchette moitié /
+    # double. Un vrai saut (pièce jointe inhabituelle, x10) tire encore.
+    unusual_size = bool(
+        isinstance(zscore, (float, int))
+        and abs(zscore) >= 3
+        and habit
+        and isinstance(mean_size, (float, int))
+        and mean_size > 0
+        and isinstance(current_size, (float, int))
+        and not (0.5 * mean_size <= current_size <= 2 * mean_size)
+    )
+    unusual_hour = (
+        habit
+        and len(usual_hours_utc) <= 8
+        and not history.get("hour_previously_seen")
+    )
+    unusual_country = bool(
+        habit and history.get("unfamiliar_transport_countries")
+    )
+    if unusual_size or unusual_hour or unusual_country:
+        signals.append({"article_code": "HIST-003", "kind": "behavior_deviation"})
+    return signals, domain_age if isinstance(domain_age, int) else None
+
+
+def _correlation_signals(
+    *,
+    authenticated: bool,
+    domain_age: int | None,
+    content_context: dict[str, object] | None,
+    headers_facts: dict[str, object] | None,
+) -> list[dict[str, object]]:
+    """Preuves qui n'existent que par la réunion de plusieurs faits."""
+    signals: list[dict[str, object]] = []
+    transactional_purpose = str((content_context or {}).get("purpose") or "") in {
+        "one_time_authentication",
+        "account_security",
+        "parcel_delivery",
+        "payment",
+    }
+    if transactional_purpose and authenticated and domain_age is not None and domain_age >= 730:
+        signals.append(
+            {
+                "article_code": "CORR-012",
+                "kind": "transactional_coherence",
+                "purpose": (content_context or {}).get("purpose"),
+                "domain_age_days": domain_age,
+            }
+        )
+    if bool((headers_facts or {}).get("rfc8058_structure_aligned")) and authenticated:
+        signals.append(
+            {
+                "article_code": "CORR-013",
+                "kind": "authenticated_rfc8058_unsubscribe",
+                "unsubscribe_apex": (headers_facts or {}).get("unsubscribe_apex"),
+            }
+        )
+    return signals
+
+
 def _signals(
     urls: list[dict[str, object]],
     attachments: list[dict[str, object]],
@@ -1667,8 +1480,6 @@ def _signals(
     sender_apex: str = "",
     domain_ages: dict[str, int] | None = None,
     organisations: dict[str, set[str]] | None = None,
-    sender_site: dict[str, str] | None = None,
-    message_registers: set[str] | None = None,
     content_context: dict[str, object] | None = None,
     headers_facts: dict[str, object] | None = None,
 ) -> list[dict[str, object]]:
@@ -1688,11 +1499,6 @@ def _signals(
                 "sender_apex": sender_apex,
             }
         )
-    # Ce que l'expéditeur publie de lui-même, comparé à ce qu'il prétend faire.
-    # C'est le seul angle qui reste quand toute la technique est en règle :
-    # un serveur compromis garde son authentification, jamais son métier.
-    site_text = str((sender_site or {}).get("text") or "")
-    site_apex = str((sender_site or {}).get("apex") or sender_apex)
     direct_apexes = {
         str(value.get("initial_apex") or "")
         for value in urls
@@ -1750,6 +1556,8 @@ def _signals(
     # Le service conditionnel se juge avant la redirection : il établit une
     # dissimulation, là où une redirection ne fait que la rendre possible.
     signals.extend(_cloaking_signals(urls))
+    signals.extend(_verification_gate_signals(urls, sender_apex=sender_apex))
+    signals.extend(_opaque_landing_signals(urls, sender_apex=sender_apex))
     cross_apex = [value for value in urls if value.get("cross_apex_redirect")]
     if cross_apex:
         pairs = sorted(
@@ -1934,6 +1742,7 @@ def _signals(
         for value in urls
         if value.get("role") != "render_resource"
         and not value.get("navigation_limit_explained")
+        and not _is_definitive_target_failure(value.get("error"))
         and (value.get("error") or value.get("analysis_incomplete"))
     ]
     if incomplete_urls:
@@ -1978,207 +1787,21 @@ def _signals(
             }
         )
 
-    material_attachments: list[dict[str, object]] = []
-    incomplete_attachments: list[dict[str, object]] = []
-    for value in attachments:
-        try:
-            score = float(value.get("score") or 0)
-        except (TypeError, ValueError):
-            score = 0
-        findings = value.get("findings")
-        severe = any(
-            isinstance(item, dict) and item.get("severity") in {"high", "critical"}
-            for item in (findings if isinstance(findings, list) else [])
-        )
-        if score >= 0.7 or severe:
-            material_attachments.append(value)
-        if value.get("analysis_incomplete"):
-            incomplete_attachments.append(value)
     # Ce que le bac à sable a réellement vu, constat par constat. L'ancien
     # signal unique disait « quelque chose de matériel » sans dire quoi : une
     # macro, une archive chiffrée et un PDF qui lance un programme y étaient
     # indiscernables, et tout ce qui passait sous le seuil disparaissait.
-    signals.extend(attachment_clues(attachments))
-    if incomplete_attachments:
-        signals.append(
-            {
-                "article_code": "DEEP-005",
-                "kind": "file_incomplete",
-                "occurrences": len(incomplete_attachments),
-                "attachment_references": [
-                    {
-                        "file_ref": str(value.get("sha256") or "")[:12],
-                        "filename": value.get("filename"),
-                        "content_type": value.get("content_type") or value.get("mime"),
-                        "reason": value.get("reason"),
-                        "error": value.get("error"),
-                        "technical_reason": _attachment_limit_reason(value),
-                    }
-                    for value in incomplete_attachments[:10]
-                ],
-            }
+    signals.extend(_attachment_signals(attachments))
+    history_clues, domain_age = _history_signals(history, nature)
+    signals.extend(history_clues)
+    signals.extend(
+        _correlation_signals(
+            authenticated=authenticated,
+            domain_age=domain_age,
+            content_context=content_context,
+            headers_facts=headers_facts,
         )
-    labels = history.get("ground_truth_labels") or {}
-    legitimate = int(labels.get("legitimate", 0)) if isinstance(labels, dict) else 0
-    adverse = sum(
-        int(labels.get(name, 0))
-        for name in ("spam", "suspect", "dangerous")
-        if isinstance(labels, dict)
     )
-    if legitimate >= 3 and adverse == 0:
-        signals.append(
-            {"article_code": "HIST-001", "kind": "confirmed_sender", "count": legitimate}
-        )
-    # Un envoi de masse est légitime quand le destinataire l'a demandé. Sans
-    # aucun échange antérieur ni confirmation humaine, ce lien d'abonnement
-    # n'est établi par rien : le cadre reste à la charge de l'expéditeur.
-    if (
-        isinstance(nature, dict)
-        and nature.get("sending_mode") == "bulk"
-        and int(history.get("previous_message_count") or 0) == 0
-        and legitimate == 0
-    ):
-        signals.append(
-            {
-                "article_code": "NATURE-002",
-                "kind": "unsolicited_bulk",
-                "unsubscribe_offered": bool(nature.get("unsubscribe_offered")),
-                "claim_registers": list(nature.get("claim_registers") or []),
-            }
-        )
-    if int(history.get("previous_message_count") or 0) == 0:
-        signals.append({"article_code": "HIST-002", "kind": "first_seen"})
-        # Apex éprouvé localement : cette adresse précise est nouvelle, mais
-        # d'autres adresses du même domaine ont déjà livré sans étiquette
-        # défavorable - l'ancienneté et l'absence d'étiquette humaine
-        # protègent contre un domaine qui s'auto-blanchirait vite.
-        if history.get("apex_established_locally"):
-            signals.append(
-                {
-                    "article_code": "HIST-004",
-                    "kind": "apex_established_locally",
-                    "apex": history.get("sender_apex"),
-                    "delivered_count": history.get("apex_delivered_count"),
-                    "apex_track_record_age_days": history.get(
-                        "apex_track_record_age_days"
-                    ),
-                }
-            )
-    # Langue habituelle du destinataire : ce que ce destinataire précis reçoit
-    # déjà très majoritairement, jamais ce que d'autres destinataires lisent.
-    current_language = (nature or {}).get("language")
-    recipient_language_total = int(history.get("recipient_language_total") or 0)
-    recipient_language_dominance = float(
-        history.get("recipient_language_dominance") or 0
-    )
-    if (
-        current_language
-        and current_language == history.get("recipient_dominant_language")
-        and recipient_language_total >= 10
-        and recipient_language_dominance >= 0.7
-    ):
-        signals.append(
-            {
-                "article_code": "HIST-005",
-                "kind": "recipient_usual_language",
-                "language": current_language,
-                "recipient_language_total": recipient_language_total,
-                "recipient_language_dominance": recipient_language_dominance,
-            }
-        )
-    if history.get("persistent_allow"):
-        signals.append(
-            {"article_code": "POLICY-002", "kind": "authenticated_sender_allow"}
-        )
-    domain_age = history.get("sender_domain_age_days")
-    if isinstance(domain_age, int) and domain_age < 90:
-        signals.append(
-            {
-                "article_code": "DOMAIN-001",
-                "kind": "recent_sender_domain",
-                "age_days": domain_age,
-                "creation_date": history.get("sender_domain_creation_date"),
-            }
-        )
-    elif isinstance(domain_age, int) and domain_age >= 730:
-        signals.append(
-            {
-                "article_code": "DOMAIN-002",
-                "kind": "established_sender_domain",
-                "age_days": domain_age,
-                "creation_date": history.get("sender_domain_creation_date"),
-            }
-        )
-    elif not history.get("sender_domain_enriched"):
-        signals.append(
-            {
-                "article_code": "DOMAIN-003",
-                "kind": "sender_domain_age_unavailable",
-                "sender_domain": history.get("sender_domain"),
-            }
-        )
-    # Cohérence transactionnelle : une notification déclenchée par l'action du
-    # destinataire (confirmation, reçu, code) ne prouve rien seule - un
-    # attaquant écrit aussi « confirmez votre commande ». Les trois faits
-    # ensemble sont plus durs à contrefaire qu'aucun pris seul : aligner son
-    # authentification sur un domaine établi depuis deux ans qu'on ne
-    # contrôle pas coûte cher.
-    transactional_purpose = str((content_context or {}).get("purpose") or "") in {
-        "one_time_authentication",
-        "account_security",
-        "parcel_delivery",
-        "payment",
-    }
-    if (
-        transactional_purpose
-        and authenticated
-        and isinstance(domain_age, int)
-        and domain_age >= 730
-    ):
-        signals.append(
-            {
-                "article_code": "CORR-012",
-                "kind": "transactional_coherence",
-                "purpose": (content_context or {}).get("purpose"),
-                "domain_age_days": domain_age,
-            }
-        )
-    # Désinscription RFC 8058 authentifiée : le hook headers ne consigne que
-    # l'alignement syntaxique (HEADERS-004, neutre) - un From usurpé aligne
-    # aussi facilement ses deux en-têtes qu'un expéditeur réel. Ce n'est que
-    # combiné à une authentification DMARC réellement vérifiée que la
-    # structure devient une preuve, faible et corrélée.
-    if bool((headers_facts or {}).get("rfc8058_structure_aligned")) and authenticated:
-        signals.append(
-            {
-                "article_code": "CORR-013",
-                "kind": "authenticated_rfc8058_unsubscribe",
-                "unsubscribe_apex": (headers_facts or {}).get("unsubscribe_apex"),
-            }
-        )
-    zscore = history.get("size_zscore")
-    # L'heure ne parle que pour un expéditeur aux horaires réguliers : un
-    # émetteur déclenché par l'utilisateur (confirmation de commande...)
-    # écrit à toute heure, et une heure jamais vue ne dit rien de lui. On ne
-    # retient donc l'écart d'heure que pour un expéditeur au planning
-    # concentré (peu d'heures distinctes vues jusqu'ici).
-    usual_hours_utc = history.get("usual_hours_utc") or []
-    regular_schedule = len(usual_hours_utc) <= 8
-    unusual_hour = (
-        int(history.get("previous_message_count") or 0) >= 10
-        and regular_schedule
-        and not history.get("hour_previously_seen")
-    )
-    unusual_country = bool(
-        int(history.get("previous_message_count") or 0) >= 10
-        and history.get("unfamiliar_transport_countries")
-    )
-    if (
-        (isinstance(zscore, (float, int)) and abs(zscore) >= 3)
-        or unusual_hour
-        or unusual_country
-    ):
-        signals.append({"article_code": "HIST-003", "kind": "behavior_deviation"})
     if not complete:
         signals.append({"article_code": "POLICY-001", "kind": "incomplete_evidence"})
     return signals
@@ -2195,17 +1818,20 @@ async def _domain_ages(
     """
     rows = await pool.fetch(
         """
-        SELECT e.value_normalized AS domain, (en.data->>'age_days')::int AS age_days
+        SELECT e.value_normalized AS domain, en.data,
+               m.captured_at
         FROM entities e JOIN enrichments en ON en.id=e.enrichment_id
+        JOIN messages m ON m.id=e.message_id
         WHERE e.message_id=$1::uuid AND e.entity_type='domain'
-          AND en.status='ok' AND en.data ? 'age_days'
+          AND en.status='ok'
+          AND (en.data ? 'age_days' OR en.data ? 'creation_date')
         """,
         message_id,
     )
     ages: dict[str, int] = {}
     for row in rows:
         apex = _apex(str(row["domain"] or ""))
-        age = row["age_days"]
+        age = domain_age(_json_object(row["data"]), row["captured_at"])
         if not apex or age is None:
             continue
         ages[apex] = min(age, ages.get(apex, age))
@@ -2267,9 +1893,8 @@ async def _sender_site(
 ) -> dict[str, str] | None:
     """Ce que l'expéditeur publie sur sa page d'accueil, quand la question se pose.
 
-    La visite n'a lieu que si le message se réclame d'une activité précise :
-    sans registre invoqué, il n'y a rien à comparer, et rien ne justifie
-    d'aller chercher un site de plus. C'est ce qui garde le coût négligeable.
+    Les enquêteurs d'identité et d'activité partagent cette lecture. Un refus
+    ou une page interstitielle reste une absence de fait, sans seconde visite.
     """
     if not sender_apex or not registers:
         return None
@@ -2293,6 +1918,11 @@ async def _sender_site(
     }
 
 
+# Marqueur du constat « domaine officiel avec un mot en plus », posé sans
+# modèle. Lu par le moteur de verdict pour ne condamner que sur un fait.
+MECHANICAL_APPENDED = "domaine_officiel_avec_mot_en_plus"
+
+
 async def _identity_relation(
     pool: asyncpg.Pool[Any],
     client: httpx.AsyncClient,
@@ -2300,26 +1930,45 @@ async def _identity_relation(
     *,
     display_name: str,
     from_apex: str,
+    organisations: dict[str, set[str]] | None = None,
+    attested_locally: bool = False,
+    from_domain: str = "",
 ) -> tuple[dict[str, object] | None, dict[str, object]]:
     """Cherche qui est ce nom, qui est ce domaine, puis fait juger le rapport.
 
-    Trois garde-fous tiennent l'ensemble. Le premier : quand la recherche
+    Quatre garde-fous tiennent l'ensemble. Le premier : quand la recherche
     attribue le domaine émetteur à l'organisation cherchée, la question est
     close sans appeler personne - filiale, domaine régional, prestataire.
-    Le deuxième : une panne, un quota ou une réponse hors format ne produit
-    aucun indice. Le troisième : le modèle ne voit que deux noms et ce qu'une
+    Le deuxième : un fait de propriété déjà en base - délégation NS, titulaire
+    RDAP, signataire DKIM - qui rattache l'émetteur à un apex officiel la
+    clôt de même ; la graphie seule accusait e-ca-paris.fr le 3 septembre
+    2026 alors que ses serveurs de noms étaient ceux du Crédit Agricole.
+    Le troisième : une panne, un quota ou une réponse hors format ne produit
+    aucun indice. Le quatrième : le modèle ne voit que deux noms et ce qu'une
     recherche publique en dit ; rien du message ne sort d'ici.
     """
     from sentimail_v3.code.identity_relation import (
         RELATION_PROMPT,
         appended_to_official,
+        owned_by_official,
         relation_clue,
         relation_question,
     )
     from sentimail_v3.code.organisation_lookup import belongs
-    from sentimail_v3.observation.organisation_search import about_domain, about_name
+    from sentimail_v3.observation.organisation_search import (
+        SearchUnavailable,
+        about_domain,
+        about_name,
+    )
 
-    sur_le_nom, apexes = await about_name(pool, client, settings, display_name)
+    try:
+        sur_le_nom, apexes = await about_name(pool, client, settings, display_name)
+    except SearchUnavailable as exc:
+        # Le moteur n'a pas répondu : la question n'a pas de matière, elle ne
+        # se pose pas au modèle, et le fait est écrit pour que l'enquêteur
+        # note « non vérifié » plutôt qu'un vide.
+        _log("deep.identity_relation_search_unavailable", kind=exc.kind, detail=exc.detail)
+        return None, {"searched": False, "error": True, "search_unavailable": exc.kind}
     if apexes and belongs(from_apex, apexes):
         _log(
             "deep.identity_relation_cleared",
@@ -2331,13 +1980,27 @@ async def _identity_relation(
             "cleared": True,
             "official_apexes": apexes,
         }
-    imite = appended_to_official(from_apex, apexes)
+    proprietaire = owned_by_official(from_apex, apexes, organisations or {})
+    if proprietaire:
+        _log(
+            "deep.identity_relation_owned",
+            from_apex=from_apex,
+            officiel=proprietaire,
+        )
+        return None, {
+            "searched": True,
+            "cleared": True,
+            "owned_via": proprietaire,
+            "official_apexes": apexes,
+        }
+    imite = appended_to_official(from_apex, apexes, from_domain=from_domain)
     if imite:
         # Le domaine porte le nom d'un domaine officiel avec un mot en plus.
         # Le constat se lit sans avis, et le soumettre au modèle risquait ce
         # qu'il a fait : y voir un domaine de service de l'enseigne.
         _log("deep.identity_relation_appended", from_apex=from_apex, officiel=imite)
         return (
+            _sans_charge_si_atteste(
             {
                 "clue_code": "IDENTITY_CLAIMED_ORGANISATION_REFUTED",
                 "article_code": "DEEP-022",
@@ -2351,18 +2014,33 @@ async def _identity_relation(
                 ),
                 "facts": {
                     "from_apex": from_apex,
+                    "from_domain": from_domain or from_apex,
                     "claimed_organisation": display_name.strip()[:80],
-                    "explication": (
-                        f"{from_apex} n'est pas {imite} : il en reprend le nom "
-                        "avec un mot en plus."
-                    ),
+                    # Pas d'explication à part : l'énoncé dit déjà tout, et
+                    # l'avis la répétait après la phrase qui nomme les domaines.
                     "official_apexes": apexes[:3],
+                    # Le constat est mécanique : c'est lui, et non la lecture
+                    # du modèle, qui peut fonder un classement sans question.
+                    "constat": MECHANICAL_APPENDED,
                     "verified_by": "search",
                 },
             },
+                attested_locally,
+            ),
             {"searched": True, "appended_to": imite, "official_apexes": apexes},
         )
-    sur_le_domaine = await about_domain(pool, client, settings, from_apex)
+    try:
+        sur_le_domaine = await about_domain(pool, client, settings, from_apex)
+    except SearchUnavailable as exc:
+        # Le nom sortait de la mémoire, le domaine devait partir dehors : sans
+        # lui, le modèle comparerait un nom à une chaîne de caractères.
+        _log("deep.identity_relation_search_unavailable", kind=exc.kind, detail=exc.detail)
+        return None, {
+            "searched": False,
+            "error": True,
+            "search_unavailable": exc.kind,
+            "official_apexes": apexes,
+        }
     try:
         content, _ = await provider_chat_json(
             pool,
@@ -2398,19 +2076,111 @@ async def _identity_relation(
         from_apex=from_apex,
         official_apexes=apexes,
         searched=bool(sur_le_nom and sur_le_domaine),
+        from_domain=from_domain,
     )
+    if clue is not None:
+        clue = _sans_charge_si_atteste(clue, attested_locally)
     return clue, {
         "searched": True,
         "results_on_name": len(sur_le_nom),
         "results_on_domain": len(sur_le_domaine),
         "official_apexes": apexes,
+        # Ce que le modèle a lu du rapport : vrai, faux ou indécis. Sans ce
+        # fait, une organisation trouvée au rapport non tranché passait pour
+        # un vide chez l'enquêteur sender_relation.
+        "rapport": parsed.get("rapport"),
+    }
+
+
+def _sans_charge_si_atteste(
+    clue: dict[str, object], attested_locally: bool
+) -> dict[str, object]:
+    """Le constat reste écrit ; s'il vise un domaine authentifié déjà livré, il
+    cesse de charger.
+
+    L'indice garde son article et son code : il est jugé et appris comme les
+    autres. Seule sa direction change, parce qu'un fait - ce domaine a
+    authentifié des messages qu'on a livrés - vaut plus que la ressemblance
+    de deux noms. Un inconnu qui accole une marque reste accusé à pleine
+    force.
+    """
+    if not attested_locally:
+        return clue
+    facts = dict(clue.get("facts") or {})
+    facts["attested_locally"] = True
+    return {
+        **clue,
+        "direction": "neutral",
+        "strength": 0,
+        "statement": (
+            str(clue.get("statement") or "")
+            + " Cet expéditeur est toutefois authentifié et t’a déjà écrit : "
+            "je le note sans l’accuser."
+        ),
+        "facts": facts,
+    }
+
+
+def _sans_charge_si_cite(clue: dict[str, object]) -> dict[str, object]:
+    """La marque n'est écrite que dans le texte transféré d'une messagerie
+    publique : le constat reste écrit pour le juge, il cesse de charger et ne
+    fonde aucun faisceau."""
+    if clue.get("direction") != "adverse":
+        return clue
+    facts = dict(clue.get("facts") or {})
+    facts["uncharged"] = "cited_only"
+    return {
+        **clue,
+        "direction": "neutral",
+        "strength": 0,
+        "statement": (
+            str(clue.get("statement") or "")
+            + " La marque n’apparaît que dans le texte transféré depuis une "
+            "messagerie publique : je le note sans l’accuser."
+        ),
+        "facts": facts,
     }
 
 
 def _display_name(from_header: str) -> str:
     """La partie lisible d'un en-tête « De », sans son adresse."""
     nom, _ = parseaddr(from_header)
-    return nom.strip()
+    return sans_bruit(nom.strip())
+
+
+def _from_domain_of(parsed: Any) -> str:
+    """Le domaine complet de l'adresse affichée, sous-domaines compris.
+
+    L'apex dit qui possède ; le domaine complet dit ce qu'on a voulu faire
+    lire. « cic-notification.sju.somesepta.best » porte le nom volé dans un
+    sous-domaine que l'apex « somesepta.best » ne montre pas.
+    """
+    _, adresse = parseaddr(str(parsed.message.get("from_header") or ""))
+    return adresse.rsplit("@", 1)[-1].strip().casefold() if "@" in adresse else ""
+
+
+def _from_address_of(parsed: Any) -> str:
+    """L'adresse affichée, telle qu'elle est écrite."""
+    _, adresse = parseaddr(str(parsed.message.get("from_header") or ""))
+    return adresse.strip() if "@" in adresse else ""
+
+
+def _subject_of(parsed: Any) -> str:
+    """L'objet que le destinataire lit, sans les signes glissés dans les mots.
+
+    « Carte A′̍meli » ne désigne personne pour un lecteur d'organisation ; le
+    même objet nettoyé désigne l'Assurance Maladie (M-96852d, 30 octobre 2026).
+    """
+    return sans_bruit(str(parsed.message.get("subject") or ""))
+
+
+def _readable_body(parsed: Any) -> str:
+    """Le corps que le destinataire lit : le texte brut, sinon le texte visible
+    du HTML. Même point de départ que le hook contenu et que le dossier du
+    juge : trois lecteurs, un seul texte."""
+    return readable_text(
+        parsed.message.get("body_text"), parsed.message.get("body_html")
+    )[0]
 
 
 def _display_name_of(parsed: Any) -> str:
@@ -2425,6 +2195,53 @@ def _display_name_of(parsed: Any) -> str:
     return _display_name(str(parsed.message.get("from_header") or ""))
 
 
+async def _claimed_organisation(
+    pool: asyncpg.Pool[Any],
+    client: httpx.AsyncClient,
+    settings: Settings,
+    *,
+    display_name: str,
+    subject: str,
+    body: str,
+) -> tuple[str, dict[str, object]]:
+    """Au nom de qui ce message se présente-t-il ? Lu, jamais deviné.
+
+    Le nom affiché ne suffit plus : le 16 septembre 2026, « Annuel-Famille »
+    ne désignait personne et « Prime Famille » était écrit dans le corps. Le
+    modèle lit les trois - nom, objet, texte visible - et recopie le nom tel
+    qu'il est écrit ; l'appelant vérifie ensuite que le message l'écrit bien.
+    Une panne rend une chaîne vide et se note : elle n'accuse personne.
+    """
+    from sentimail_v3.code.identity_relation import (
+        CLAIM_PROMPT,
+        claim_question,
+        parse_claim,
+    )
+
+    try:
+        content, _ = await provider_chat_json(
+            pool,
+            client,
+            settings,
+            messages=[
+                {"role": "system", "content": CLAIM_PROMPT},
+                {
+                    "role": "user",
+                    "content": claim_question(
+                        display_name=display_name, subject=subject, text=body
+                    ),
+                },
+            ],
+            max_tokens=200,
+            role="sender_relation",
+        )
+    except Exception as exc:  # noqa: BLE001 - une lecture manquée n'accuse pas
+        _log("deep.claim_error", error=type(exc).__name__)
+        return "", {"asked": True, "error": type(exc).__name__}
+    organisation = parse_claim(content)
+    return organisation, {"asked": True, "read": organisation}
+
+
 async def _activity_coherence(
     pool: asyncpg.Pool[Any],
     client: httpx.AsyncClient,
@@ -2434,15 +2251,26 @@ async def _activity_coherence(
     body: str,
     clue_codes: set[str],
     display_name: str = "",
+    message_purpose: str = "",
+    *,
+    always: bool = False,
 ) -> dict[str, object] | None:
     """Demande à un modèle si ce message peut émaner de cet expéditeur.
 
     L'appel est isolé et court : une question, une réponse binaire motivée. Il
     est aussi fail-soft - une panne du modèle ne produit aucun indice, et
     surtout aucune accusation par défaut.
+
+    `always` retire les dispenses de `should_ask` : l'enquêteur
+    `sender_relation` a déjà décidé que le métier lu est exploitable, et il
+    regarde aussi les expéditeurs connus.
     """
     headline = str((site or {}).get("text") or "")[:600]
-    if not should_ask(headline, clue_codes):
+    if not always and not should_ask(
+        headline,
+        clue_codes,
+        message_purpose=message_purpose,
+    ):
         return None
     try:
         content, _ = await provider_chat_json(
@@ -2458,6 +2286,7 @@ async def _activity_coherence(
                         display_name=display_name,
                         subject=subject,
                         body=body,
+                        message_purpose=message_purpose,
                     ),
                 },
             ],
@@ -2472,7 +2301,13 @@ async def _activity_coherence(
         parsed = json.loads(content[start : end + 1])
     except (ValueError, TypeError):
         return None
-    return coherence_clue(parsed, sender_apex=str((site or {}).get("apex") or ""))
+    return coherence_clue(
+        parsed,
+        sender_apex=str((site or {}).get("apex") or ""),
+        display_name=display_name,
+        published_activity=headline,
+        message_subject=subject,
+    )
 
 
 async def analyze_message(
@@ -2481,6 +2316,8 @@ async def analyze_message(
     settings: Settings,
     message_id: str,
 ) -> dict[str, object]:
+    deadline = monotonic() + max(0.001, float(getattr(settings, "deep_analysis_deadline_seconds", 240)))
+    cache_key = await observation_fingerprint(pool, message_id, settings)
     stored = await pool.fetchval(
         "SELECT raw_eml FROM messages WHERE id=$1::uuid", message_id
     )
@@ -2488,10 +2325,10 @@ async def analyze_message(
     if not isinstance(raw, bytes):
         raise TypeError("raw message unavailable")
     urls, urls_complete, url_coverage = await _analyze_urls(
-        pool, client, settings, message_id, raw
+        pool, client, settings, message_id, raw, deadline=deadline
     )
     attachments, attachments_complete = await _analyze_attachments(
-        pool, client, settings, message_id, raw
+        pool, client, settings, message_id, raw, deadline=deadline
     )
     history = await _history(pool, message_id)
     # Une panne ou une absence RDAP/WHOIS retire une information de contexte,
@@ -2505,18 +2342,31 @@ async def analyze_message(
     domain_ages = await _domain_ages(pool, message_id)
     organisations = await _domain_organisations(pool, message_id)
     parsed = parse_message(raw)
+    try:
+        stored_facts = _json_object(await pool.fetchval("SELECT facts FROM messages WHERE id=$1::uuid", message_id))
+    except (TypeError, ValueError):
+        stored_facts = {}
+    visible = stored_facts.get("visible_content")
+    body = (visible["text"] if isinstance(visible, dict)
+            and visible.get("version") == VISIBLE_CONTENT_VERSION
+            and isinstance(visible.get("text"), str) and not visible.get("truncated")
+            else _readable_body(parsed))
+    corps = _body_with_attachments(body, attachments)
     registers = activity_registers(
         str(parsed.message.get("subject") or ""),
-        str(parsed.message.get("body_text") or "")[:8000],
+        corps[:8000],
     )
-    sender_site = await _sender_site(client, settings, sender_apex, registers)
-    # Deux enquêteurs ont besoin de cette même page. La lire une fois par
-    # enquêteur payait deux fois le même aller-retour ; quand le message
-    # n'invoque aucun registre, la lecture ci-dessus n'a pas eu lieu et il
-    # faut la faire ici.
-    site_partage = sender_site or await _sender_site(
-        client, settings, sender_apex, {"coherence"}
-    )
+    # La cohérence de l'identité a besoin de la page même sans registre
+    # d'activité. Un résultat absent est partagé aussi, jamais redemandé.
+    site_partage = await load_observation(pool, message_id, "sender_site", cache_key) if cache_key else None
+    if site_partage is None:
+        try:
+            async with asyncio.timeout(max(0.001, min(45, deadline - monotonic()))):
+                site_partage = await _sender_site(client, settings, sender_apex, registers or {"coherence"})
+        except TimeoutError:
+            site_partage = None
+        if cache_key and site_partage is not None:
+            await save_observation(pool, message_id, "sender_site", cache_key, site_partage)
     # Les enquêteurs qui ont besoin du monde extérieur passent par leur
     # registre : chacun est exécuté, chacun rend compte, et le superviseur peut
     # constater qu'ils ont bien tourné. Enterré dans cette fonction, un tel
@@ -2526,6 +2376,8 @@ async def analyze_message(
         client=client,
         settings=settings,
         message_id=message_id,
+        observation_fingerprint=cache_key,
+        analysis_deadline=deadline,
         clue_codes={
             str(row["clue_code"])
             for row in await pool.fetch(
@@ -2536,18 +2388,41 @@ async def analyze_message(
                 """,
                 message_id,
             )
-        },
+        }
+        # Les indices d'historique n'existent pas encore en base à cet
+        # instant : sans eux, un expéditeur explicitement autorisé est
+        # vérifié comme un inconnu.
+        | _history_clue_codes(history, nature),
         sender_apex=sender_apex,
-        subject=str(parsed.message.get("subject") or ""),
-        body=str(parsed.message.get("body_text") or ""),
+        # Ce que la délégation DNS, le RDAP et DKIM attestent de chaque
+        # domaine du message : un fait de propriété, là où la graphie seule
+        # accuse.
+        organisations=organisations,
+        subject=_subject_of(parsed),
+        # Le texte que le destinataire lit, d'où qu'il vienne : sur un mail
+        # HTML seul, body_text est vide et les enquêteurs lisaient le vide.
+        body=corps,
         # Le nom que le destinataire lit. C'est lui qui porte l'identité
         # revendiquée, et le domaine qui dit qui a réellement envoyé : les
         # comparer est le seul moyen de voir un message se présenter sous une
         # identité qui n'est pas la sienne.
         display_name=_display_name_of(parsed),
+        from_domain=_from_domain_of(parsed),
+        # L'adresse entière, pour reconnaître un nom de personne qu'elle
+        # écrit (« sophia.wong@ ») : une personne ne se cherche pas comme une
+        # organisation.
+        from_address=_from_address_of(parsed),
         sender_site=site_partage,
+        message_purpose=str(content_context.get("purpose") or ""),
+        # Authentifié et déjà livré : un constat de graphie ne charge plus.
+        sender_attested=attested_locally(history, authenticated=authenticated),
+        # Le destinataire, pour que son nom ne parte jamais vers la recherche
+        # comme s'il était une organisation.
+        recipient=str(history.get("participant_email") or ""),
+        url_analyses=urls,
     )
     deep_hook_results = await run_deep_hooks(list(DEEP_HOOKS), contexte)
+    complete = complete and not any(r.error_type == "TimeoutError" for r in deep_hook_results)
     deep_hook_clues = [
         clue for result in deep_hook_results for clue in result.clues
     ]
@@ -2561,12 +2436,23 @@ async def analyze_message(
         sender_apex=sender_apex,
         domain_ages=domain_ages,
         organisations=organisations,
-        sender_site=sender_site,
-        message_registers=registers,
         content_context=content_context,
         headers_facts=headers_facts,
     )
     signals.extend(deep_hook_clues)
+    # Le texte lu dans les images et les fichiers passe par les motifs du
+    # contrôle de contenu, qui ne lit que le corps visible : un faux reçu tenu
+    # dans une image (M-fc7f44, 3 novembre 2026) ne laissait aucun indice.
+    try:
+        signals.extend(
+            await attachment_text_signals(
+                attachments,
+                visible_body_chars=len(str(body or "").strip()),
+                already_observed=set(contexte.clue_codes),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - un constat absent, pas une chaîne arrêtée
+        _log("deep.attachment_text_error", error=type(exc).__name__)
     # Récidive de campagne : le squelette du message reprend-il celui d'un
     # message déjà qualifié ? Le label de la campagne source informe le juge,
     # la ressemblance seule ne décide de rien.
@@ -2593,6 +2479,11 @@ async def analyze_message(
         )
     return {
         "complete": complete,
+        # Le juge doit savoir de quel côté l'analyse a échoué : un lien qui
+        # refuse le bac à sable et un fichier jamais ouvert n'ont pas le même
+        # sens. Le second reste décisif même pour un expéditeur authentifié.
+        "urls_complete": urls_complete,
+        "attachments_complete": attachments_complete,
         "deep_hook_runs": [
             {
                 "hook_name": r.hook_name,
@@ -2602,6 +2493,7 @@ async def analyze_message(
                 "facts": r.facts,
                 "error_type": r.error_type,
                 "error_detail": r.error_detail,
+                "cache_reused": getattr(r, "cache_reused", False),
             }
             for r in deep_hook_results
         ],
@@ -2610,7 +2502,9 @@ async def analyze_message(
             "urls_hard_max": MAX_URLS,
             "urls_applied": url_coverage.get("adaptive_budget"),
             "attachments": MAX_ATTACHMENTS,
+            "images": MAX_IMAGE_ATTACHMENTS,
             "attachment_bytes": MAX_ATTACHMENT_BYTES,
+            "attachment_seconds": MAX_ATTACHMENTS_SECONDS,
         },
         "url_coverage": url_coverage,
         "url_analyses": urls,
@@ -2727,12 +2621,30 @@ _SIGNAL_RULES: dict[str, tuple[str, str, int, float, str]] = {
         0.95,
         "Une page distante contient un formulaire sensible, mais le message ne présente pas de contexte trompeur corrélé permettant de l’imputer à sa demande.",
     ),
+    "DEEP-024": (
+        "URL_FAKE_HUMAN_VERIFICATION",
+        "adverse",
+        80,
+        0.9,
+        "Un lien mène à une fausse page de vérification « êtes-vous humain », servie comme une page ordinaire hors du domaine de l’expéditeur et sans autre contenu : un décor qui fait croire à un site protégé et arrête les contrôles avant la suite.",
+    ),
+    "DEEP-025": (
+        "URL_OPAQUE_LANDING",
+        "neutral",
+        0,
+        0.9,
+        "Un lien d’action mène, hors du domaine de l’expéditeur, à une page minuscule qui ne montre rien sans exécuter de script : ni texte, ni lien, ni formulaire. Le contrôle du lien n’a rien pu lire de la destination.",
+    ),
     "HIST-001": (
         "HISTORY_CONFIRMED_LEGITIMATE_SENDER",
         "favorable",
         30,
         0.9,
         "L’utilisateur a déjà confirmé plusieurs messages de cet expéditeur.",
+    ),
+    "HIST-006": (
+        "HISTORY_CONFIRMED_MAIL_PROFILE", "favorable", 20, 0.9,
+        "L’utilisateur a déjà confirmé ce type de courrier de la même identité authentifiée.",
     ),
     "HIST-002": (
         "HISTORY_FIRST_OBSERVATION",
@@ -2820,14 +2732,17 @@ _SIGNAL_RULES: dict[str, tuple[str, str, int, float, str]] = {
         0.9,
         "Un lien du message répond différemment selon l’identité de qui le demande.",
     ),
-    # Même sort : un envoi de masse d'un expéditeur jamais vu, sans lien
-    # d'abonnement établi, ne produisait rien.
+    # Même sort : une adresse exacte jamais vue qui porte les marqueurs d'un
+    # envoi de masse ne produisait rien. Son domaine parent est un autre fait :
+    # il peut être connu et établi sans prouver que cet envoi était attendu.
     "NATURE-002": (
         "NATURE_UNSOLICITED_BULK_FIRST_CONTACT",
         "adverse",
         20,
         0.8,
-        "Le message est un envoi de masse d’un expéditeur inconnu, sans abonnement établi.",
+        "Le message porte des marqueurs d’envoi de masse. Cette adresse exacte "
+        "n’avait encore aucun historique local ni confirmation humaine pour ce "
+        "client ; son domaine parent est évalué séparément.",
     ),
     "POLICY-001": (
         "EVIDENCE_INCOMPLETE",
@@ -2874,7 +2789,7 @@ async def persist_deep_hook_runs(
             result.duration_ms,
             _json(result.facts),
             result.error_type,
-            result.error_detail,
+            pg_text(result.error_detail),
         )
 
 
@@ -2884,6 +2799,7 @@ async def persist_signals(
     raw_signals = analysis.get("signals")
     signals = raw_signals if isinstance(raw_signals, list) else []
     async with pool.acquire() as connection, connection.transaction():
+        await connection.execute("SELECT id FROM investigations WHERE id=$1::uuid FOR UPDATE", investigation_id)
         exists = await connection.fetchval(
             """
             SELECT EXISTS (
@@ -2893,8 +2809,16 @@ async def persist_signals(
             """,
             investigation_id,
         )
-        if exists:
+        binding = await connection.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM verdicts WHERE investigation_id=$1::uuid AND is_binding)",
+            investigation_id,
+        )
+        if binding:
             return
+        if exists:
+            await connection.execute(
+                "DELETE FROM hook_runs WHERE investigation_id=$1::uuid AND run_order>=100", investigation_id
+            )
         await persist_deep_hook_runs(
             connection, investigation_id, analysis.get("deep_hook_runs") or []
         )
@@ -2903,7 +2827,7 @@ async def persist_signals(
             INSERT INTO hook_runs (
                 investigation_id, hook_name, hook_version, run_order, status,
                 duration_ms, facts
-            ) VALUES ($1::uuid,'deep_evidence','2.2.0',100,'ok',0,$2::jsonb)
+            ) VALUES ($1::uuid,'deep_evidence','2.3.0',100,'ok',0,$2::jsonb)
             RETURNING id
             """,
             investigation_id,
@@ -2953,7 +2877,13 @@ async def persist_signals(
                 statement = str(signal.get("statement") or "")
             else:
                 clue_code, direction, strength, confidence, statement = rule
-            if article_code in {"DEEP-002", "DEEP-014"}:
+            if article_code in {"DEEP-024", "DEEP-025"}:
+                hosts = signal.get("final_hosts")
+                if isinstance(hosts, list) and hosts:
+                    statement += " Hébergée sur : " + ", ".join(
+                        str(value) for value in hosts[:4]
+                    ) + "."
+            elif article_code in {"DEEP-002", "DEEP-014"}:
                 categories = signal.get("sensitive_categories")
                 if isinstance(categories, list) and categories:
                     statement += " Catégories observées : " + ", ".join(
@@ -2968,7 +2898,7 @@ async def persist_signals(
                             continue
                         label = str(value.get("visible_text") or "").strip()
                         labels.append(
-                            (f"« {label} » — " if label else "")
+                            (f"« {label} » - " if label else "")
                             + f"{value.get('initial_apex') or 'apex inconnu'} "
                             f"[réf. {value.get('url_ref') or '?'}] : "
                             f"{value.get('technical_reason') or 'inspection non terminée'}"
@@ -3040,7 +2970,7 @@ async def persist_signals(
                 direction,
                 strength,
                 confidence,
-                statement,
+                pg_text(statement),
                 _json(signal),
                 _json(snapshot),
                 ordinal,
@@ -3052,14 +2982,57 @@ async def persist_signals(
         # seul moment où les indices statiques et l'analyse profonde sont tous
         # écrits. Elles deviennent des indices comme les autres, pour entrer au
         # dossier, au jugement et à l'apprentissage par la même porte.
-        observed = {
-            str(row["clue_code"])
-            for row in await connection.fetch(
-                "SELECT DISTINCT clue_code FROM clues WHERE investigation_id=$1::uuid",
-                investigation_id,
+        observed_rows = await connection.fetch(
+            """
+            SELECT DISTINCT ON (clue_code) clue_code,facts
+            FROM clues WHERE investigation_id=$1::uuid
+            ORDER BY clue_code,strength DESC,id DESC
+            """,
+            investigation_id,
+        )
+        observed = {str(row["clue_code"]) for row in observed_rows}
+        evidence: dict[str, dict[str, object]] = {}
+        for row in observed_rows:
+            try:
+                item = _json_object(row["facts"])
+            except (TypeError, ValueError):
+                continue
+            nested = item.get("facts")
+            evidence[str(row["clue_code"])] = (
+                dict(nested) if isinstance(nested, dict) else dict(item)
             )
+        # Un constat gardé sans charge - domaine authentifié déjà livré - reste
+        # écrit sous son code ; il ne doit pas pour autant fonder un faisceau
+        # qui, lui, accuse à pleine force.
+        observed -= {
+            code
+            for code, facts in evidence.items()
+            if facts.get("attested_locally") is True or facts.get("uncharged")
         }
-        for ordinal, convergence in enumerate(correlations(observed), start=900):
+        message_identity = await connection.fetchrow(
+            """
+            SELECT m.from_header, m.envelope_from,
+                   (SELECT h.value_decoded FROM headers h
+                    WHERE h.message_id=m.id AND h.name_normalized='reply-to'
+                    ORDER BY h.ordinal LIMIT 1) AS reply_to
+            FROM messages m
+            JOIN investigations i ON i.message_id=m.id
+            WHERE i.id=$1::uuid
+            """,
+            investigation_id,
+        )
+        identity = (
+            identity_facts(
+                message_identity["from_header"],
+                message_identity["envelope_from"],
+                message_identity["reply_to"],
+            )
+            if message_identity is not None
+            else {}
+        )
+        for ordinal, convergence in enumerate(
+            correlations(observed, identity=identity, evidence=evidence), start=900
+        ):
             await connection.execute(
                 """
                 INSERT INTO clues (
@@ -3078,7 +3051,7 @@ async def persist_signals(
                 convergence["direction"],
                 convergence["strength"],
                 convergence["confidence"],
-                convergence["statement"],
+                pg_text(convergence["statement"]),
                 _json(convergence["facts"]),
                 ordinal,
             )
@@ -3086,16 +3059,15 @@ async def persist_signals(
         await connection.execute(
             """
             UPDATE investigations SET
-                favorable_points=favorable_points+$2,
-                adverse_points=adverse_points+$3,
-                neutral_clues=neutral_clues+$4,
-                summary=summary || $5::jsonb
+                favorable_points=(SELECT coalesce(sum(strength) FILTER(WHERE direction='favorable'),0)
+                                  FROM clues WHERE investigation_id=$1::uuid),
+                adverse_points=(SELECT coalesce(sum(strength) FILTER(WHERE direction='adverse'),0)
+                                FROM clues WHERE investigation_id=$1::uuid),
+                neutral_clues=(SELECT count(*) FROM clues WHERE investigation_id=$1::uuid AND direction='neutral'),
+                summary=summary || $2::jsonb
             WHERE id=$1::uuid
             """,
             investigation_id,
-            favorable,
-            adverse,
-            neutral,
             _json({"deep_analysis_complete": bool(analysis.get("complete"))}),
         )
 
@@ -3205,6 +3177,87 @@ def should_compare_profiles(
     if rendu.get("analysis_skipped") or rendu.get("error"):
         return False
     return True
+
+
+def _verification_gate_signals(
+    urls: list[dict[str, object]], *, sender_apex: str
+) -> list[dict[str, object]]:
+    """Le faux sas « vérifiez que vous êtes humain », vu par le bac à sable.
+
+    Un vrai mur anti-robot refuse le scanner (403) et reste un constat neutre ;
+    une page servie en 200 qui n'est QUE ce décor est une tromperie. Le détail
+    du partage vit dans ``code/verification_gate``.
+    """
+    gates = [
+        value
+        for value in urls
+        if value.get("role") != "render_resource"
+        and is_fake_verification_gate(
+            final_status=value.get("final_status"),
+            body_excerpt=value.get("body_excerpt"),
+            visible_link_count=value.get("visible_link_count"),
+            final_apex=value.get("final_apex"),
+            sender_apex=sender_apex,
+        )
+    ]
+    if not gates:
+        return []
+    return [
+        {
+            "article_code": "DEEP-024",
+            "kind": "fake_human_verification_gate",
+            "occurrences": len(gates),
+            "final_hosts": sorted(
+                {str(value.get("final_host") or "") for value in gates} - {""}
+            ),
+            "sender_apex": sender_apex,
+            "excerpt": str(gates[0].get("body_excerpt") or "")[:200],
+        }
+    ]
+
+
+def _opaque_landing_signals(
+    urls: list[dict[str, object]], *, sender_apex: str
+) -> list[dict[str, object]]:
+    """La coquille sans script au bout d'un lien d'action, vue par le bac à sable.
+
+    « Rien observé » et « rien à voir » ne disent pas la même chose : le
+    constat, neutre, dit que le contrôle n'a rien pu lire. Le détail du partage
+    vit dans ``code/opaque_landing``.
+    """
+    coquilles: list[dict[str, object]] = []
+    for value in urls:
+        if value.get("role") == "render_resource":
+            continue
+        chain = value.get("redirect_chain")
+        dernier = chain[-1] if isinstance(chain, list) and chain else {}
+        if not isinstance(dernier, dict):
+            dernier = {}
+        if is_opaque_landing(
+            final_status=value.get("final_status"),
+            content_type=dernier.get("content_type"),
+            size=dernier.get("size"),
+            body_excerpt=value.get("body_excerpt"),
+            visible_link_count=value.get("visible_link_count"),
+            form_count=value.get("form_count"),
+            final_apex=value.get("final_apex"),
+            sender_apex=sender_apex,
+            link_context=value.get("link_context"),
+        ):
+            coquilles.append(value)
+    if not coquilles:
+        return []
+    return [
+        {
+            "article_code": "DEEP-025",
+            "kind": "opaque_landing",
+            "occurrences": len(coquilles),
+            "final_hosts": sorted(
+                {str(value.get("final_host") or "") for value in coquilles} - {""}
+            ),
+            "sender_apex": sender_apex,
+        }
+    ]
 
 
 def _cloaking_signals(urls: list[dict[str, object]]) -> list[dict[str, object]]:

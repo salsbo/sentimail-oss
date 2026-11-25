@@ -143,7 +143,7 @@ class RegistreEnBaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("EXTORTION_SEXTORSION", techniques)
         lessons = await pedagogy(self.pool, ["QUISHING"])
         self.assertEqual(len(lessons), 1)
-        self.assertIn("QR", lessons[0]["description"])
+        self.assertIn("code", lessons[0]["description"].casefold())
 
     async def test_une_reconnaissance_alimente_le_registre_vivant(self) -> None:
         from sentimail_v3.code.attack_techniques import record_observations

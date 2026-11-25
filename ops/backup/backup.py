@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -82,7 +83,8 @@ def run_backup() -> None:
                 archive.setpassword(password())
                 if archive.testzip() is not None:
                     raise RuntimeError("encrypted backup integrity check failed")
-                verify_path.write_bytes(archive.read("sentimail-v3.dump"))
+                with archive.open("sentimail-v3.dump") as source, verify_path.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
             subprocess.run(
                 ["pg_restore", "--list", str(verify_path)],
                 check=True,

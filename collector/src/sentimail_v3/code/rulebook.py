@@ -26,6 +26,9 @@ LIST_ACTIONS = {"allow", "hold"}
 _FEEDBACK_ID_RE = re.compile(r"\bF[- ](\d+)\b", re.IGNORECASE)
 _POLICY_ID_RE = re.compile(r"\bP[- ]([0-9a-fA-F]{8})\b", re.IGNORECASE)
 _LOCAL_PART_RE = re.compile(r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}$", re.IGNORECASE)
+_OBSERVED_LOCAL_PART_RE = re.compile(
+    r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+$", re.IGNORECASE
+)
 _DOMAIN_LABEL_RE = re.compile(r"^[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?$", re.IGNORECASE)
 _EMAIL_TOKEN_RE = re.compile(
     r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+", re.IGNORECASE
@@ -95,7 +98,17 @@ def _explicit_list_action(value: str) -> str | None:
     return "allow" if allow else "hold"
 
 
-def _normalize_sender_address(value: str) -> str:
+def _normalize_sender_address(
+    value: str, *, observed_sender: bool = False
+) -> str:
+    """Normalise une adresse saisie, ou une identité déjà observée par le MX.
+
+    Une adresse saisie dans une liste reste soumise à la limite SMTP de 64
+    caractères pour sa partie locale. Un message déjà accepté peut toutefois
+    porter une identité adverse hors norme. Elle doit rester blocable sous sa
+    forme exacte : sa longueur totale et son domaine restent contrôlés, mais
+    la seule limite locale n'annule pas le retour authentifié de l'utilisateur.
+    """
     candidate = value.strip()
     if candidate.casefold().startswith("sender="):
         candidate = candidate.split("=", 1)[1].strip()
@@ -103,7 +116,8 @@ def _normalize_sender_address(value: str) -> str:
     if not address or len(address) > 254 or address.count("@") != 1:
         raise RuleImportError(f"adresse email invalide : {value[:120]}")
     local, domain = address.rsplit("@", 1)
-    if not _LOCAL_PART_RE.fullmatch(local):
+    local_pattern = _OBSERVED_LOCAL_PART_RE if observed_sender else _LOCAL_PART_RE
+    if not local_pattern.fullmatch(local):
         raise RuleImportError(f"partie locale invalide : {value[:120]}")
     try:
         ascii_domain = domain.encode("idna").decode("ascii").casefold()
@@ -113,6 +127,23 @@ def _normalize_sender_address(value: str) -> str:
     if len(labels) < 2 or any(not _DOMAIN_LABEL_RE.fullmatch(label) for label in labels):
         raise RuleImportError(f"domaine invalide : {value[:120]}")
     return f"{local}@{ascii_domain}"
+
+
+def _normalize_domain(value: str) -> str:
+    """Normalise un domaine prouvé par l'authentification d'un message."""
+    candidate = value.strip().casefold().rstrip(".")
+    try:
+        ascii_domain = candidate.encode("idna").decode("ascii").casefold()
+    except UnicodeError as exc:
+        raise RuleImportError(f"domaine invalide : {value[:120]}") from exc
+    labels = ascii_domain.split(".")
+    if (
+        len(ascii_domain) > 253
+        or len(labels) < 2
+        or any(not _DOMAIN_LABEL_RE.fullmatch(label) for label in labels)
+    ):
+        raise RuleImportError(f"domaine invalide : {value[:120]}")
+    return ascii_domain
 
 
 def _import_attachment(raw_message: bytes) -> tuple[str, str]:
@@ -284,26 +315,36 @@ async def set_sender_list_policy(
     action: str,
     *,
     source: str,
+    observed_sender: bool = False,
+    scope: str = "sender",
 ) -> None:
     if action not in LIST_ACTIONS:
         raise ValueError("invalid sender list action")
-    normalized_sender = _normalize_sender_address(sender)
+    if scope == "sender":
+        normalized_sender = _normalize_sender_address(
+            sender, observed_sender=observed_sender
+        )
+    elif scope == "domain":
+        normalized_sender = _normalize_domain(sender)
+    else:
+        raise ValueError("invalid sender list scope")
     opposite = "hold" if action == "allow" else "allow"
     await connection.execute(
         """
         UPDATE sender_policies SET active=false,updated_at=now()
-        WHERE lower(participant_email)=lower($1) AND scope='sender'
+        WHERE sentimail_same_client(participant_email,$1) AND scope=$4
           AND value_normalized=$2 AND action=$3 AND active=true
         """,
         participant,
         normalized_sender,
         opposite,
+        scope,
     )
     await connection.execute(
         """
         INSERT INTO sender_policies (
             participant_email,scope,value_normalized,action,active,source
-        ) VALUES ($1,'sender',$2,$3,true,$4)
+        ) VALUES ($1,$5,$2,$3,true,$4)
         ON CONFLICT (participant_email,scope,value_normalized,action)
         DO UPDATE SET active=true,source=EXCLUDED.source,updated_at=now()
         """,
@@ -311,6 +352,7 @@ async def set_sender_list_policy(
         normalized_sender,
         action,
         source,
+        scope,
     )
 
 
@@ -419,6 +461,11 @@ def label_sender(from_header: object, envelope_from: object) -> str:
     return (visible or str(envelope_from or "")).casefold()
 
 
+def _policy_label(item: Any) -> str:
+    value = str(item["value_normalized"])
+    return f"tout le domaine {value}" if item["scope"] == "domain" else value
+
+
 def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -443,11 +490,11 @@ async def render_rulebook(pool: asyncpg.Pool[Any], participant: str) -> RuleResp
         FROM labels l LEFT JOIN messages m ON m.id=l.message_id
         WHERE l.source='smtp_feedback_user'
           AND (
-              lower(l.participant_email)=lower($1)
+              sentimail_same_client(l.participant_email,$1)
               OR (
                   l.participant_email IS NULL AND EXISTS (
                       SELECT 1 FROM unnest(m.envelope_recipients) recipient
-                      WHERE lower(recipient)=lower($1)
+                      WHERE sentimail_same_client(recipient,$1)
                   )
               )
           )
@@ -458,7 +505,7 @@ async def render_rulebook(pool: asyncpg.Pool[Any], participant: str) -> RuleResp
     policies = await pool.fetch(
         """
         SELECT id,scope,value_normalized,action,active,created_at,updated_at
-        FROM sender_policies WHERE lower(participant_email)=lower($1)
+        FROM sender_policies WHERE sentimail_same_client(participant_email,$1)
         ORDER BY created_at,id
         """,
         participant,
@@ -519,14 +566,14 @@ async def render_rulebook(pool: asyncpg.Pool[Any], participant: str) -> RuleResp
             f"{adverse} défavorable(s), {counts['undetermined']} indéterminé(s)."
         )
     active_allow = [
-        str(item["value_normalized"])
+        _policy_label(item)
         for item in policies
-        if item["active"] and item["action"] == "allow" and item["scope"] == "sender"
+        if item["active"] and item["action"] == "allow"
     ]
     active_hold = [
-        str(item["value_normalized"])
+        _policy_label(item)
         for item in policies
-        if item["active"] and item["action"] == "hold" and item["scope"] == "sender"
+        if item["active"] and item["action"] == "hold"
     ]
     lines.extend(["", "Liste blanche active :"])
     lines.extend([f"- {address}" for address in active_allow] or ["- Vide."])
@@ -722,11 +769,11 @@ async def _change_feedback(
             FROM labels l LEFT JOIN messages m ON m.id=l.message_id
             WHERE l.id=$1 AND l.source='smtp_feedback_user'
               AND (
-                  lower(l.participant_email)=lower($2)
+                  sentimail_same_client(l.participant_email,$2)
                   OR (
                       l.participant_email IS NULL AND EXISTS (
                           SELECT 1 FROM unnest(m.envelope_recipients) recipient
-                          WHERE lower(recipient)=lower($2)
+                          WHERE sentimail_same_client(recipient,$2)
                       )
                   )
               )
@@ -783,7 +830,7 @@ async def _change_policy(
             """
             SELECT id,scope,value_normalized,action,active
             FROM sender_policies
-            WHERE lower(participant_email)=lower($1)
+            WHERE sentimail_same_client(participant_email,$1)
               AND replace(id::text,'-','') LIKE $2 || '%'
             FOR UPDATE
             """,

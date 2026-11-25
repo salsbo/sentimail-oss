@@ -118,7 +118,7 @@ class LearnedSignalsTests(unittest.IsolatedAsyncioTestCase):
         learned = await _learned_signals(self.pool, message_id, PARTICIPANT)
         self.assertNotIn(str(code), {item["clue_code"] for item in learned})
 
-    async def test_signals_never_leak_between_recipients(self) -> None:
+    async def test_signals_are_shared_between_recipients_of_the_client(self) -> None:
         message_id = await self._message("learning-isolation@example.org")
         code = await self.pool.fetchval(
             """
@@ -133,7 +133,9 @@ class LearnedSignalsTests(unittest.IsolatedAsyncioTestCase):
         learned = await _learned_signals(
             self.pool, message_id, "someone-else@example.org"
         )
-        self.assertEqual(learned, [])
+        reported = {item["clue_code"]: item for item in learned}
+        self.assertIn(str(code), reported)
+        self.assertEqual(reported[str(code)]["confirmed_adverse"], 2)
 
 
 if __name__ == "__main__":

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import unittest
 from email.message import EmailMessage
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from sentimail_v3.conversation.assistant import (
     _action_token,
     _apply_freeform_choice_guard,
     _choice_interpretation,
     _choice_list_action,
+    _decision_plan,
+    _interpret_inbound_directive,
     _parse_json,
     _preformatted_choice,
     _reply_text,
@@ -18,12 +22,14 @@ from sentimail_v3.conversation.conversation import (
     strip_quoted_reply,
 )
 from sentimail_v3.conversation.conversation_scope import conversation_scope
+from sentimail_v3.conversation.choice_registry import response_body
 from sentimail_v3.observation.deep_analysis import is_single_use_or_side_effect_url
 from sentimail_v3.conversation.directive_policy import apply_directive_gate, evaluate_directive
 from sentimail_v3.code.rulebook import (
     RuleImportError,
     csv_safe_cell,
     parse_policy_import,
+    set_sender_list_policy,
     validate_rule_request,
 )
 from sentimail_v3.observation.smtp_server import recipient_groups
@@ -330,6 +336,7 @@ class ConversationTests(unittest.TestCase):
     def test_preformatted_choices_are_deterministic(self) -> None:
         self.assertEqual(_preformatted_choice("A"), ("A", ""))
         self.assertEqual(_preformatted_choice("B."), ("B", ""))
+        self.assertEqual(_preformatted_choice("C"), ("C_TEXT", ""))
         self.assertEqual(_preformatted_choice("Réponse A"), ("A", ""))
         self.assertEqual(
             _preformatted_choice("libère l’email, il est légitime\n\nréponse A"),
@@ -339,6 +346,12 @@ class ConversationTests(unittest.TestCase):
             _preformatted_choice("C : Collegue est mon fils"),
             ("C_TEXT", "Collegue est mon fils"),
         )
+        own_reply = (
+            "Bonjour MAIA,\n\n"
+            "Merci pour ton avis. C'est du spam : ne le livre pas et bloque les "
+            "prochains.\n\nMerci !"
+        )
+        self.assertEqual(_preformatted_choice(own_reply), ("B", own_reply))
         result, gate = _choice_interpretation("A")
         self.assertEqual(result["requested_action"], "release_original")
         self.assertEqual(gate["status"], "allow_binding_choice")
@@ -347,7 +360,7 @@ class ConversationTests(unittest.TestCase):
         self.assertIsNone(_choice_list_action("C_TEXT"))
 
     def test_preformatted_choices_never_depend_on_a_provider(self) -> None:
-        for choice in ("A", "B", "C"):
+        for choice in ("A", "B"):
             result, gate = _choice_interpretation(choice)
             self.assertEqual(
                 result["api_metadata"],
@@ -363,17 +376,30 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(result["requested_action"], "record_feedback")
         self.assertIsNone(gate["explicit_action"])
 
+    def test_le_plan_local_rejette_un_spam_retenu(self) -> None:
+        result, gate = _choice_interpretation("B")
+        plan = _decision_plan(
+            result,
+            gate,
+            {
+                "original_message_id": "message-id",
+                "delivery_status": "held",
+                "case_id": "case-id",
+            },
+        )
+        self.assertEqual(plan.feedback_classification, "spam")
+        self.assertTrue(plan.reject_current)
+        self.assertFalse(plan.release_requested)
+
     def test_action_reply_does_not_claim_an_acknowledgement_or_learning(self) -> None:
         result, _ = _choice_interpretation("A")
         reply = _reply_text(result, "Un email", "L’original vient d’être livré.")
         self.assertNotIn("Bien reçu", reply)
         self.assertNotIn("apprentissage humain", reply)
 
-    def test_choice_c_only_asks_for_the_missing_explanation(self) -> None:
-        result, _ = _choice_interpretation("C")
-        reply = _reply_text(result, "Un email", "Aucune action n’a été exécutée.")
-        self.assertIn("commençant par C", reply)
-        self.assertNotIn("Bien reçu", reply)
+    def test_choice_c_is_not_a_deterministic_action(self) -> None:
+        with self.assertRaises(ValueError):
+            _choice_interpretation("C")
 
     def test_choice_c_text_allows_high_confidence_llm_release(self) -> None:
         result = {
@@ -529,6 +555,144 @@ class ConversationTests(unittest.TestCase):
         )
         self.assertEqual(gate["explicit_classification"], "dangerous")
         self.assertEqual(gate["status"], "allow_non_binding")
+
+
+class ObservedSenderPolicyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_choice_can_block_an_overlong_observed_sender(self) -> None:
+        sender = f"{'x' * 154}@sender.example"
+        connection = AsyncMock()
+
+        await set_sender_list_policy(
+            connection,
+            "user@example.org",
+            sender,
+            "hold",
+            source="authenticated_smtp_choice_b",
+            observed_sender=True,
+        )
+
+        self.assertEqual(connection.execute.await_count, 2)
+        stored = connection.execute.await_args_list[1].args
+        self.assertEqual(stored[2], sender)
+        self.assertEqual(stored[3], "hold")
+
+    async def test_manual_lists_keep_the_smtp_length_limit(self) -> None:
+        sender = f"{'x' * 154}@sender.example"
+        connection = AsyncMock()
+
+        with self.assertRaises(RuleImportError):
+            await set_sender_list_policy(
+                connection,
+                "user@example.org",
+                sender,
+                "hold",
+                source="authenticated_smtp_directive",
+            )
+
+        connection.execute.assert_not_awaited()
+
+
+class ChoiceLlmTests(unittest.IsolatedAsyncioTestCase):
+    async def test_le_corps_prerempli_c_appelle_le_llm(self) -> None:
+        pool = AsyncMock()
+        result = {
+            "domain_scope": "mail",
+            "intent": "clarification",
+            "classification": None,
+            "requested_action": "none",
+            "scope": "unknown",
+            "confidence": 0.9,
+            "explanation": "La demande ne précise encore aucune action.",
+            "clarification_question": "Que veux-tu que je fasse de ce message ?",
+            "reasons": [],
+            "raw_response": {},
+            "api_metadata": {"provider": "test", "model": "test", "usage": {}},
+        }
+        message = {
+            "id": 1,
+            "conversation_id": "conversation-id",
+            "user_text": response_body(None),
+        }
+        context = {
+            "participant_email": "user@example.org",
+            "original_message_id": "message-id",
+        }
+        with (
+            patch(
+                "sentimail_v3.conversation.assistant._reserve_llm_call",
+                new=AsyncMock(return_value=(7, None)),
+            ),
+            patch(
+                "sentimail_v3.conversation.assistant._interpret",
+                new=AsyncMock(return_value=result),
+            ) as interpret,
+        ):
+            outcome = await _interpret_inbound_directive(
+                pool,
+                AsyncMock(),
+                SimpleNamespace(),  # type: ignore[arg-type]
+                message,  # type: ignore[arg-type]
+                context,
+            )
+
+        self.assertIsNotNone(outcome)
+        self.assertEqual(outcome.choice, "C_TEXT")
+        self.assertEqual(outcome.llm_event_id, 7)
+        interpret.assert_awaited_once()
+
+    async def test_c_ne_prend_pas_le_raccourci_d_un_reglage_local(self) -> None:
+        pool = AsyncMock()
+        result = {
+            "domain_scope": "mail",
+            "intent": "clarification",
+            "classification": None,
+            "requested_action": "none",
+            "scope": "unknown",
+            "confidence": 0.9,
+            "explanation": "La demande doit être interprétée dans le dossier.",
+            "clarification_question": "Que veux-tu que je fasse de ce message ?",
+            "reasons": [],
+            "raw_response": {},
+            "api_metadata": {"provider": "test", "model": "test", "usage": {}},
+        }
+        user_text = response_body(None).replace(
+            "Tapez ici vos demandes ou remarques",
+            "Désactive l'accusé de réception.",
+        )
+        message = {
+            "id": 1,
+            "conversation_id": "conversation-id",
+            "user_text": user_text,
+        }
+        context = {
+            "participant_email": "user@example.org",
+            "original_message_id": "message-id",
+        }
+        with (
+            patch(
+                "sentimail_v3.conversation.assistant._reserve_llm_call",
+                new=AsyncMock(return_value=(8, None)),
+            ),
+            patch(
+                "sentimail_v3.conversation.assistant._interpret",
+                new=AsyncMock(return_value=result),
+            ) as interpret,
+            patch(
+                "sentimail_v3.conversation.assistant._apply_receipt_toggle",
+                new=AsyncMock(),
+            ) as local_toggle,
+        ):
+            outcome = await _interpret_inbound_directive(
+                pool,
+                AsyncMock(),
+                SimpleNamespace(),  # type: ignore[arg-type]
+                message,  # type: ignore[arg-type]
+                context,
+            )
+
+        self.assertIsNotNone(outcome)
+        interpret.assert_awaited_once()
+        local_toggle.assert_not_awaited()
 
 
 if __name__ == "__main__":

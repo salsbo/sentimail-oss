@@ -61,9 +61,10 @@ class AuthenticationHook(EvidenceHook):
             if match:
                 signing_domain = match.group(1)
         from_apex = ""
+        display_name = ""
         for header in context.parsed.headers:
             if header["name_normalized"] == "from":
-                address = parseaddr(str(header["value_decoded"]))[1]
+                display_name, address = parseaddr(str(header["value_decoded"]))
                 from_apex = _apex(address.rsplit("@", 1)[-1]) if "@" in address else ""
                 break
         signing_apex = _apex(signing_domain) if signing_domain else ""
@@ -121,6 +122,14 @@ class AuthenticationHook(EvidenceHook):
             rule = mapping.get((method, result))
             if rule:
                 article, code, direction, strength = rule
+                facts: dict[str, object] = {
+                    "method": method,
+                    "result": result,
+                    "from_apex": from_apex,
+                    "claimed_organisation": display_name.strip()[:80],
+                }
+                if code == "AUTH_DKIM_PASS" and signing_domain:
+                    facts["signing_domain"] = signing_domain
                 clues.append(
                     Clue(
                         article,
@@ -129,7 +138,9 @@ class AuthenticationHook(EvidenceHook):
                         strength,
                         0.95,
                         f"Le relais de confiance indique {method.upper()}={result}.",
-                        {"method": method, "result": result},
+                        # L'avis nomme le domaine qui a écrit et le nom
+                        # affiché : « authentique » ne dit pas « légitime ».
+                        facts,
                         {"source": "authentication-results:rspamd.sentimail"},
                     )
                 )
@@ -142,7 +153,14 @@ class AuthenticationHook(EvidenceHook):
                         35 if result in {"temperror", "permerror"} else 10,
                         0.95,
                         f"Le résultat {method.upper()}={result} ne permet pas d’établir l’authenticité.",
-                        {"method": method, "result": result},
+                        # L'avis nomme le domaine qu'il n'a pas pu vérifier :
+                        # « le domaine affiché » ne dit rien à qui lit.
+                        {
+                            "method": method,
+                            "result": result,
+                            "from_apex": from_apex,
+                            "claimed_organisation": display_name.strip()[:80],
+                        },
                         {"source": "authentication-results:rspamd.sentimail"},
                     )
                 )

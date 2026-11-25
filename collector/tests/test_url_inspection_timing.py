@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from sentimail_v3.observation import deep_analysis
 
@@ -74,6 +77,113 @@ class DureeMesureeTests(unittest.IsolatedAsyncioTestCase):
         requete = str(pool.insertions[0][0])
         self.assertIn("started_at", requete)
         self.assertIn("completed_at", requete)
+
+
+class ChronoDeLInspectionSeuleTests(unittest.IsolatedAsyncioTestCase):
+    """La durée enregistrée est celle d'une tentative, jamais celle de la file.
+
+    Le 9 novembre, un message portait vingt liens d'un même apex. Ils passent
+    un par un, et le chrono démarrait avant l'attente : treize liens ont
+    dépassé 45 s alors que le plus long n'avait travaillé que 12,6 s. Le
+    superviseur est resté dégradé une heure sans aucune panne.
+    """
+
+    MESSAGE = "11111111-1111-1111-1111-111111111111"
+
+    @staticmethod
+    def _candidats(nombre: int) -> list[dict[str, str]]:
+        return [
+            {"url": f"https://exemple.fr/{rang}", "role": "html_link",
+             "link_context": "primary", "visible_text": f"Document {rang}"}
+            for rang in range(nombre)
+        ]
+
+    async def _analyser(
+        self, candidats: list[dict[str, str]], faux_fetch: Any, *, budget: float = 5.0,
+    ) -> list[tuple[str, datetime | None, datetime]]:
+        enregistrements: list[tuple[str, datetime | None, datetime]] = []
+
+        async def enregistrer(pool, message, kind, key, source, status, data,
+                              failure=None, started_at=None):
+            enregistrements.append((status, started_at, datetime.now(timezone.utc)))
+
+        pool = SimpleNamespace(fetchrow=AsyncMock(return_value=None), execute=AsyncMock())
+        reglages = SimpleNamespace(url_analysis_concurrency=2, url_analysis_deadline_seconds=budget)
+        with patch.object(deep_analysis, "_message_url_candidates", return_value=(candidats, 0)), patch.object(
+            deep_analysis, "_select_url_candidates", return_value=(candidats, {})
+        ), patch.object(
+            deep_analysis, "_message_is_dmarc_aligned", AsyncMock(return_value=False)
+        ), patch.object(deep_analysis, "_fetch_url_analysis", faux_fetch), patch.object(
+            deep_analysis, "_save_analysis", enregistrer
+        ), patch.object(deep_analysis, "should_compare_profiles", return_value=False):
+            await deep_analysis._analyze_urls(pool, None, reglages, self.MESSAGE, b"raw")  # type: ignore[arg-type]
+        return enregistrements
+
+    async def test_l_attente_de_la_file_n_entre_pas_dans_la_duree(self) -> None:
+        async def faux_fetch(client, settings, url, key):
+            await asyncio.sleep(0.05)
+            return {"initial_url": url, "initial_apex": "exemple.fr"}, "ok", None
+
+        lignes = await self._analyser(self._candidats(5), faux_fetch)
+
+        durees = [(fin - debut).total_seconds() for _, debut, fin in lignes if debut]
+        self.assertEqual(len(durees), 5)
+        # Cinq liens en série : le dernier attend 0,20 s avant de travailler 0,05 s.
+        self.assertLess(max(durees), 0.15, "l'attente de la file est comptée")
+
+    async def test_un_rejeu_n_additionne_pas_ses_deux_tentatives(self) -> None:
+        appels = 0
+
+        async def faux_fetch(client, settings, url, key):
+            nonlocal appels
+            appels += 1
+            if appels == 1:
+                await asyncio.sleep(0.2)
+                return {"initial_url": url, "initial_apex": "exemple.fr", "error": "hop_timeout"}, "ok", None
+            return {"initial_url": url, "initial_apex": "exemple.fr"}, "ok", None
+
+        lignes = await self._analyser(self._candidats(1), faux_fetch)
+
+        self.assertEqual(appels, 2)
+        _, debut, fin = lignes[0]
+        self.assertIsNotNone(debut)
+        self.assertLess((fin - debut).total_seconds(), 0.1, "les deux tentatives sont additionnées")
+
+    async def test_un_blocage_du_bac_a_sable_reste_visible_si_le_rejeu_reussit(self) -> None:
+        # Le délai de 45 s du client signifie que le plafond n'a pas tenu. C'est
+        # le cas que le compteur existe pour voir : le rejeu ne doit pas l'effacer.
+        appels = 0
+
+        async def faux_fetch(client, settings, url, key):
+            nonlocal appels
+            appels += 1
+            if appels == 1:
+                await asyncio.sleep(0.2)
+                return {"initial_url": url, "initial_apex": "exemple.fr",
+                        "analysis_incomplete": True, "error": "sandbox_request:ReadTimeout"}, "error", TimeoutError()
+            return {"initial_url": url, "initial_apex": "exemple.fr"}, "ok", None
+
+        lignes = await self._analyser(self._candidats(1), faux_fetch)
+
+        self.assertEqual(appels, 2)
+        _, debut, fin = lignes[0]
+        self.assertIsNotNone(debut)
+        self.assertGreaterEqual((fin - debut).total_seconds(), 0.2, "le blocage du bac à sable a disparu")
+
+    async def test_un_lien_jamais_inspecte_n_a_pas_de_duree(self) -> None:
+        # Le budget expire pendant l'attente : ce lien n'a rien coûté au bac à
+        # sable, il ne doit pas passer pour une inspection de plusieurs dizaines
+        # de secondes. Son absence reste visible par son statut d'erreur.
+        async def faux_fetch(client, settings, url, key):
+            await asyncio.Event().wait()
+
+        lignes = await self._analyser(self._candidats(3), faux_fetch, budget=0.05)
+
+        self.assertEqual([statut for statut, _, _ in lignes], ["error"] * 3)
+        self.assertEqual(sum(debut is None for _, debut, _ in lignes), 2,
+                         "un lien resté dans la file a reçu une durée")
+        self.assertEqual(sum(debut is not None for _, debut, _ in lignes), 1,
+                         "le lien coupé en plein travail doit garder sa durée")
 
 
 class RejeuQuiNeSObstinePasTests(unittest.IsolatedAsyncioTestCase):

@@ -91,8 +91,12 @@ class StockageTests(unittest.IsolatedAsyncioTestCase):
 
         return _Pool(), appels
 
-    async def test_active_par_defaut(self) -> None:
+    async def test_desactive_par_defaut(self) -> None:
         pool, _ = self._pool(None)
+        self.assertFalse(await get_receipt_enabled(pool, "operateur@mondomaine.example"))
+
+    async def test_un_reglage_active_se_lit(self) -> None:
+        pool, _ = self._pool(True)
         self.assertTrue(await get_receipt_enabled(pool, "operateur@mondomaine.example"))
 
     async def test_un_reglage_desactive_se_lit(self) -> None:

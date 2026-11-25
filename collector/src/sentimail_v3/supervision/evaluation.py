@@ -131,10 +131,9 @@ def labelling_coverage(rows: Iterable[Any]) -> dict[str, dict[str, Any]]:
 def hold_precision(rows: Iterable[Any]) -> dict[str, Any]:
     """Quand la chaîne dérange l'utilisateur, avait-elle raison de le faire ?
 
-    C'est la seule métrique dont la vérité terrain est presque complète : on
-    interroge, donc on obtient une réponse. Elle reste biaisée au second ordre -
-    l'utilisateur traite d'abord les cas évidents - mais elle est la moins
-    aveugle de toutes.
+    Le dénominateur ne comprend que les demandes effectivement qualifiées.
+    Les demandes sans réponse restent dans le total, sans qualification : la
+    couverture et le biais de réponse interdisent d'étendre ce taux à toutes.
     """
     ligne = confusion_matrix(rows)["rows"][ASK]
     qualifies = ligne["labelled"]
@@ -142,6 +141,8 @@ def hold_precision(rows: Iterable[Any]) -> dict[str, Any]:
         "value": (ligne[SPAM] / qualifies) if qualifies else None,
         "labelled": qualifies,
         "total": ligne["total"],
+        "spam": ligne[SPAM],
+        "legitimate": ligne[LEGITIMATE],
     }
 
 

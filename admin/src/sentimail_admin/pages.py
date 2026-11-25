@@ -11,300 +11,52 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime, timezone
+from collections.abc import Mapping, Sequence
 from html import escape
 from typing import Any
 
+from .html_base import (
+    AVIS,
+    ETATS_COMPOSANT,
+    ETATS_DOMAINE,
+    ETATS_LIVRAISON,
+    ONGLETS,
+    STYLE,
+    _CLASSES_ETAT,
+    _classe,
+    _date_mesure,
+    _entier,
+    _pourcentage,
+    _url,
+    colonnes,
+    document,
+    horodatage,
+    page_erreur,
+    pastille,
+    texte,
+)
 from .naming import verification_record
 from .reference import reference
 from .presets import PRESETS
-
-STYLE = """
-:root { color-scheme: light dark; }
-* { box-sizing: border-box; }
-body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-       background: #f6f7f9; color: #1a1d21; }
-header { background: #14171a; color: #f6f7f9; padding: 1rem 1.5rem; }
-header h1 { margin: 0 0 .6rem; font-size: 1.1rem; font-weight: 600;
-            letter-spacing: .02em; }
-nav a { color: #cfd6dd; text-decoration: none; margin-right: 1.2rem;
-        font-size: .95rem; }
-nav a.actif { color: #fff; border-bottom: 2px solid #4c9aff; padding-bottom: 2px; }
-main { max-width: 76rem; margin: 0 auto; padding: 1.5rem; }
-h2 { font-size: 1.25rem; margin: 0 0 .3rem; }
-p.chapeau { margin: 0 0 1.2rem; color: #5a6470; }
-section { background: #fff; border: 1px solid #e2e6ea; border-radius: 8px;
-          padding: 1.2rem; margin-bottom: 1.5rem; }
-/* Une adresse électronique ou un domaine est un mot sans espace : sans cette
-   règle, la largeur minimale d'une colonne devenait celle du plus long, la
-   table dépassait sa section et la page défilait latéralement. */
-table { width: 100%; border-collapse: collapse; font-size: .93rem;
-        table-layout: fixed; }
-th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid #eceff2;
-         vertical-align: top; overflow-wrap: anywhere; }
-th { color: #5a6470; font-weight: 600; font-size: .82rem;
-     text-transform: uppercase; letter-spacing: .04em; }
-td.compact { white-space: nowrap; color: #5a6470; }
-/* Ce qui accompagne la valeur principale d'une cellule sans la concurrencer :
-   le rDNS sous une adresse, par exemple. */
-.secondaire { margin-top: .2rem; font-size: .85em; color: #5a6470; }
-td.elements { padding-top: 0; }
-td.elements summary { cursor: pointer; color: #5a6470; font-size: .85rem; }
-td.elements p, td.elements ul { margin: .5rem 0 0 0; font-size: .9rem; }
-td.elements ul { padding-left: 1.2rem; }
-.badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
-  font-size: 0.82em; white-space: nowrap; }
-/* Dans une table à colonnes fixes, un badge qui ne se coupe jamais déborde
-   sur la colonne voisine : il s'y replie. */
-td .badge { white-space: normal; }
-.badge-vert { background: #e7f5ec; color: #14532d; }
-.badge-ambre { background: #fdf1e3; color: #7c2d12; }
-.badge-gris { background: #eef1f4; color: #47505a; }
-form.recherche { margin: 0 0 12px 0; display: flex; gap: 8px; }
-form.recherche input { flex: 1; max-width: 380px; }
-form.aller { display: flex; gap: .4rem; align-items: center; margin-top: .7rem; }
-form.aller label { margin: 0; color: #9aa4ae; font-size: .8rem;
-        text-transform: uppercase; letter-spacing: .04em; }
-form.aller input { width: 12rem; padding: .3rem .5rem; font: inherit;
-        font-size: .88rem; border-radius: 6px; border: 1px solid #39414a;
-        background: #1c2126; color: #e7eaee; }
-form.aller button { padding: .3rem .7rem; font-size: .88rem;
-        background: #262c33; color: #e7eaee; border-color: #39414a; }
-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-       font-size: .88em; background: #f0f2f5; padding: .1rem .3rem;
-       border-radius: 4px; overflow-wrap: anywhere; }
-/* Une adresse IP, une plage, une référence : ça se lit d'un bloc ou pas du
-   tout. « 93.184.216.99/32 » coupé en trois lignes n'est plus une adresse. */
-code.insecable { white-space: nowrap; overflow-wrap: normal; }
-/* Un jeton de vérification, lui, n'a pas de sens de lecture : il se coupe. */
-code.jeton { word-break: break-all; }
-.etat { display: inline-block; padding: .1rem .55rem; border-radius: 999px;
-        font-size: .8rem; font-weight: 600; }
-.etat-actif, .etat-ok, .etat-delivered { background: #e3f5e9; color: #17692f; }
-.etat-attente, .etat-degraded, .etat-held { background: #fdf1dc; color: #8a5a08; }
-.etat-suspendu, .etat-down { background: #fbe4e4; color: #8f2020; }
-.etat-neutre { background: #eceff2; color: #4a545f; }
-form.enligne { display: inline; }
-label { display: block; font-size: .85rem; color: #5a6470; margin-bottom: .2rem; }
-input[type=text], input[type=email] { width: 100%; padding: .5rem .6rem;
-       border: 1px solid #cfd6dd; border-radius: 6px; font: inherit; }
-.champs { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: .9rem; }
-.champs > div { flex: 1 1 16rem; }
-button { font: inherit; padding: .45rem .9rem; border-radius: 6px;
-         border: 1px solid #cfd6dd; background: #fff; cursor: pointer; }
-button.principal { background: #1a5fd0; border-color: #1a5fd0; color: #fff; }
-button.discret { color: #8f2020; }
-.avis { padding: .7rem 1rem; border-radius: 6px; margin-bottom: 1.2rem;
-        font-size: .93rem; }
-.avis-ok { background: #e3f5e9; color: #17692f; }
-.avis-erreur { background: #fbe4e4; color: #8f2020; }
-.vide { color: #5a6470; font-style: italic; }
-footer { max-width: 76rem; margin: 0 auto; padding: 0 1.5rem 2rem;
-         color: #7a838d; font-size: .82rem; }
-@media (prefers-color-scheme: dark) {
-  body { background: #14171a; color: #e7eaee; }
-  section { background: #1c2126; border-color: #2c333a; }
-  th, td { border-color: #2c333a; }
-  code { background: #262c33; }
-  input[type=text], input[type=email] { background: #14171a; color: #e7eaee;
-        border-color: #39414a; }
-  button { background: #262c33; color: #e7eaee; border-color: #39414a; }
-  button.principal { background: #1a5fd0; border-color: #1a5fd0; }
-  p.chapeau, .vide, td.compact, .secondaire, footer { color: #9aa4ae; }
-}
-"""
-
-ONGLETS: tuple[tuple[str, str], ...] = (
-    ("/domaines", "Domaines"),
-    ("/etat", "État du système"),
-    ("/courrier", "Courrier récent"),
-    ("/mesure", "Mesure d'efficacité"),
-    ("/ecarts", "Écarts"),
-    ("/apprentissage", "Registre d'apprentissage"),
-    ("/sources", "Sources hostiles"),
-    ("/reglages", "Réglages"),
-)
-
-# Les avis affichés après une modification. Liste fermée : l'URL choisit une
-# clé, jamais un texte, donc rien de ce qui vient du réseau n'est réaffiché.
-AVIS: Mapping[str, tuple[str, str]] = {
-    "plafonds_enregistres": ("ok", "Plafonds enregistrés pour ce domaine."),
-    "moteur_enregistre": (
-        "ok",
-        "Clé posée sur le serveur. Elle n'a traversé aucune boîte aux "
-        "lettres et n'est enregistrée nulle part ailleurs.",
-    ),
-    "modele_enregistre": (
-        "ok",
-        "Rôle confié au modèle local. Éprouve-le avant de compter dessus.",
-    ),
-    "modele_retire": ("ok", "Rôle rendu au fournisseur distant."),
-    "identite_enregistree": (
-        "ok",
-        "Identité de l'instance enregistrée. Elle prime désormais sur "
-        "l'environnement du service.",
-    ),
-    "domaine_ajoute": ("ok", "Domaine ajouté. Publiez son jeton avant de l'activer."),
-    "ecart_traite": ("ok", "Écart marqué traité. Il reste compté dans les mesures."),
-    "ecart_inconnu": ("erreur", "Cet écart n'existe pas ou est déjà traité."),
-    "reference_illisible": (
-        "erreur",
-        "Ce n'est pas une référence de dossier. Une référence s'écrit "
-        "« E-c62805 » pour un écart, « M-e9e8f2 » pour un message.",
-    ),
-    "reference_courrier": (
-        "erreur",
-        "« D-… » est la référence d'un récapitulatif envoyé par courrier. "
-        "Elle situe des numéros dans cette lettre ; elle ne désigne aucun "
-        "dossier de la console.",
-    ),
-    "source_ajoutee": ("ok", "Source ajoutée au registre. Le MX la refusera d'ici une minute."),
-    "source_supprimee": ("ok", "Source retirée du registre."),
-    "source_existante": ("erreur", "Cette source figure déjà au registre."),
-    "source_inconnue": ("erreur", "Cette source ne figure pas au registre."),
-    "domaine_existant": ("erreur", "Ce domaine est déjà enregistré."),
-    "domaine_active": ("ok", "Domaine activé. La prise en compte demande 30 secondes."),
-    "domaine_suspendu": (
-        "ok",
-        "Domaine suspendu. Ses destinataires ne sont plus pris en charge.",
-    ),
-    "domaine_inconnu": ("erreur", "Ce domaine n'existe plus."),
-    "domaine_non_verifie": (
-        "erreur",
-        (
-            "Ce domaine n'a pas encore prouvé sa maîtrise : publie le jeton en "
-            "TXT sur _sentimail.<domaine>, fais vérifier, puis active."
-        ),
-    ),
-}
-
-ETATS_LIVRAISON: Mapping[str, str] = {
-    "captured": "reçu",
-    "analyzing": "en analyse",
-    "held": "retenu",
-    "release_pending": "libération en cours",
-    "deferred": "différé",
-    "delivered": "livré",
-    "consumed": "traité",
-    "undeliverable": "destinataire inexistant",
-}
-
-ETATS_COMPOSANT: Mapping[str, str] = {
-    "ok": "opérationnel",
-    "degraded": "dégradé",
-    "down": "hors service",
-}
-
-ETATS_DOMAINE: Mapping[str, str] = {
-    "pending": "en attente",
-    "active": "actif",
-    "suspended": "suspendu",
-}
-
-_CLASSES_ETAT: Mapping[str, str] = {
-    "active": "etat-actif",
-    "pending": "etat-attente",
-    "suspended": "etat-suspendu",
-    "ok": "etat-ok",
-    "degraded": "etat-degraded",
-    "down": "etat-down",
-    "delivered": "etat-delivered",
-    "held": "etat-held",
-}
-
-
-def _classe(valeur: str) -> str:
-    return _CLASSES_ETAT.get(valeur, "etat-neutre")
-
-
-def pastille(valeur: str | None, libelles: Mapping[str, str]) -> str:
-    brut = str(valeur or "")
-    texte = libelles.get(brut, brut or "-")
-    return f'<span class="etat {_classe(brut)}">{escape(texte)}</span>'
-
-
-def horodatage(value: Any) -> str:
-    if not isinstance(value, datetime):
-        return "-"
-    return escape(value.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M"))
-
-
-def colonnes(*largeurs: str) -> str:
-    """La largeur de chaque colonne, déclarée avant la première ligne.
-
-    Les tables sont en ``table-layout: fixed`` : sans ce partage, toutes les
-    colonnes seraient égales, et un objet de courrier recevrait la même place
-    qu'un badge de trois lettres. Avec, la répartition est celle qu'on a
-    voulue, et le contenu s'y plie au lieu d'élargir la page.
-    """
-    return (
-        "<colgroup>"
-        + "".join(f'<col style="width:{largeur}">' for largeur in largeurs)
-        + "</colgroup>"
-    )
-
-
-def texte(value: Any, *, defaut: str = "-", maximum: int = 160) -> str:
-    brut = "" if value is None else str(value)
-    brut = brut.replace("\r", " ").replace("\n", " ").strip()
-    if not brut:
-        return escape(defaut)
-    if len(brut) > maximum:
-        brut = brut[: maximum - 1] + "…"
-    return escape(brut)
-
-
-def document(titre: str, chemin_actif: str, corps: str, avis: str | None = None) -> str:
-    onglets = "".join(
-        f'<a href="{chemin}"'
-        + (' class="actif"' if chemin == chemin_actif else "")
-        + f">{escape(libelle)}</a>"
-        for chemin, libelle in ONGLETS
-    )
-    bandeau = ""
-    if avis and avis in AVIS:
-        ton, message = AVIS[avis]
-        bandeau = f'<p class="avis avis-{ton}">{escape(message)}</p>'
-    return (
-        "<!DOCTYPE html>\n"
-        '<html lang="fr"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        '<meta name="robots" content="noindex, nofollow">'
-        f"<title>{escape(titre)} - SentiMail</title>"
-        f"<style>{STYLE}</style></head><body>"
-        "<header><h1>SentiMail - configuration</h1>"
-        f"<nav>{onglets}</nav>"
-        # Le champ qui ouvre un dossier cité. Il est dans le bandeau parce
-        # qu'une référence se colle d'où qu'on vienne : depuis un échange,
-        # depuis un avis, depuis une note - jamais depuis la page qui la
-        # portait déjà.
-        '<form method="get" action="/aller" class="aller">'
-        '<label for="ref">Aller au dossier</label>'
-        '<input type="search" id="ref" name="ref" placeholder="E-c62805, M-e9e8f2…" '
-        'autocomplete="off" spellcheck="false">'
-        '<button type="submit">Ouvrir</button></form>'
-        "</header>"
-        f"<main>{bandeau}{corps}</main>"
-        "<footer>Accès réservé au tailnet. Chaque modification est enregistrée "
-        "avec l'adresse qui l'a demandée.</footer>"
-        "</body></html>"
-    )
 
 
 # --- Domaines ---------------------------------------------------------------
 
 
-def page_domaines(domaines: Sequence[Mapping[str, Any]]) -> str:
+def page_domaines(
+    domaines: Sequence[Mapping[str, Any]],
+    clients: Sequence[Mapping[str, Any]] = (),
+) -> str:
     if domaines:
-        lignes = "".join(_ligne_domaine(domaine) for domaine in domaines)
+        lignes = "".join(_ligne_domaine(domaine, clients) for domaine in domaines)
         tableau = (
-            "<table><thead><tr><th>Domaine</th><th>État</th><th>Contact</th>"
+            "<table><thead><tr><th>Domaine</th><th>Client</th><th>État</th><th>Contact</th>"
             "<th>Jeton à publier</th><th>Vérifié le</th><th></th></tr></thead>"
             f"<tbody>{lignes}</tbody></table>"
         )
     else:
         tableau = '<p class="vide">Aucun domaine enregistré pour le moment.</p>'
+    client_field = _client_select(clients, "client", "Client (facultatif)")
 
     return (
         "<section><h2>Domaines protégés</h2>"
@@ -323,13 +75,50 @@ def page_domaines(domaines: Sequence[Mapping[str, Any]]) -> str:
         '<div><label for="admin_email">Contact (facultatif)</label>'
         '<input type="email" id="admin_email" name="admin_email" '
         'placeholder="admin@exemple.fr" autocomplete="off"></div>'
+        f"{client_field}"
         "</div>"
         '<button type="submit" class="principal">Ajouter</button>'
+        "</form></section>"
+        "<section><h2>Ajouter un client</h2>"
+        '<p class="chapeau">Les domaines rattachés au même client partagent '
+        "les règles d’expéditeur et l’apprentissage.</p>"
+        '<form method="post" action="/domaines/clients/ajouter">'
+        '<div class="champs"><div><label for="client_name">Nom du client</label>'
+        '<input type="text" id="client_name" name="name" maxlength="120" required>'
+        "</div></div><button type=\"submit\" class=\"principal\">Ajouter</button>"
         "</form></section>"
     )
 
 
-def _ligne_domaine(domaine: Mapping[str, Any]) -> str:
+def _client_select(
+    clients: Sequence[Mapping[str, Any]], name: str, label: str,
+    selected: object = None,
+    *,
+    isolated_option: bool = True,
+) -> str:
+    options = (
+        ['<option value="">Nouveau client isolé</option>']
+        if isolated_option
+        else []
+    )
+    for client in clients:
+        identifiant = str(client["id"])
+        selection = " selected" if identifiant == str(selected or "") else ""
+        options.append(
+            f'<option value="{escape(identifiant)}"{selection}>'
+            f'{texte(client["name"], maximum=120)}</option>'
+        )
+    return (
+        f'<div><label for="{escape(name)}">{escape(label)}</label>'
+        f'<select id="{escape(name)}" name="{escape(name)}">'
+        + "".join(options)
+        + "</select></div>"
+    )
+
+
+def _ligne_domaine(
+    domaine: Mapping[str, Any], clients: Sequence[Mapping[str, Any]] = ()
+) -> str:
     fqdn = str(domaine["fqdn"])
     identifiant = escape(str(domaine["id"]))
     statut = str(domaine["status"])
@@ -349,8 +138,21 @@ def _ligne_domaine(domaine: Mapping[str, Any]) -> str:
         f"<code>{escape(verification_record(fqdn))}</code><br>"
         f'<code class="jeton">{texte(domaine["verification_token"], maximum=80)}</code>' 
     )
+    client_select = _client_select(
+        clients,
+        f"client-{identifiant}",
+        "Client",
+        domaine.get("client_id"),
+        isolated_option=False,
+    ).replace(f'name="client-{identifiant}"', 'name="client"')
     return (
         f"<tr><td><strong>{texte(fqdn)}</strong></td>"
+        "<td>"
+        f'<form method="post" action="/domaines/rattacher" class="enligne">'
+        f'<input type="hidden" name="domaine" value="{identifiant}">'
+        f"{client_select}"
+        '<button type="submit" class="discret">Rattacher</button></form>'
+        f'<small>{texte(domaine.get("client_name"), defaut="client isolé")}</small></td>'
         f"<td>{pastille(statut, ETATS_DOMAINE)}</td>"
         f"<td>{texte(domaine['admin_email'], defaut='non renseigné')}</td>"
         f"<td>{jeton}</td>"
@@ -360,6 +162,45 @@ def _ligne_domaine(domaine: Mapping[str, Any]) -> str:
 
 
 # --- État du système --------------------------------------------------------
+
+
+def _model_usage_panel(composants: Sequence[Mapping[str, Any]]) -> str:
+    usage = None
+    for component in composants:
+        details = component.get("details")
+        try:
+            details = json.loads(details) if isinstance(details, str) else details
+        except ValueError:
+            continue
+        if isinstance(details, Mapping) and isinstance(details.get("model_usage_24h"), Mapping):
+            usage = details["model_usage_24h"]
+            break
+    if usage is None:
+        return ""
+    title = "<section><h2>Appels de modèles enregistrés sur 24 heures</h2>"
+    if usage.get("status") != "ok":
+        return title + "<p>Mesure indisponible lors du dernier relevé.</p></section>"
+    rows = "".join(
+        f'<tr><td>{texte(g.get("role"))}<br>{texte(g.get("provider"))}<br>{texte(g.get("model_name"))}</td>'
+        f'<td>{_entier(g.get("attempts"))} : {_entier(g.get("complete"))} réussies, '
+        f'{_entier(g.get("error"))} erreurs, {_entier(g.get("cancelled"))} annulées, {_entier(g.get("started"))} sans fin enregistrée.</td>'
+        f'<td>{_entier(g.get("distinct_messages"))}</td><td>Entrée : {_entier(g.get("input_tokens"))} ; '
+        f'sortie : {_entier(g.get("output_tokens"))}. Cache lu : {_entier(g.get("cache_read_tokens"))} ; '
+        f'créé : {_entier(g.get("cache_creation_tokens"))}. Usage rapporté sur {_entier(g.get("usage_reported"))} tentatives.</td></tr>'
+        for g in usage.get("groups", []) if isinstance(g, Mapping)
+    )
+    return (title + f'<p>Du {_date_mesure(usage.get("window_start_utc"))} UTC au '
+        f'{_date_mesure(usage.get("window_end_utc"))} UTC, fin exclue : {_entier(usage.get("attempts"))} tentatives '
+        f'avec {_entier(usage.get("distinct_messages"))} messages distincts identifiés ; '
+        f'tentatives sans message rattaché : {_entier(usage.get("unattributed_attempts"))}.</p>'
+        '<p>La période porte sur le début enregistré de chaque tentative. Les replis sont des tentatives distinctes. '
+        'Les appels antérieurs à l’activation du journal ne sont pas reconstitués. '
+        'Un même message peut figurer dans plusieurs groupes. '
+        'Les tokens sont les quantités rapportées par les modèles ; les usages absents restent inconnus. '
+        'Le cache lu ou créé est une partie des tokens d’entrée, à ne pas ajouter au total.</p>'
+        '<table><thead><tr><th>Rôle, fournisseur, modèle</th><th>Tentatives par état</th>'
+        '<th>Messages distincts du groupe</th><th>Tokens rapportés</th></tr></thead>'
+        f'<tbody>{rows}</tbody></table></section>')
 
 
 def page_etat(
@@ -401,7 +242,7 @@ def page_etat(
     return (
         "<section><h2>État actuel</h2>"
         '<p class="chapeau">Dernier relevé de chaque composant.</p>'
-        f"{actuel}</section>"
+        f"{actuel}</section>{_model_usage_panel(composants)}"
         "<section><h2>Transitions récentes</h2>"
         '<p class="chapeau">Les changements d\'état, du plus récent au plus '
         "ancien.</p>"
@@ -603,32 +444,6 @@ def _portee(valeur: Any) -> str:
     return {"sender": "expéditeur", "domain": "domaine"}.get(str(valeur), str(valeur))
 
 
-def _action(valeur: Any) -> str:
-    return {"hold": "à retenir", "allow": "à laisser passer"}.get(
-        str(valeur), str(valeur)
-    )
-
-
-def _url(valeur: Any) -> str:
-    from urllib.parse import quote
-
-    return escape(quote(str(valeur), safe=""))
-
-
-def page_erreur(titre: str, message: str) -> str:
-    corps = (
-        f"<section><h2>{escape(titre)}</h2>"
-        f'<p class="avis avis-erreur">{escape(message)}</p>'
-        '<p><a href="/domaines">Revenir aux domaines</a></p></section>'
-    )
-    return document(titre, "", corps)
-
-
-def iterables(rows: Iterable[Any]) -> list[Mapping[str, Any]]:
-    """Convertit les enregistrements de la base en dictionnaires."""
-    return [dict(row) for row in rows]
-
-
 # --- Réglages ---------------------------------------------------------------
 
 ETATS_MODELE: Mapping[str, str] = {
@@ -663,7 +478,11 @@ def _ligne_plafond(domaine: Mapping[str, Any]) -> str:
 
 
 def _ligne_modele(role: str, routage: Mapping[str, Any] | None) -> str:
-    libelle = "Échanges avec l'utilisateur" if role == "conversation" else "Verdicts"
+    libelle = {
+        "conversation": "Échanges avec l'utilisateur",
+        "analysis": "Analyses auxiliaires",
+        "verdict": "Verdicts",
+    }.get(role, role)
     actif = bool(routage and routage["enabled"])
     modele = escape(str(routage["model_name"])) if routage else ""
     etat = "local" if actif else "distant"
@@ -703,7 +522,8 @@ def page_reglages(
 
     connu = {str(ligne["role"]): ligne for ligne in routage}
     modeles = "".join(
-        _ligne_modele(role, connu.get(role)) for role in ("conversation", "verdict")
+        _ligne_modele(role, connu.get(role))
+        for role in ("conversation", "analysis", "verdict")
     )
     return (
         "<section><h2>Plafonds par domaine</h2>"
@@ -726,20 +546,54 @@ def page_reglages(
 # --- Mesure d'efficacité ----------------------------------------------------
 
 _ISSUES: tuple[tuple[str, str], ...] = (
-    ("deliver", "Livré sans rien demander"),
+    ("deliver", "Original livré en premier"),
     ("ask_user", "Avis demandé"),
     ("filed_as_junk", "Classé indésirable"),
 )
+_EXECUTIONS_MESURE = (*_ISSUES,
+    ("suppressed", "Supprimé par préférence authentifiée"),
+    ("undeliverable", "Non distribuable, sans première exécution"),
+    ("pending", "En attente de première exécution"),
+    ("unconfirmed", "État final sans preuve d’exécution"),
+)
 
 
-def _pourcentage(valeur: Any, *, defaut: str = "-") -> str:
-    if not isinstance(valeur, (int, float)) or isinstance(valeur, bool):
-        return defaut
-    return f"{valeur * 100:.1f} %"
-
-
-def _entier(valeur: Any) -> str:
-    return str(valeur) if isinstance(valeur, int) and not isinstance(valeur, bool) else "-"
+def _population_mesure(rapport: Mapping[str, Any]) -> str:
+    population = rapport.get("population")
+    executions = rapport.get("executions")
+    if not isinstance(population, Mapping) or not isinstance(executions, Mapping):
+        return ""
+    lignes = "".join(
+        f"<tr><td>{texte(label)}</td><td>{_entier(executions.get(key))}</td></tr>"
+        for key, label in _EXECUTIONS_MESURE
+    )
+    residuels = rapport.get("residuals") or {}
+    return (
+        "<h3>Population et premières exécutions</h3>"
+        f'<p>Captures du {_date_mesure(rapport.get("window_start_utc"))} UTC '
+        f'au {_date_mesure(rapport.get("window_end_utc"))} UTC, borne de fin exclue. '
+        f'{_entier(population.get("captured"))} messages captés, dont '
+        f'{_entier(population.get("consumed_excluded"))} échanges consommés par MAIA '
+        f'exclus : {_entier(population.get("protected"))} messages protégés.</p>'
+        "<p>La première livraison, le premier avis ou la suppression fait foi, "
+        "même si le dossier change ensuite d’état. Les états sans événement "
+        "ne prouvent aucune livraison.</p>"
+        "<table><thead><tr><th>Première issue constatée</th><th>Messages</th>"
+        f"</tr></thead><tbody>{lignes}</tbody></table>"
+        f'<p>Les mesures de qualité ci-dessous portent sur '
+        f'{_entier(population.get("quality_evaluated"))} messages dont la première '
+        "issue est une livraison, un classement indésirable ou un avis. Les "
+        "suppressions, non-distribuables, attentes et états non confirmés sont exclus "
+        "de ces taux. Une préférence ne constitue pas une qualification de sécurité.</p>"
+        f'<p>{_entier(population.get("ignored_with_notice"))} dossiers abandonnés '
+        "après avis restent comptés comme sollicitations. Le silence ne crée "
+        "aucune qualification et n’efface pas une qualification active existante.</p>"
+        f'<p>Contrôle des preuves : {_entier(residuels.get("missing_case"))} messages '
+        f'sans dossier ; {_entier(residuels.get("without_execution_event"))} sans '
+        f'événement d’exécution, dont {_entier(residuels.get("delivered_without_event"))} '
+        f'marqués livrés et {_entier(residuels.get("suppressed_without_event"))} '
+        "marqués supprimés.</p>"
+    )
 
 
 def page_mesure(rapport: Any, observe_le: Any) -> str:
@@ -797,8 +651,9 @@ def page_mesure(rapport: Any, observe_le: Any) -> str:
     return (
         "<h2>Mesure d’efficacité</h2>"
         f'<p class="compact">Fenêtre : {texte(rapport.get("window_days"))} jours · '
-        f"publié le {horodatage(observe_le)} · "
-        f'{_entier(rapport["matrix"].get("total"))} messages.</p>'
+        f"publié le {_date_mesure(observe_le)} UTC · "
+        f'{_entier(rapport["matrix"].get("total"))} messages dans la mesure de qualité.</p>'
+        + _population_mesure(rapport) +
 
         "<h3>Couverture de qualification</h3>"
         "<p>Sur quelle part de chaque issue une conclusion est permise. "
@@ -810,26 +665,29 @@ def page_mesure(rapport: Any, observe_le: Any) -> str:
         "<h3>Matrice</h3>"
         "<p>Effectifs bruts. La colonne « non qualifié » n’est jamais répartie : "
         "ce qui n’a pas été jugé par un humain ne compte dans aucun taux.</p>"
-        "<table><thead><tr><th>Décision du système</th><th>Légitime</th>"
+        "<table><thead><tr><th>Première exécution</th><th>Légitime</th>"
         "<th>Indésirable</th><th>Ambigu</th><th>Non qualifié</th>"
         "<th>Total</th></tr></thead>"
         f"<tbody>{lignes_matrice}</tbody></table>"
 
         "<h3>Précision de la retenue</h3>"
-        f"<p>Quand le système a demandé un avis, il avait raison "
-        f'<strong>{_pourcentage(retenue.get("value"))}</strong> du temps '
-        f'({_entier(retenue.get("labelled"))} réponses sur '
-        f'{_entier(retenue.get("total"))} demandes). '
-        "C’est la seule métrique dont la vérité terrain est presque complète.</p>"
+        f'<p>Parmi les {_entier(retenue.get("labelled"))} demandes qualifiées, '
+        f'<strong>{_pourcentage(retenue.get("value"))}</strong> portent une '
+        f'qualification indésirable. Il y a {_entier(retenue.get("total"))} demandes '
+        "au total. Les demandes sans qualification restent inconnues ; le taux "
+        "ne se généralise pas à toutes les demandes.</p>"
 
         "<h3>Risque d’échec silencieux</h3>"
         f'<p><strong>{_pourcentage(risque.get("value"))}</strong> des messages ont '
         "été livrés alors qu’ils étaient indésirables "
-        f'({_entier(risque.get("observed"))} observés).{borne}</p>'
+        f'({_entier(risque.get("observed"))} observés sur '
+        f'{_entier(risque.get("total"))} messages dans la mesure de qualité).{borne}</p>'
 
         "<h3>Taux d’erreur, entre deux bornes</h3>"
         "<p>Une retenue n’est ni une réussite ni un échec : c’est un report. "
-        "Chaque taux est donc donné en la comptant d’abord comme juste, puis "
+        f'Ces taux ne portent que sur {_entier(taux.get("legitimate_observed"))} '
+        f'légitimes et {_entier(taux.get("spam_observed"))} indésirables qualifiés. '
+        "Chaque taux est donné en la comptant d’abord comme juste, puis "
         "comme erreur. L’écart mesure ce que le système délègue au lieu de "
         "trancher.</p>"
         "<table><thead><tr><th>Erreur</th><th>Retenue comptée juste</th>"
@@ -858,6 +716,7 @@ def page_mesure(rapport: Any, observe_le: Any) -> str:
 # avant d'enregistrer, et ``custom`` reste ouvert pour un fournisseur maison.
 _LIBELLES_ROLE: Mapping[str, str] = {
     "verdict": "Verdict",
+    "analysis": "Analyses auxiliaires",
     "conversation": "Conversation",
 }
 
@@ -990,8 +849,12 @@ def encart_confidentialite(
     connu_moteur = {str(ligne["role"]): ligne for ligne in (rows or [])}
     connu_local = {str(ligne["role"]): ligne for ligne in (routage or [])}
     lignes = "".join(
-        _ligne_confidentialite(role, connu_moteur.get(role), connu_local.get(role))
-        for role in ("verdict", "conversation")
+        _ligne_confidentialite(
+            role,
+            connu_moteur.get("verdict" if role == "analysis" else role),
+            connu_local.get(role),
+        )
+        for role in ("verdict", "analysis", "conversation")
     )
     return (
         "<section><h2>Confidentialité</h2>"
@@ -1340,7 +1203,10 @@ def page_ecarts(
             + " → " + texte(ecart.get("human_label")) + "</td>"
             + "<td>"
             + '<span class="badge badge-{1}">{0}</span>'.format(
-                *libelles.get(str(ecart["direction"]), (str(ecart["direction"]), "gris"))
+                *libelles.get(
+                    str(ecart["direction"]),
+                    (escape(str(ecart["direction"])), "gris"),
+                )
             )
             + "</td><td>"
             + (

@@ -26,19 +26,26 @@ from typing import Any
 import asyncpg
 import httpx
 
-from sentimail_v3.config import Settings, load_settings
-from sentimail_v3.crypto import load_key
-from sentimail_v3.identity import instance_identity
-from sentimail_v3.llm import LlmError, provider_chat_json
 from sentimail_v3.code.doctrine_learning import refresh_learned_doctrine
-from sentimail_v3.supervision import discrepancies
-from sentimail_v3.supervision.evaluation_report import publish as publish_evaluation
-from sentimail_v3.judgment.verdict_engine import PROMPT_VERSION
+from sentimail_v3.code.reference import nommer_dossier
+from sentimail_v3.config import Settings, load_settings
+from sentimail_v3.conversation.conversation import ConversationStore
+from sentimail_v3.crypto import load_key
 from sentimail_v3.execution.delivery import retry_one_release
 from sentimail_v3.execution.delivery_state import TERMINAL
 from sentimail_v3.execution.review_guard import reconcile_one_review_hold
+from sentimail_v3.identity import instance_identity
+from sentimail_v3.judgment.verdict_engine import PROMPT_VERSION
+from sentimail_v3.judgment.verdict_retry import (
+    MAX_ATTEMPTS,
+    WAITING_RUN_SQL,
+    retry_on_schedule_sql,
+)
+from sentimail_v3.llm import LlmError, provider_chat_json
+from sentimail_v3.llm_accounting import llm_scope, observed_call
+from sentimail_v3.supervision import discrepancies
+from sentimail_v3.supervision.evaluation_report import publish as publish_evaluation
 from sentimail_v3.supervision.health import pulse
-from sentimail_v3.code.reference import nommer_dossier
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("sentimail-v3-caretaker")
@@ -72,6 +79,9 @@ recommande jamais d'ajuster un seuil de classification à partir de leur somme :
 tout seuil qui corrige l'un aggrave l'autre. Quand les deux sont élevés, la
 cause n'est pas un seuil mais un manque d'indices pour trancher - dis-le.
 erreur_de_qualification et laisse_passer désignent, eux, de vraies erreurs.
+Tout désaccord est déjà tranché par le verdict humain, qui s'applique : ne
+demande jamais à l'exploitant de revoir, d'examiner ou d'acquitter un écart
+ni un dossier qualifié par un destinataire.
 
 Un refus SMTP définitif « destinataire inconnu » n'appelle aucune correction :
 le dossier est conclu, et créer la boîte devinée par un expéditeur de masse
@@ -89,17 +99,24 @@ def _log(event: str, **fields: object) -> None:
 
 async def collect(pool: asyncpg.Pool[Any]) -> dict[str, Any]:
     """L'état de santé factuel, sans interprétation."""
+    # Un dossier qui attend, dans les temps, l'essai planifié après une panne
+    # passagère du modèle n'est ni coincé ni en échec : il attend une échéance
+    # choisie. Le 15 octobre 2026, trois essais enchaînés pendant la même
+    # lenteur ont fait écrire « intervention requise » pour une attente.
+    # Une échéance manquée, elle, le refait compter dans les deux.
     row = await pool.fetchrow(
         """
         SELECT
           (SELECT count(*) FROM verdict_runs
-            WHERE status='error' AND created_at > now()-interval '24 hours')
+            WHERE status='error' AND created_at > now()-interval '24 hours'
+              AND NOT """ + WAITING_RUN_SQL + """)
             AS verdicts_en_erreur_24h,
           (SELECT count(*) FROM messages
             WHERE delivery_status='deferred') AS livraisons_differees,
-          (SELECT count(*) FROM messages
-            WHERE delivery_status IN ('captured','analyzing')
-              AND captured_at < now()-interval '30 minutes') AS dossiers_coinces,
+          (SELECT count(*) FROM messages m
+            WHERE m.delivery_status IN ('captured','analyzing')
+              AND m.captured_at < now()-interval '30 minutes'
+              AND NOT """ + retry_on_schedule_sql("m") + """) AS dossiers_coinces,
           -- « ignored » est un état voulu : le dossier a été abandonné faute
           -- de réponse, décision prise et tracée. Le compter ici ferait passer
           -- dix-huit abandons pour dix-huit incidents, et noierait le seul cas
@@ -137,6 +154,7 @@ async def collect(pool: asyncpg.Pool[Any]) -> dict[str, Any]:
         SELECT error_type, left(error_detail,120) AS detail, count(*)
         FROM verdict_runs
         WHERE status='error' AND created_at > now()-interval '24 hours'
+          AND NOT """ + WAITING_RUN_SQL + """
         GROUP BY 1,2 ORDER BY 3 DESC LIMIT 5
         """
     )
@@ -148,9 +166,6 @@ async def collect(pool: asyncpg.Pool[Any]) -> dict[str, Any]:
         # Le détail par sens, sans lequel le total appelle un réglage de seuil
         # qui aggraverait forcément l'un des deux défauts.
         "sens_des_desaccords_7j": disagreement_directions(ecarts),
-        # Les écarts que personne n'a encore acquittés depuis la console. Eux
-        # seuls décident d'un courrier : un écart traité ne dérange plus.
-        "ecarts_non_traites": await discrepancies.open_counts(pool),
         "erreurs_de_verdict_24h": [dict(value) for value in errors],
     }
 
@@ -234,7 +249,6 @@ def report_fingerprint(state: dict[str, Any]) -> str:
             "erreurs_de_verdict_24h",
             "sens_des_desaccords_7j",
             "desaccords_humain_modele_7j",
-            "ecarts_non_traites",
         )
     }
     return hashlib.sha256(
@@ -272,53 +286,64 @@ def actionable_signals(state: dict[str, Any]) -> bool:
 
 
 def mail_worthy(state: dict[str, Any]) -> bool:
-    """Un courrier ne part que pour du grave qui n'a pas déjà été traité.
+    """Un courrier ne part que pour une anomalie d'exploitation levée.
 
-    Grave : une vraie erreur de jugement encore ouverte sur la console, ou un
-    compteur d'anomalie levé. Les prudences et les écarts acquittés vivent sur
-    la page des écarts ; les rapporter par courrier était le bruit même que la
-    console remplace.
+    Un désaccord humain/modèle n'en est jamais une : le verdict humain s'est
+    appliqué, personne ne repasse derrière (règle du 13 septembre 2026). Les
+    écarts restent mesurés sur la page de la console, sans courrier.
     """
-    ouverts = state.get("ecarts_non_traites")
-    ouverts = ouverts if isinstance(ouverts, dict) else {}
-    if any(
-        int(ouverts.get(direction) or 0) > 0
-        for direction in discrepancies.REAL_ERROR_DIRECTIONS
-    ):
-        return True
     return any(
         int(state.get(key) or 0) > 0
         for key in (
             "retenues_sans_avis",
             "dossiers_coinces",
             "livraisons_differees",
-            "alertes_amorties_24h",
         )
     )
 
 
 async def _anthropic_diagnose(
-    client: httpx.AsyncClient, api_key: str, model: str, state: dict[str, Any]
+    pool: asyncpg.Pool[Any],
+    client: httpx.AsyncClient,
+    api_key: str,
+    model: str,
+    state: dict[str, Any],
 ) -> str:
-    response = await client.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
-        json={
-            "model": model,
-            "system": SYSTEM,
-            "messages": [
-                {"role": "user", "content": "ÉTAT:\n" + _json(state)}
-            ],
-            "max_tokens": 800,
-        },
-        timeout=120.0,
-    )
-    response.raise_for_status()
-    return "".join(
-        str(block.get("text") or "")
-        for block in response.json().get("content") or []
-        if isinstance(block, dict) and block.get("type") == "text"
-    )
+    async def invoke() -> tuple[str, dict[str, Any]]:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+            json={
+                "model": model,
+                "system": SYSTEM,
+                "messages": [
+                    {"role": "user", "content": "ÉTAT:\n" + _json(state)}
+                ],
+                "max_tokens": 800,
+            },
+            timeout=120.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        text = "".join(
+            str(block.get("text") or "")
+            for block in payload.get("content") or []
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        return text, {
+            "http_status": response.status_code,
+            "usage": payload.get("usage") if isinstance(payload, dict) else {},
+        }
+
+    with llm_scope(purpose="caretaker"):
+        content, _ = await observed_call(
+            pool,
+            role="caretaker",
+            provider="anthropic",
+            model=model,
+            invoke=invoke,
+        )
+    return content
 
 
 async def diagnose(
@@ -339,7 +364,7 @@ async def diagnose(
     try:
         if anthropic_key:
             content = await _anthropic_diagnose(
-                client, anthropic_key, settings.anthropic_model, state
+                pool, client, anthropic_key, settings.anthropic_model, state
             )
         else:
             content, _ = await provider_chat_json(
@@ -391,20 +416,27 @@ async def diagnose(
 
 
 async def _replay_errored(pool: asyncpg.Pool[Any], settings: Settings) -> int:
-    """Rejoue les verdicts épuisés en erreur, sans jamais toucher un livré."""
+    """Rejoue les verdicts épuisés en erreur, sans jamais toucher un livré.
+
+    Épuisé veut dire daté de fin. Un troisième échec passager attend encore
+    son quatrième essai, à quatre heures : le rejouer supprimerait son run et
+    relancerait le dossier aussitôt, dans la panne qu'on laisse passer.
+    """
     rows = await pool.fetch(
         """
         SELECT DISTINCT i.message_id::text AS message_id
         FROM verdict_runs vr
         JOIN investigations i ON i.id=vr.investigation_id
         JOIN messages m ON m.id=i.message_id
-        WHERE vr.status='error' AND vr.attempts >= 3
+        WHERE vr.status='error' AND vr.attempts >= $3
+          AND vr.completed_at IS NOT NULL
           AND vr.created_at > now()-interval '24 hours'
           AND NOT (m.delivery_status = ANY($2::text[]))
         LIMIT $1
         """,
         MAX_REPLAYS_PER_RUN,
         sorted(TERMINAL),
+        MAX_ATTEMPTS,
     )
     from sentimail_v3.supervision.replay import replay_case
 
@@ -427,6 +459,28 @@ async def _replay_errored(pool: asyncpg.Pool[Any], settings: Settings) -> int:
     return done
 
 
+async def _invitation_queue(
+    pool: asyncpg.Pool[Any], settings: Settings
+) -> ConversationStore:
+    """La file qui remet un avis MAIA en route, la même que celle du verdict.
+
+    Réparer une retenue orpheline, c'est recréer l'avis qui lui manque : il
+    faut donc pouvoir le mettre en file. Depuis que la réparation l'exige,
+    l'action du caretaker l'appelait sans, et échouait en TypeError à chaque
+    passage - le journal disait « caretaker.error » et rien n'était réparé.
+    """
+    identite = await instance_identity(pool, settings)
+    return ConversationStore(
+        pool,
+        identite.action_address,
+        identite.assistant_sender,
+        settings.render_sandbox_url,
+        identite.action_aliases,
+        load_key(settings.raw_eml_key_file),
+        settings=settings,
+    )
+
+
 async def execute(
     pool: asyncpg.Pool[Any], settings: Settings, actions: list[str]
 ) -> dict[str, int]:
@@ -443,9 +497,10 @@ async def execute(
                 done += 1
             outcome[action] = done
         elif action == "reconcile_review_holds":
+            invitations = await _invitation_queue(pool, settings)
             done = 0
             for _ in range(10):
-                if not await reconcile_one_review_hold(pool, settings):
+                if not await reconcile_one_review_hold(pool, settings, invitations):
                     break
                 done += 1
             outcome[action] = done
@@ -605,6 +660,12 @@ async def main() -> None:
                 detail=str(exc)[:300],
             )
         pulse("caretaker")
+        try:
+            from sentimail_v3.supervision.classifier_cycle import run_once as classifier_cycle
+            result = await classifier_cycle(pool)
+            _log("caretaker.classifier_cycle", result=result)
+        except Exception as exc:  # noqa: BLE001 - aucun effet sur la livraison
+            _log("caretaker.classifier_cycle_error", error=type(exc).__name__)
         await asyncio.sleep(settings.caretaker_interval_hours * 3600)
 
 

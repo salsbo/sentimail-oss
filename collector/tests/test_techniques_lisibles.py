@@ -4,6 +4,7 @@ import re
 import unittest
 from pathlib import Path
 
+from sentimail_v3.code.plain_words import confidence_badge
 from sentimail_v3.conversation.review_notice import render_notice_html
 
 MIGRATION = (
@@ -55,41 +56,37 @@ class SansJargonTests(unittest.TestCase):
 
 
 class AffichageTests(unittest.TestCase):
-    """Le conseil doit arriver jusqu'à l'avis, sinon il n'existe pas."""
+    """Le conseil doit arriver jusqu'à l'avis, sinon il n'existe pas.
 
-    def _rendu(self, technique: dict[str, str]) -> str:
+    De la technique, l'avis ne garde plus que le geste à faire : la nommer et
+    la décrire redisait en trois lignes ce que l'indice de confiance dit en un
+    mot. Le conseil, lui, n'est dit nulle part ailleurs.
+    """
+
+    def _rendu(self, conseil: str) -> str:
         return render_notice_html({
             "subject": "Objet", "sender": "Un expéditeur <a@b.test>",
             "status_text": "Ce message n’a pas été livré : il attend ta réponse.",
-            "concerns": ["Un souci."], "reassurances": [],
-            "decision": "Je préfère te demander.",
-            "techniques": [technique],
+            "concerns": ["Un souci."],
+            "badge": confidence_badge("dangerous", 1),
+            "advice": conseil,
             "action_address": "maia@sentinel.mondomaine.example", "has_preview": False,
         })
 
     def test_le_conseil_est_affiche(self) -> None:
-        rendu = self._rendu({
-            "name": "Leurre de suspension de compte",
-            "description": "La menace de fermer ton compte sert à te faire cliquer.",
-            "advice": "Connecte-toi comme d’habitude.",
-        })
+        rendu = self._rendu("Connecte-toi comme d’habitude.")
         self.assertIn("Connecte-toi comme d’habitude.", rendu)
 
-    def test_le_conseil_suit_la_description(self) -> None:
-        rendu = self._rendu({
-            "name": "N", "description": "DESCRIPTION", "advice": "CONSEIL",
-        })
-        self.assertLess(rendu.index("DESCRIPTION"), rendu.index("CONSEIL"))
+    def test_le_conseil_accompagne_l_indice(self) -> None:
+        rendu = self._rendu("CONSEIL")
+        self.assertLess(rendu.index("DANGEREUX"), rendu.index("CONSEIL"))
+        self.assertLess(rendu.index("CONSEIL"), rendu.index("Pourquoi j&#x27;hésite"))
 
-    def test_une_technique_sans_conseil_ne_laisse_pas_de_fleche_vide(self) -> None:
-        rendu = self._rendu({"name": "N", "description": "D", "advice": ""})
-        self.assertNotIn("→", rendu)
+    def test_sans_conseil_aucune_fleche_ne_reste(self) -> None:
+        self.assertNotIn("→", self._rendu(""))
 
     def test_le_conseil_est_echappe(self) -> None:
-        rendu = self._rendu({
-            "name": "N", "description": "D", "advice": "<script>x</script>",
-        })
-        self.assertNotIn("<script>", rendu)
+        self.assertNotIn("<script>", self._rendu("<script>x</script>"))
 
 
 if __name__ == "__main__":

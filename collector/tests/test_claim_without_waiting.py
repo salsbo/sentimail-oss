@@ -34,7 +34,7 @@ class AttendreCeQuiCompteTests(unittest.TestCase):
     def test_le_delai_fixe_reste_un_filet(self) -> None:
         # Sans lui, un dossier dont l'investigation n'aboutit jamais ne serait
         # jamais jugé : le retard deviendrait un silence.
-        self.assertIn("analysis_wait_seconds", inspect.getsource(verdict_engine))
+        self.assertIn("analysis_wait_seconds", inspect.getsource(verdict_engine._claim))
 
     def test_les_deux_conditions_sont_alternatives(self) -> None:
         # « investigation terminée OU délai écoulé », jamais « ET » : exiger

@@ -10,6 +10,7 @@ from sentimail_v3.execution.delivery_state import (
     HELD,
     ORIGINS,
     RELEASE_PENDING,
+    SUPPRESSED,
     TERMINAL,
     UNDELIVERABLE,
     move,
@@ -73,6 +74,22 @@ class DeliveryStateTests(unittest.IsolatedAsyncioTestCase):
     def test_a_release_can_still_conclude_in_delivery(self) -> None:
         self.assertIn(RELEASE_PENDING, ORIGINS[DELIVERED])
         self.assertIn(HELD, ORIGINS[DELIVERED])
+
+    def test_une_livraison_en_preparation_peut_revenir_a_la_retenue(self) -> None:
+        """Un courrier qui n'a pas pu être composé revient à la retenue.
+
+        Seul ce chemin-là : un envoi différé repasse par release_pending avant
+        d'être composé, et un état terminal ne se rouvre jamais.
+        """
+        self.assertIn(RELEASE_PENDING, ORIGINS[HELD])
+        self.assertNotIn(DEFERRED, ORIGINS[HELD])
+        for terminal in TERMINAL:
+            self.assertNotIn(terminal, ORIGINS[HELD])
+
+    def test_authenticated_block_is_a_terminal_non_smtp_outcome(self) -> None:
+        self.assertIn(SUPPRESSED, TERMINAL)
+        self.assertIn(ANALYZING, ORIGINS[SUPPRESSED])
+        self.assertNotIn(SUPPRESSED, ORIGINS[DELIVERED])
 
 
 if __name__ == "__main__":

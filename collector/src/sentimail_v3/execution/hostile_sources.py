@@ -75,12 +75,6 @@ def source_from_received(
     return None
 
 
-def source_ip_from_received(received_values: list[str]) -> str | None:
-    """La première adresse publique de la chaîne Received, dans l'ordre."""
-    found = source_from_received(received_values)
-    return found[0] if found else None
-
-
 async def record_hostile_source(
     pool: asyncpg.Pool[Any], message_id: str, reason: str
 ) -> bool:

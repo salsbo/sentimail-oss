@@ -30,7 +30,8 @@ Conséquences directes, sans redémarrage ni rechargement :
   que ce MX n'est pas un relais ouvert.
 
 Enrôler un domaine protège **tous** ses destinataires. Il n'y a pas de liste
-d'adresses à tenir.
+d'adresses à tenir. Seule exception : une boîte que le serveur de livraison ne
+connaît pas est refusée dès l'arrivée (voir « Ce que le MX refuse »).
 
 ## Enrôler un domaine
 
@@ -105,6 +106,34 @@ d'adresses à tenir.
 ## Ce que le MX refuse
 
 - Tout destinataire hors des domaines actifs (`reject_unauth_destination`).
+- Une boîte inexistante d'un domaine actif (`reject_unverified_recipient`,
+  réponse `550 Destinataire inconnu`). Le MX ne tient aucune liste d'adresses :
+  il envoie une sonde sans contenu par la route du domaine, donc au collecteur.
+  Le collecteur reconnaît la sonde à son expéditeur `sentimail-verification@`
+  et pose la même question au serveur de livraison (`RELAY_HOST:RELAY_PORT`,
+  sans message, expéditeur vide, 4 s au plus pour tout l'échange). Seul un
+  refus définitif d'adresse (5xx avec un statut 5.1.x) fait refuser le
+  destinataire. Un délai, un refus temporaire ou de politique, une exception ou
+  une panne laissent passer, comme avant ; collecteur arrêté, le MX accepte et
+  garde le message dans sa file (`unverified_recipient_defer_code = 250`).
+  Une sonde sans réponse sûre reçoit un report (`450 4.4.3`), jamais un 250 :
+  le MX accepte le message, mais ne garde ce résultat qu'une heure au lieu de
+  tenir l'adresse pour connue 31 jours. L'adresse d'action de SentiMail n'est
+  jamais vérifiée. Le collecteur ne refuse jamais un message réel :
+  l'expéditeur `sentimail-verification@` est refusé à l'entrée du MX
+  (`5.7.1 Expediteur reserve`) sous toutes ses formes, adresse exacte de la
+  sonde comprise. Postfix garde la réponse 31 jours pour une adresse connue,
+  une heure pour une adresse inconnue, dans `/var/lib/postfix` : ce cache
+  repart de zéro à chaque recréation du conteneur MX, et le premier message
+  vers une adresse pas encore vérifiée attend environ 3 s au RCPT. Une route
+  directe (`config/mx-direct/routes`) est sondée chez son propre serveur, sans
+  le filtre 5.1.x du collecteur : tout 5xx de ce serveur y vaut « Destinataire
+  inconnu ». Journal du collecteur : `recipient_probe.checked` (issue connue,
+  inconnue ou hors champ), `recipient_probe_deferred` (avertissement, sans
+  réponse sûre) et `recipient_probe.error` (erreur), avec l'issue, le code
+  reçu et le domaine, jamais l'adresse. Code :
+  `observation/recipient_check.py` ; réglages : section « Destinataires
+  inconnus » de `infra/postfix/main.cf.tmpl`.
 - `mynetworks` se limite à la boucle locale du conteneur : y ajouter le
   sous-réseau Docker ouvrirait le relais à tous les conteneurs voisins.
 - Aucune authentification SMTP n'est proposée (`smtpd_sasl_auth_enable = no`),
@@ -160,6 +189,17 @@ Contrairement à V2, ce rspamd n'interroge aucune base de données : pas de
 réglages par domaine à rendre, donc pas de dépendance à Postgres ni de
 processus de rendu à surveiller.
 
+Exception d'exploitation demandée par le mainteneur le 24 octobre 2026 : les
+notifications de `info@account.netflix.com` dont l'objet est exactement
+`A new device is using your account` sont écartées au milter de Postfix, avant
+le collecteur, uniquement pour `amartin@example.org`. La règle exige DKIM et DMARC
+valides, un unique destinataire SMTP et sa concordance avec l'en-tête `To`.
+Elle ne modifie aucun verdict et n'ajoute aucune liste noire d'expéditeur.
+Les autres objets Netflix, expéditeurs et destinataires ne correspondent pas.
+La configuration est dans `local.d/regexp.conf` et `local.d/force_actions.conf` ;
+Postfix accepte le message puis le jette sans avis MAIA ni rejet à réessayer.
+La santé native de rspamd vérifie aussi la validité de sa configuration.
+
 ## Vérifications utiles
 
 ```sh
@@ -172,3 +212,32 @@ docker compose exec mx postmap -q pas-enrole.fr pgsql:/etc/postfix/relay_domains
 # La file est-elle vide ?
 docker compose exec mx postqueue -p
 ```
+
+
+## Domaines SMTP servis directement
+
+Le MX public peut aussi acheminer des domaines non protégés directement vers
+un autre serveur SMTP. Ils ne sont pas ajoutés à `domains`, ne passent pas par
+le collecteur et ne produisent ni dossier, ni verdict, ni avis MAIA.
+
+Le répertoire opérateur `SENTINEL_V3_MX_DIRECT_ROUTES_DIR` fournit `routes`
+(`domaine.example smtp:[serveur]:25` ou `adresse@domaine.example
+smtp:[serveur]:port`) et `recipient_access` (refus SMTP facultatifs, par
+exemple une adresse d'envoi uniquement). Une route par adresse exacte ne capte
+que ce destinataire ; les autres destinataires du même domaine gardent la route
+SQL vers le collecteur. Les clés exactes sont obligatoires ; `*` est interdit.
+Les maps sont reconstruites au démarrage. Les domaines protégés restent résolus
+par SQL.
+
+Une route par adresse peut viser un service SMTP local lié à une interface
+privée. Ce service doit autoriser explicitement les seuls destinataires prévus
+et refuser le relais vers les domaines externes. La configuration de la
+réinjection limitée à une instance reste propre à chaque déploiement.
+Les contrôles SMTP et le milter d'authentification de l'entrée publique restent
+actifs ; ce chemin direct ne passe pas par l'analyse du pipeline V3.
+
+Une route au domaine entier ne doit pas coexister avec l'enrôlement de ce domaine
+en protection. Une route par destinataire peut viser une boîte d'un domaine
+protégé, à condition de pointer vers un relais privé qui n'accepte que les
+destinataires explicitement prévus. Sauvegarder le répertoire opérateur avec la
+configuration du service mail auquel il appartient.

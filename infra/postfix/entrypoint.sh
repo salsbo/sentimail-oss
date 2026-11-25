@@ -60,8 +60,11 @@ main_vars='${POSTFIX_MYHOSTNAME} ${POSTFIX_MYORIGIN} ${POSTFIX_MYDOMAIN} ${POSTF
 map_vars='${POSTGRES_HOST} ${POSTGRES_USER} ${POSTGRES_PASSWORD} ${POSTGRES_DB} ${SENTINEL_COLLECTOR_HOST} ${SENTINEL_COLLECTOR_PORT}'
 
 envsubst "${main_vars}" < /etc/postfix/main.cf.tmpl > /etc/postfix/main.cf
-envsubst "${map_vars}" < /etc/postfix/relay_domains.cf.tmpl > /etc/postfix/relay_domains.cf
-envsubst "${map_vars}" < /etc/postfix/transport.cf.tmpl > /etc/postfix/transport.cf
+(
+    umask 027
+    envsubst "${map_vars}" < /etc/postfix/relay_domains.cf.tmpl > /etc/postfix/relay_domains.cf
+    envsubst "${map_vars}" < /etc/postfix/transport.cf.tmpl > /etc/postfix/transport.cf
+)
 
 chmod 640 /etc/postfix/relay_domains.cf /etc/postfix/transport.cf
 chown root:postfix /etc/postfix/relay_domains.cf /etc/postfix/transport.cf
@@ -74,6 +77,8 @@ unset POSTGRES_PASSWORD
 # une table vide, jamais une erreur de lookup.
 mkdir -p /etc/postfix/hostile
 [ -f /etc/postfix/hostile/hostile.cidr ] || : > /etc/postfix/hostile/hostile.cidr
+
+/usr/local/bin/direct-routes.sh
 
 postfix check
 

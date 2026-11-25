@@ -7,7 +7,7 @@ la base, donc de laisser le modèle demander ce qu'il lui manque.
 
 Deux bornes tiennent cette liberté. La première est l'identité : le
 destinataire vient du jeton SMTP, il est injecté par le code à chaque appel
-d'outil, et aucune formulation du modèle ne peut le remplacer — c'est ce qui
+d'outil, et aucune formulation du modèle ne peut le remplacer : c'est ce qui
 rend impossible d'atteindre la boîte d'un autre. La seconde est le nombre de
 tours : la boucle s'arrête au bout de quelques allers-retours, avec ce qu'elle
 a. Une question hors messagerie n'entre jamais ici : le pré-filtre l'a écartée
@@ -20,6 +20,7 @@ politique déterministe.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,6 +31,7 @@ import httpx
 from sentimail_v3.conversation.agent_tools import catalogue, run_tool
 from sentimail_v3.config import Settings
 from sentimail_v3.llm import provider_chat_json
+from sentimail_v3.llm_accounting import LlmQuotaExceeded, Reservation, llm_scope
 
 MAX_STEPS = 4
 MAX_ANSWER_CHARS = 4000
@@ -97,13 +99,47 @@ async def answer_question(
     question: str,
     *,
     participant: str,
+    reserve_call: Reservation | None = None,
+    deadline_seconds: float | None = None,
+    max_calls: int = MAX_STEPS + 1,
 ) -> Answer:
     """Répond à une question de messagerie, outils bornés au seul demandeur."""
+    used: list[str] = []
+    attempts = 0
+
+    async def reserve() -> tuple[int | None, str | None]:
+        nonlocal attempts
+        if attempts >= min(MAX_STEPS + 1, max_calls):
+            return None, "question_call_limit"
+        reservation = await reserve_call() if reserve_call is not None else (None, None)
+        if reservation[1] is None:
+            attempts += 1
+        return reservation
+
+    budget = deadline_seconds if deadline_seconds is not None else getattr(settings, "assistant_question_deadline_seconds", 120)
+    try:
+        if budget <= 0 or max_calls <= 0:
+            raise LlmQuotaExceeded("question_budget")
+        with llm_scope(reserve_call=reserve, purpose="question"):
+            async with asyncio.timeout(budget):
+                return await _answer_question(pool, client, settings, question,
+                                              participant=participant, used=used)
+    except (TimeoutError, LlmQuotaExceeded):
+        return Answer(
+            text="Je n’ai pas pu terminer cette recherche dans le temps ou le nombre de consultations permis. "
+                 "Précise ta question et je reprendrai la recherche. Aucune décision sur tes messages n’a été changée.",
+            tools_used=used, steps=attempts, truncated=True,
+        )
+
+
+async def _answer_question(
+    pool: asyncpg.Pool[Any], client: httpx.AsyncClient, settings: Settings,
+    question: str, *, participant: str, used: list[str],
+) -> Answer:
     conversation: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": f"QUESTION DE L'UTILISATEUR:\n{question[:2000]}"},
     ]
-    used: list[str] = []
     metadata: dict[str, Any] = {}
     for step in range(1, MAX_STEPS + 1):
         content, metadata = await provider_chat_json(

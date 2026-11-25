@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pinned_http
 import pytest
-from pydantic import ValidationError
 import server
 from pinned_http import HopResponse
+from pydantic import ValidationError
 from url_policy import ValidatedTarget
 from url_policy import resolve_global_addresses as real_resolve
 
@@ -128,6 +128,34 @@ async def test_redirects_are_manually_bounded(monkeypatch: pytest.MonkeyPatch) -
     assert result["hops"] == server.MAX_REDIRECTS + 1
 
 
+def test_qr_decode_failure_does_not_invalidate_the_url_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    def broken_image(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("not an image")
+
+    pil = ModuleType("PIL")
+    pil.Image = SimpleNamespace(  # type: ignore[attr-defined]
+        DecompressionBombWarning=Warning,
+        open=broken_image,
+    )
+    pyzbar = ModuleType("pyzbar")
+    pyzbar_decode = ModuleType("pyzbar.pyzbar")
+    pyzbar_decode.decode = lambda _image: []  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "PIL", pil)
+    monkeypatch.setitem(sys.modules, "pyzbar", pyzbar)
+    monkeypatch.setitem(sys.modules, "pyzbar.pyzbar", pyzbar_decode)
+    result = server.FetchResult(initial_url="https://example.com/image")
+    server._decode_qr(b"not-an-image", result)
+    assert result.error is None
+    assert result.qr_error is not None
+    assert result.qr_error.startswith("qr_decode:")
+    assert result.as_dict()["qr_error"] == result.qr_error
+
+
 class TestProfilsDAcces:
     """Deux profils, pour voir si un site sert deux pages differentes.
 
@@ -161,8 +189,11 @@ class TestProfilsDAcces:
         scanner = pinned_http.profile_headers("scanner")
         navigateur = pinned_http.profile_headers("browser")
         assert scanner["User-Agent"] != navigateur["User-Agent"]
-        assert "sentimail" in scanner["User-Agent"].casefold()
+        assert scanner["User-Agent"] == "Mozilla/5.0 (compatible)"
         assert "mozilla" in navigateur["User-Agent"].casefold()
+        for profile in (scanner, navigateur):
+            assert not any(word in str(profile).casefold() for word in (
+                "sentimail", "referer", "from"))
 
     def test_le_profil_navigateur_demande_du_html_et_une_langue(self) -> None:
         # Un site qui filtre sur l'entete Accept ou la langue doit voir un
@@ -194,3 +225,21 @@ class TestEmpreinteDeContenu:
 
     def test_une_page_vide_ne_casse_pas_l_empreinte(self) -> None:
         assert server.content_digest("") == server.content_digest("   ")
+
+    async def test_la_reponse_fetch_normalise_le_texte_et_ignore_scripts(self, monkeypatch):
+        async def resolve(_target):
+            return ("93.184.216.34",)
+
+        contents = iter((b"<p>Bonjour  le   monde</p><script>bruit</script>",
+                         b"<p>Bonjour le monde</p><style>bruit</style>"))
+
+        async def request(*_args, **_kwargs):
+            body = next(contents)
+            return HopResponse(200, {}, body, "text/html", len(body), False, "93.184.216.34")
+
+        monkeypatch.setattr(server, "resolve_global_addresses", resolve)
+        monkeypatch.setattr(server, "request_pinned", request)
+        a = await server.fetch(server.FetchIn(url="https://exemple.test/a"))
+        b = await server.fetch(server.FetchIn(url="https://exemple.test/a"))
+        assert a["content_digest"] == b["content_digest"]
+        assert a["content_digest"] == server.content_digest("<p>Bonjour le monde</p>")

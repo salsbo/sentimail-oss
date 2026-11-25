@@ -1,11 +1,13 @@
-"""Les écarts humain/modèle, enregistrés pour être instruits.
+"""Les écarts humain/modèle, enregistrés pour être mesurés.
 
 Un désaccord n'était qu'une ligne de rapport recalculée sur sept jours
-glissants : rien ne distinguait un écart déjà analysé d'un écart jamais vu, et
-le même constat renaissait à chaque glissement de fenêtre. Chaque désaccord
-devient ici un enregistrement durable, ouvert tant qu'un exploitant ne l'a pas
-acquitté depuis la console. L'acquittement classe le dossier ; il ne retire
-jamais l'écart des mesures.
+glissants : le même constat renaissait à chaque glissement de fenêtre. Chaque
+désaccord devient ici un enregistrement durable.
+
+Règle du mainteneur (13 septembre 2026) : un verdict humain posé s'applique, et
+c'est tout. Personne ne repasse derrière. L'écart naît donc clos par ce
+verdict (`acknowledged_by = 'verdict_humain'`) : il reste dans les mesures,
+il ne demande jamais de revue ni d'acquittement.
 
 Ce module n'écrit que la table ``discrepancies``. Il ne juge rien : la
 comparaison reprend exactement les quatre sens de ``disagreement_directions``,
@@ -20,6 +22,9 @@ import asyncpg
 
 # Les deux sens qui sont de vraies erreurs : le système a tranché à l'envers.
 REAL_ERROR_DIRECTIONS = ("laisse_passer", "erreur_de_qualification")
+
+# Qui clôt un écart : le verdict humain lui-même, jamais une revue ultérieure.
+HUMAN_VERDICT = "verdict_humain"
 
 # Le même classement que disagreement_directions, dit en SQL. L'ordre des
 # WHEN reproduit l'ordre des elif : « suspect » est à la fois une issue
@@ -51,9 +56,10 @@ async def record(pool: asyncpg.Pool[Any], prompt_version: str) -> int:
         INSERT INTO discrepancies
           (message_id, label_id, human_label, model_classification,
            model_confidence, model_rationale, direction, prompt_version,
-           created_at)
+           created_at, acknowledged_at, acknowledged_by)
         SELECT message_id, label_id, humain, modele, confiance, raisonnement,
-               {_DIRECTION_CASE}, prompt_version, label_created_at
+               {_DIRECTION_CASE}, prompt_version, label_created_at,
+               label_created_at, '{HUMAN_VERDICT}'
         FROM (
             SELECT DISTINCT ON (l.id)
                    l.message_id, l.id AS label_id, l.label AS humain,
@@ -74,6 +80,16 @@ async def record(pool: asyncpg.Pool[Any], prompt_version: str) -> int:
         ON CONFLICT (label_id) DO NOTHING
         """,
         prompt_version,
+    )
+    # Les écarts ouverts avant la règle sont tranchés de la même façon : leur
+    # verdict humain existe déjà.
+    await pool.execute(
+        """
+        UPDATE discrepancies
+        SET acknowledged_at = created_at, acknowledged_by = $1
+        WHERE acknowledged_at IS NULL
+        """,
+        HUMAN_VERDICT,
     )
     try:
         return int(result.rsplit(" ", 1)[-1])

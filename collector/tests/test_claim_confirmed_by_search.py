@@ -103,6 +103,16 @@ class TrajetCompletTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(clue)
 
+    async def test_le_rapport_lu_est_ecrit_dans_les_faits(self) -> None:
+        """L'enquêteur sender_relation distingue « rapport reconnu », « non
+        tranché » et « démenti » sur ce fait : sans lui, une organisation
+        trouvée au rapport non tranché passait pour un vide."""
+        _, facts = await self._juger({"rapport": None}, apexes=["disneyplus.com"])
+        self.assertIn("rapport", facts)
+        self.assertIsNone(facts["rapport"])
+        _, facts = await self._juger({"rapport": True}, apexes=["disneyplus.com"])
+        self.assertTrue(facts["rapport"])
+
     async def test_une_panne_du_modele_n_accuse_pas(self) -> None:
         clue, facts = await self._juger({}, apexes=["disneyplus.com"], panne=True)
         self.assertIsNone(clue)
@@ -165,3 +175,88 @@ class CeQuiSortDeLaMachineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FaitDeProprieteAvantAccusationTests(unittest.IsolatedAsyncioTestCase):
+    """Le hook reçoit les signatures d'organisation et s'en sert avant d'accuser."""
+
+    async def test_un_fait_de_propriete_ferme_la_question_sans_modele(self) -> None:
+        appels: list[str] = []
+
+        async def _about_name(*_: Any, **__: Any):
+            return SUR_LE_NOM, ["ca-paris.com", "credit-agricole.fr"]
+
+        async def _about_domain(*_: Any, **__: Any):
+            appels.append("about_domain")
+            return SUR_LE_DOMAINE
+
+        async def _chat(*_: Any, **__: Any):
+            appels.append("modele")
+            return json.dumps({"rapport": False}), {}
+
+        with patch.object(deep_analysis, "_log", lambda *a, **k: None), patch.object(
+            deep_analysis, "provider_chat_json", _chat
+        ), patch(
+            "sentimail_v3.observation.organisation_search.about_name", _about_name
+        ), patch(
+            "sentimail_v3.observation.organisation_search.about_domain", _about_domain
+        ):
+            clue, facts = await deep_analysis._identity_relation(
+                None,
+                None,
+                _Settings(),
+                display_name="Crédit Agricole d'Ile-de-France",
+                from_apex="e-ca-paris.fr",
+                organisations={"e-ca-paris.fr": {"ns:credit-agricole.fr"}},
+            )
+        self.assertIsNone(clue)
+        self.assertTrue(facts.get("cleared"))
+        self.assertEqual(facts.get("owned_via"), "credit-agricole.fr")
+        self.assertEqual(appels, [])
+
+    async def test_sans_fait_de_propriete_le_constat_mecanique_reste(self) -> None:
+        async def _about_name(*_: Any, **__: Any):
+            return SUR_LE_NOM, ["ca-paris.com", "credit-agricole.fr"]
+
+        with patch.object(deep_analysis, "_log", lambda *a, **k: None), patch(
+            "sentimail_v3.observation.organisation_search.about_name", _about_name
+        ):
+            clue, _ = await deep_analysis._identity_relation(
+                None,
+                None,
+                _Settings(),
+                display_name="Crédit Agricole d'Ile-de-France",
+                from_apex="e-ca-paris.fr",
+                organisations={"e-ca-paris.fr": {"ns:hebergeur-mutualise.example"}},
+            )
+        self.assertIsNotNone(clue)
+        self.assertEqual(clue["strength"], 65)
+
+    def test_le_hook_transmet_les_signatures_du_contexte(self) -> None:
+        import inspect
+
+        from sentimail_v3.observation import deep_hooks
+
+        source = inspect.getsource(deep_hooks.SenderRelationHook._constat)
+        self.assertIn("organisations", source)
+
+
+class AutorisationVisibleDuHookTests(unittest.TestCase):
+    """Les indices d'historique naissent après les hooks : ils doivent leur être
+    montrés quand même, sinon un expéditeur explicitement autorisé est vérifié
+    comme un inconnu."""
+
+    def test_l_autorisation_explicite_est_visible_avant_les_hooks(self) -> None:
+        codes = deep_analysis._history_clue_codes({"persistent_allow": True}, None)
+        self.assertIn("AUTHENTICATED_SENDER_ALLOW", codes)
+
+    def test_un_expediteur_confirme_est_visible_avant_les_hooks(self) -> None:
+        codes = deep_analysis._history_clue_codes(
+            {"ground_truth_labels": {"legitimate": 5}}, None
+        )
+        self.assertIn("HISTORY_CONFIRMED_LEGITIMATE_SENDER", codes)
+
+    def test_sans_historique_aucune_autorisation(self) -> None:
+        codes = deep_analysis._history_clue_codes({}, None)
+        self.assertNotIn("AUTHENTICATED_SENDER_ALLOW", codes)
+        self.assertNotIn("HISTORY_CONFIRMED_LEGITIMATE_SENDER", codes)

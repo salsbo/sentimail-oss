@@ -91,3 +91,52 @@ class DkimAlignmentTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FaitsPourLAvisTests(unittest.IsolatedAsyncioTestCase):
+    """L'avis doit pouvoir nommer le domaine qui a écrit et le nom affiché."""
+
+    async def test_le_dmarc_pass_porte_le_domaine_et_le_nom_affiche(self) -> None:
+        clues, _ = await AuthenticationHook().observe(
+            _context(
+                _message(
+                    "rspamd.sentimail; dmarc=pass; dkim=pass header.d=e-ca-paris.fr; spf=pass",
+                    "Crédit Agricole d'Ile-de-France <diffusion@e-ca-paris.fr>",
+                )
+            )
+        )
+        dmarc = next(clue for clue in clues if clue.clue_code == "AUTH_DMARC_PASS")
+        self.assertEqual(dmarc.facts.get("from_apex"), "e-ca-paris.fr")
+        self.assertEqual(
+            dmarc.facts.get("claimed_organisation"), "Crédit Agricole d'Ile-de-France"
+        )
+
+    async def test_le_dkim_pass_porte_le_domaine_signataire_meme_aligne_avec_dmarc(
+        self,
+    ) -> None:
+        clues, _ = await AuthenticationHook().observe(
+            _context(
+                _message(
+                    "rspamd.sentimail; dmarc=pass; dkim=pass header.d=e-ca-paris.fr; spf=pass",
+                    "Crédit Agricole d'Ile-de-France <diffusion@e-ca-paris.fr>",
+                )
+            )
+        )
+        dkim = next(clue for clue in clues if clue.clue_code == "AUTH_DKIM_PASS")
+        self.assertEqual(dkim.direction, "favorable")
+        self.assertEqual(dkim.facts.get("signing_domain"), "e-ca-paris.fr")
+
+    async def test_le_dkim_pass_porte_le_domaine_signataire_delegue_sous_dmarc(
+        self,
+    ) -> None:
+        clues, _ = await AuthenticationHook().observe(
+            _context(
+                _message(
+                    "rspamd.sentimail; dmarc=pass; dkim=pass header.d=esp-mailer.net; spf=pass",
+                    "Boutique <info@boutique.fr>",
+                )
+            )
+        )
+        dkim = next(clue for clue in clues if clue.clue_code == "AUTH_DKIM_PASS")
+        self.assertEqual(dkim.direction, "favorable")
+        self.assertEqual(dkim.facts.get("signing_domain"), "esp-mailer.net")

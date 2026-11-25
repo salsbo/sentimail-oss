@@ -20,6 +20,43 @@ from sentimail_v3.code.reference import nommer_dossier
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger("sentimail-v3-enricher")
 _extract_domain = tldextract.TLDExtract(suffix_list_urls=())
+_DNS_RESOLVER: dns.asyncresolver.Resolver | None = None
+# Une absence DNS est un résultat ; une panne de source doit être réessayée vite.
+_ABSENCES_DNS = frozenset({"NXDOMAIN", "NoAnswer"})
+_FRESH_CACHE_SQL = """
+    en.source='rdap+dns' AND en.expires_at>now()
+    AND (
+        NOT (
+            en.data ? 'rdap_error'
+            OR (en.data ? 'asn_error' AND
+                coalesce(en.data#>>'{asn_error,type}','') NOT IN ('NXDOMAIN','NoAnswer'))
+            OR (en.data ? 'reverse_dns_error' AND
+                coalesce(en.data#>>'{reverse_dns_error,type}','') NOT IN ('NXDOMAIN','NoAnswer'))
+            OR jsonb_path_exists(en.data,
+                '$.dns.*.error ? (@ != "NXDOMAIN" && @ != "NoAnswer")')
+        )
+        OR en.observed_at + interval '1 hour'>now()
+    )
+"""
+
+
+def _partial_data(data: dict[str, object]) -> bool:
+    """Les faits obtenus restent utilisables, sans figer une panne sept jours."""
+    dns = data.get("dns")
+    dns_failed = isinstance(dns, dict) and any(
+        isinstance(value, dict)
+        and value.get("error") is not None
+        and value["error"] not in _ABSENCES_DNS
+        for value in dns.values()
+    )
+    return "rdap_error" in data or any(
+        name in data
+        and (
+            not isinstance(data[name], dict)
+            or data[name].get("type") not in _ABSENCES_DNS
+        )
+        for name in ("asn_error", "reverse_dns_error")
+    ) or dns_failed
 
 
 def _json(value: object) -> str:
@@ -78,10 +115,18 @@ async def _rdap(client: httpx.AsyncClient, kind: str, value: str) -> dict[str, A
     }
 
 
+def _dns_resolver() -> dns.asyncresolver.Resolver:
+    global _DNS_RESOLVER
+    if _DNS_RESOLVER is None:
+        resolver = dns.asyncresolver.Resolver()
+        resolver.timeout = 3.0
+        resolver.lifetime = 5.0
+        _DNS_RESOLVER = resolver
+    return _DNS_RESOLVER
+
+
 async def _dns_domain(domain: str) -> dict[str, object]:
-    resolver = dns.asyncresolver.Resolver()
-    resolver.timeout = 3
-    resolver.lifetime = 5
+    resolver = _dns_resolver()
     queries = {
         "a": (domain, "A"),
         "aaaa": (domain, "AAAA"),
@@ -105,9 +150,7 @@ async def _dns_domain(domain: str) -> dict[str, object]:
 async def _cymru_ip(
     ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> dict[str, object]:
-    resolver = dns.asyncresolver.Resolver()
-    resolver.timeout = 3
-    resolver.lifetime = 5
+    resolver = _dns_resolver()
     if ip.version == 4:
         query = ".".join(reversed(ip.exploded.split("."))) + ".origin.asn.cymru.com"
     else:
@@ -178,7 +221,7 @@ async def _enrich_ip(client: httpx.AsyncClient, value: str) -> dict[str, object]
     except Exception as exc:  # noqa: BLE001 - ASN est un enrichissement fail-soft
         result["asn_error"] = {"type": type(exc).__name__}
     try:
-        reverse = await dns.asyncresolver.resolve(ip.reverse_pointer, "PTR")
+        reverse = await _dns_resolver().resolve(ip.reverse_pointer, "PTR")
         result["reverse_dns"] = [answer.to_text() for answer in reverse]
     except Exception as exc:  # noqa: BLE001 - PTR est un enrichissement fail-soft
         result["reverse_dns_error"] = {"type": type(exc).__name__}
@@ -186,16 +229,58 @@ async def _enrich_ip(client: httpx.AsyncClient, value: str) -> dict[str, object]
 
 
 async def _next_entities(pool: asyncpg.Pool[Any]) -> list[asyncpg.Record]:
+    """Rapproche chaque clé en attente de sa dernière observation encore valable."""
     return await pool.fetch(
-        """
-        SELECT entity_type, value_normalized
-        FROM entities
-        WHERE enrichment_id IS NULL AND entity_type IN ('domain', 'ip')
-        GROUP BY entity_type, value_normalized
-        ORDER BY min(id)
-        LIMIT 20
+        f"""
+        WITH pending AS (
+            SELECT entity_type, value_normalized, min(id) AS first_id
+            FROM entities
+            WHERE enrichment_id IS NULL AND entity_type IN ('domain', 'ip')
+            GROUP BY entity_type, value_normalized
+            ORDER BY min(id)
+            LIMIT 20
+        )
+        SELECT p.entity_type, p.value_normalized, cached.id AS enrichment_id
+        FROM pending p
+        LEFT JOIN LATERAL (
+            SELECT en.id
+            FROM enrichments en
+            WHERE en.entity_type=p.entity_type
+              AND md5(en.value_normalized)=md5(p.value_normalized)
+              AND en.value_normalized=p.value_normalized
+              AND {_FRESH_CACHE_SQL}
+            ORDER BY CASE en.status WHEN 'ok' THEN 0 WHEN 'not_found' THEN 1 ELSE 2 END,
+                     en.observed_at DESC, en.id DESC
+            LIMIT 1
+        ) cached ON true
+        ORDER BY p.first_id
         """
     )
+
+
+async def _reuse(
+    pool: asyncpg.Pool[Any], entity_type: str, value: str, enrichment_id: int
+) -> bool:
+    """Rattache les nouvelles occurrences sans réécrire les preuves déjà utilisées."""
+    count = await pool.fetchval(
+        f"""
+        WITH attached AS (
+            UPDATE entities e SET enrichment_id=en.id
+            FROM enrichments en
+            WHERE e.enrichment_id IS NULL AND e.entity_type IN ('domain', 'ip')
+              AND e.entity_type=$1
+              AND md5(e.value_normalized)=md5($2) AND e.value_normalized=$2
+              AND en.id=$3 AND en.entity_type=e.entity_type
+              AND md5(en.value_normalized)=md5($2) AND en.value_normalized=$2
+              AND {_FRESH_CACHE_SQL}
+            RETURNING e.id
+        ) SELECT count(*) FROM attached
+        """,
+        entity_type,
+        value,
+        enrichment_id,
+    )
+    return bool(count)
 
 
 async def _save(
@@ -207,7 +292,9 @@ async def _save(
     error: str | None = None,
 ) -> None:
     expires = datetime.now(UTC) + (
-        timedelta(days=7) if status == "ok" else timedelta(hours=1)
+        timedelta(days=7)
+        if status == "ok" and not _partial_data(data)
+        else timedelta(hours=1)
     )
     async with pool.acquire() as connection, connection.transaction():
         enrichment_id = await connection.fetchval(
@@ -224,8 +311,12 @@ async def _save(
             error,
         )
         await connection.execute(
+            # L'empreinte utilise l'index borné ; le texte reste comparé pour
+            # qu'une collision ne rattache jamais un enrichissement étranger.
             """UPDATE entities SET enrichment_id=$1
-               WHERE enrichment_id IS NULL AND entity_type=$2 AND value_normalized=$3""",
+               WHERE enrichment_id IS NULL AND entity_type IN ('domain', 'ip')
+                 AND entity_type=$2
+                 AND md5(value_normalized)=md5($3) AND value_normalized=$3""",
             enrichment_id,
             entity_type,
             value,
@@ -238,7 +329,10 @@ async def main() -> None:
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(12),
-        headers={"Accept": "application/rdap+json, application/json"},
+        headers={
+            "Accept": "application/rdap+json, application/json",
+            "User-Agent": "Mozilla/5.0 (compatible)",
+        },
     ) as client:
         while True:
             pulse("enricher")
@@ -249,6 +343,12 @@ async def main() -> None:
             for row in rows:
                 entity_type = row["entity_type"]
                 value = row["value_normalized"]
+                cached_id = row["enrichment_id"]
+                if cached_id is not None and await _reuse(
+                    pool, entity_type, value, cached_id
+                ):
+                    _log("entity.reused", type=entity_type, value=value)
+                    continue
                 try:
                     data = (
                         await _enrich_domain(client, value)

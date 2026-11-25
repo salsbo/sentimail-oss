@@ -13,6 +13,7 @@ import unittest
 from sentimail_v3.code.identity_relation import (
     RELATION_PROMPT,
     appended_to_official,
+    claimed_name,
     obvious_relation,
     relation_clue,
     relation_question,
@@ -245,3 +246,150 @@ class IndiceProduitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FaitDeProprieteTests(unittest.TestCase):
+    """Un fait de propriété lève l'accusation « domaine avec un mot en plus ».
+
+    Le 3 septembre 2026, e-ca-paris.fr a été accusé d'imiter ca-paris.com sur
+    sa seule graphie, alors que sa délégation DNS - déjà en base - le
+    rattachait à credit-agricole.fr, apex officiel trouvé par la recherche.
+    """
+
+    def test_la_delegation_ns_vers_un_apex_officiel_atteste_la_propriete(self) -> None:
+        from sentimail_v3.code.identity_relation import owned_by_official
+
+        self.assertEqual(
+            owned_by_official(
+                "e-ca-paris.fr",
+                ["ca-paris.com", "credit-agricole.fr"],
+                {"e-ca-paris.fr": {"ns:credit-agricole.fr"}},
+            ),
+            "credit-agricole.fr",
+        )
+
+    def test_une_signature_partagee_avec_un_apex_officiel_atteste(self) -> None:
+        from sentimail_v3.code.identity_relation import owned_by_official
+
+        self.assertEqual(
+            owned_by_official(
+                "free-mobile.fr",
+                ["free.fr"],
+                {
+                    "free-mobile.fr": {"ns:proxad.net", "free sas"},
+                    "free.fr": {"ns:proxad.net"},
+                },
+            ),
+            "free.fr",
+        )
+
+    def test_la_signature_dkim_d_un_apex_officiel_atteste(self) -> None:
+        from sentimail_v3.code.identity_relation import owned_by_official
+
+        self.assertEqual(
+            owned_by_official(
+                "marque-offres.fr", ["marque.fr"], {"marque-offres.fr": {"dkim:marque.fr"}}
+            ),
+            "marque.fr",
+        )
+
+    def test_sans_fait_attestable_rien_ne_leve(self) -> None:
+        """DNS mutualisé, RDAP masqué : on n'assouplit pas sur l'absence de preuve."""
+        from sentimail_v3.code.identity_relation import owned_by_official
+
+        self.assertEqual(
+            owned_by_official("doctolib-offres.fr", ["doctolib.fr"], {}), ""
+        )
+        self.assertEqual(
+            owned_by_official("doctolib-offres.fr", ["doctolib.fr"], {"doctolib-offres.fr": set()}),
+            "",
+        )
+
+    def test_une_signature_etrangere_ne_leve_rien(self) -> None:
+        from sentimail_v3.code.identity_relation import owned_by_official
+
+        self.assertEqual(
+            owned_by_official(
+                "notif-colissimo-laposte.info",
+                ["laposte.fr"],
+                {
+                    "notif-colissimo-laposte.info": {"ns:hebergeur-louche.ru"},
+                    "laposte.fr": {"ns:laposte.fr"},
+                },
+            ),
+            "",
+        )
+
+
+class AcronymeTests(unittest.TestCase):
+    """Un sigle de trois lettres désigne quelqu'un, même écrit lettre à lettre.
+
+    « C I C » depuis cic-notification.sju.somesepta.best (M-490357, 6 septembre
+    2026) : aucun mot de quatre lettres, donc aucun jeton, donc aucune
+    question posée - et le message est parti en doute au lieu d'être accusé.
+    """
+
+    def test_les_lettres_isolees_font_un_sigle(self) -> None:
+        for nom in ("C I C", "C.I.C.", "C. I. C", "B N P"):
+            with self.subTest(nom=nom):
+                self.assertTrue(worth_asking(nom, set()))
+
+    def test_un_sigle_en_majuscules_designe_quelqu_un(self) -> None:
+        for nom in ("CIC", "WTW", "BNP", "Service Client WTW"):
+            with self.subTest(nom=nom):
+                self.assertTrue(worth_asking(nom, set()))
+
+    def test_deux_lettres_ne_designent_personne(self) -> None:
+        for nom in ("SG", "FR", "A B"):
+            with self.subTest(nom=nom):
+                self.assertFalse(worth_asking(nom, set()))
+
+    def test_un_mot_court_en_minuscules_n_est_pas_un_sigle(self) -> None:
+        self.assertFalse(worth_asking("cic", set()))
+
+    def test_le_sigle_qui_reprend_son_domaine_ne_pose_pas_question(self) -> None:
+        for nom, apex in (("CIC", "cic.fr"), ("C I C", "cic.fr"), ("BNP", "bnp.fr")):
+            with self.subTest(nom=nom):
+                self.assertTrue(obvious_relation(nom, apex))
+
+    def test_le_sigle_etranger_a_son_domaine_pose_question(self) -> None:
+        self.assertFalse(obvious_relation("C I C", "somesepta.best"))
+
+    def test_le_nom_cherche_recolle_les_lettres(self) -> None:
+        self.assertEqual(claimed_name("C I C"), "CIC")
+        self.assertEqual(claimed_name("C.I.C. Banque"), "CIC Banque")
+        self.assertEqual(claimed_name("Crédit Agricole"), "Crédit Agricole")
+
+
+class SigleDansUnSousDomaineTests(unittest.TestCase):
+    """Le nom volé peut vivre dans un sous-domaine, pas seulement dans l'apex."""
+
+    def test_le_sigle_en_sous_domaine_est_constate(self) -> None:
+        self.assertEqual(
+            appended_to_official(
+                "somesepta.best",
+                ["cic.fr"],
+                from_domain="cic-notification.sju.somesepta.best",
+            ),
+            "cic.fr",
+        )
+
+    def test_un_sigle_court_exige_un_segment_entier(self) -> None:
+        # « pacific » contient « cic » : ce n'est pas une imitation.
+        self.assertEqual(
+            appended_to_official(
+                "pacific-news.com", ["cic.fr"], from_domain="mail.pacific-news.com"
+            ),
+            "",
+        )
+
+    def test_le_sigle_dans_l_apex_est_constate(self) -> None:
+        self.assertEqual(
+            appended_to_official("cic-notification.best", ["cic.fr"]), "cic.fr"
+        )
+
+    def test_le_sous_domaine_officiel_n_est_pas_une_imitation(self) -> None:
+        self.assertEqual(
+            appended_to_official("cic.fr", ["cic.fr"], from_domain="notification.cic.fr"),
+            "",
+        )

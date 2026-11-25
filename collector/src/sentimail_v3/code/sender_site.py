@@ -1,22 +1,9 @@
-"""Ce que le site d'un expéditeur dit de son métier, comparé à son message.
+"""Registres d'activité du message et pages d'accueil réellement lisibles.
 
-Un fabricant de cuisines n'envoie pas d'avis de colis, et un installateur
-réseau non plus. Les deux l'ont pourtant fait le 16 août, depuis leurs vrais
-domaines et avec une authentification parfaite : leurs serveurs étaient
-compromis. Aucun indice technique ne pouvait les trahir - tout était en règle.
-Ce qui les trahissait tenait en une phrase de leur page d'accueil.
-
-La comparaison porte sur des registres d'activité, pas sur des mots-clés isolés
-ni sur des marques : « ce message invoque la livraison, or rien de ce que cette
-organisation publie d'elle-même n'a de rapport avec la livraison ». Un
-transporteur qui parle de colis ne déclenche rien, et un site illisible non
-plus - l'absence d'information n'accuse personne.
-
-Un second usage a existé ici : repérer une page qui se réclame d'une marque
-sans appartenir à ses domaines. Il exigeait une table de marques écrite à la
-main, supprimée le 27 août - une liste ne connaît que ce qu'on y a mis, et se
-trompe sur ce qu'on y a mal mis. La question se pose désormais sur le nom
-affiché du message, confronté à ce qu'une recherche rend du nom et du domaine.
+Le rapprochement avec l'activité publiée est désormais confié au hook LLM
+borné ``activity_coherence``. Ce module conserve seulement les faits locaux qui
+déterminent si cette question mérite d'être posée et si la page obtenue décrit
+bien l'expéditeur plutôt qu'un interstitiel d'hébergeur.
 """
 
 from __future__ import annotations
@@ -51,71 +38,6 @@ _REGISTERS: dict[str, tuple[str, ...]] = {
     # peut fonder aucune contradiction. Seules restent les activités qu'une
     # organisation exerce ou n'exerce pas.
 }
-# Le métier d'une organisation, tel qu'elle l'annonce en tête de son site, et
-# les registres transactionnels que ce métier rend plausibles.
-#
-# La liste est le seul moyen honnête de conclure : affirmer « ce n'est pas son
-# métier » suppose d'avoir reconnu son métier. Sans cela, le silence d'un site
-# passait pour une contradiction, et un code de sécurité de mutuelle s'est
-# retrouvé retenu - une mutuelle n'exerce ni la livraison ni l'hébergement, et
-# n'avait donc aucun registre reconnu.
-_SECTORS: dict[str, tuple[tuple[str, ...], frozenset[str]]] = {
-    "transport": (
-        ("transport", "logistique", "logistics", "messagerie express", "fret",
-         "colis", "livraison", "courier", "spedizioni", "corriere", "shipping"),
-        frozenset({"livraison", "paiement"}),
-    ),
-    "commerce": (
-        ("boutique", "e-commerce", "vente en ligne", "shop", "store",
-         "magasin", "achat", "commande en ligne", "negozio"),
-        frozenset({"livraison", "paiement"}),
-    ),
-    "finance": (
-        ("banque", "bancaire", "assurance", "mutuelle", "prevoyance",
-         "credit", "epargne", "placement", "courtier", "bank", "insurance",
-         "assicurazione", "finance", "comptabilite", "expert-comptable"),
-        frozenset({"paiement"}),
-    ),
-    "numerique": (
-        ("hebergement", "cloud", "saas", "logiciel", "software", "hosting",
-         "informatique", "ict", "networking", "cablaggio", "reseau",
-         "telecom", "operateur"),
-        frozenset({"paiement"}),
-    ),
-    "ameublement": (
-        ("ameublement", "arredamenti", "arredo", "mobilier", "cuisine",
-         "cucina", "meuble", "decoration", "furniture"),
-        frozenset({"livraison", "paiement"}),
-    ),
-    "restauration": (
-        ("restaurant", "traiteur", "brasserie", "pizzeria", "ristorante"),
-        frozenset({"livraison", "paiement"}),
-    ),
-    "sante": (
-        ("medecin", "cabinet medical", "clinique", "pharmacie", "sante",
-         "hopital", "laboratoire d analyses", "dentiste"),
-        frozenset({"paiement"}),
-    ),
-    "immobilier": (
-        ("immobilier", "agence immobiliere", "location", "syndic",
-         "immobiliare", "real estate"),
-        frozenset({"paiement"}),
-    ),
-    "industrie": (
-        ("industrie", "usine", "fabrication", "manufacture", "atelier",
-         "construction", "batiment", "artisan"),
-        frozenset({"livraison", "paiement"}),
-    ),
-}
-MIN_SITE_CHARS = 80
-# Une organisation annonce son métier en haut de sa page d'accueil : titre,
-# accroche, menu. Plus bas viennent les mentions ordinaires du commerce - les
-# conditions de livraison, les moyens de paiement - que presque tout site
-# comporte. Les lire comme une activité ferait de chaque commerçant un
-# transporteur, et la comparaison ne dirait plus rien.
-SITE_HEADLINE_CHARS = 400
-
-
 # Ce qu'un hébergeur répond à notre place quand il ne veut pas nous laisser
 # entrer. Ces pages n'appartiennent à personne : les lire comme la description
 # d'un métier revient à reprocher à un expéditeur ce que son pare-feu a dit.
@@ -167,6 +89,54 @@ def is_interstitial(site_text: str) -> bool:
     return any(motif in ouverture for motif in _INTERSTITIELS)
 
 
+# Le lien d'évitement que la norme d'accessibilité (WCAG 2.4.1) fait poser en
+# tête de page, dans la langue du site. Sa présence en ouverture signe une
+# extraction qui n'a rapporté que l'en-tête et son menu : des étiquettes de
+# rubriques, pas une description de métier.
+_LIENS_D_EVITEMENT = (
+    "skip to main content",
+    "skip to content",
+    "skip navigation",
+    "skip to footer",
+    "aller au contenu",
+    "aller directement au contenu",
+    "passer au contenu",
+    "saltar al contenido",
+    "passa al contenuto",
+    "zum inhalt springen",
+    "salta al contenuto",
+)
+# Une ponctuation de phrase, même une virgule, suffit à distinguer une prose
+# d'une liste d'étiquettes. « Mutuelle santé, prévoyance et retraite
+# complémentaire » en porte une ; « Research Overview Alignment Economics
+# Engineering » n'en porte aucune.
+_PONCTUATION_DE_PHRASE = re.compile(r"[.,;:!?]")
+
+
+def is_navigation_chrome(site_text: str) -> bool:
+    """Le texte lu n'est-il que l'en-tête de navigation du site ?
+
+    Deux conditions, comme pour un interstitiel, et les deux comptent. Le lien
+    d'évitement seul écarterait un site bavard dont l'extraction a simplement
+    commencé par son menu ; l'absence de ponctuation seule écarterait une
+    accroche courte mais vraie. C'est un texte ouvert par un lien d'évitement
+    ET dépourvu de toute phrase qui ne décrit aucune activité.
+
+    Le 1er septembre 2026, la page d'accueil d'anthropic.com n'a rendu que
+    « Home \\ Anthropic Skip to main content Skip to footer Research Overview
+    Alignment Economics… ». Comparé à « votre accès à l'API est désactivé », ce
+    menu a valu à une notification authentique d'être tenue pour le fait d'un
+    expéditeur détourné.
+    """
+    texte = _normalize(site_text)
+    if not texte.strip():
+        return True
+    ouverture = texte[:DEBUT_INTERSTITIEL]
+    if not any(motif in ouverture for motif in _LIENS_D_EVITEMENT):
+        return False
+    return not _PONCTUATION_DE_PHRASE.search(site_text)
+
+
 def _normalize(value: str) -> str:
     stripped = unicodedata.normalize("NFKD", value.casefold())
     ascii_only = "".join(c for c in stripped if not unicodedata.combining(c))
@@ -181,42 +151,3 @@ def activity_registers(subject: str, body: str) -> set[str]:
         for register, markers in _REGISTERS.items()
         if any(marker in text for marker in markers)
     }
-
-
-def site_sectors(site_text: str) -> set[str]:
-    """Les métiers qu'un site annonce en tête de sa page d'accueil."""
-    text = _normalize(site_text[:SITE_HEADLINE_CHARS])
-    return {
-        sector
-        for sector, (markers, _) in _SECTORS.items()
-        if any(marker in text for marker in markers)
-    }
-
-
-def site_registers(site_text: str) -> set[str]:
-    """Les registres transactionnels que le métier du site rend plausibles."""
-    plausibles: set[str] = set()
-    for sector in site_sectors(site_text):
-        plausibles |= _SECTORS[sector][1]
-    return plausibles
-
-
-def site_contradicts_message(site_text: str, registers: set[str]) -> bool:
-    """Vrai quand le message invoque une activité que l'expéditeur n'exerce pas.
-
-    Sans registre invoqué, il n'y a rien à contredire. Sans contenu lisible sur
-    le site, on ne sait pas - et ne pas savoir n'est pas une charge.
-    """
-    if not registers or len(site_text.strip()) < MIN_SITE_CHARS:
-        return False
-    if not site_sectors(site_text):
-        # Aucun métier reconnu : ne pas savoir n'est pas constater une
-        # différence. C'est le principe déjà tenu pour un titulaire RDAP
-        # masqué, et son oubli ici a retenu un code de sécurité légitime.
-        return False
-    return not (registers & site_registers(site_text))
-
-
-# Presque tout site renvoie vers ses réseaux sociaux : « Suivez-nous sur
-# Instagram ». Y lire une usurpation de marque a fait retenir un code de
-# sécurité de mutuelle. Ces noms ne peuvent donc pas fonder ce constat.

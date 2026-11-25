@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 import unittest
 
-from sentimail_v3.supervision.training import SCHEMA, compact_dossier, fingerprint
+from sentimail_v3.supervision.training import (
+    SCHEMA,
+    canonical_dossier,
+    compact_dossier,
+    fingerprint,
+    safe_teacher_target,
+    split_group_hash,
+)
 
 DOSSIER = {
     "schema": "sentinel-verdict-dossier-v3-trial-roles",
@@ -25,7 +32,10 @@ DOSSIER = {
             "direction": "adverse",
             "strength": 70,
             "confidence": 1.0,
-            "statement": "Le relais de confiance indique DMARC=fail.",
+            "statement": (
+                "compta@fournisseur.example renvoie vers "
+                "https://paiement.example/collecte?token=abc."
+            ),
             "facts": {"raw": "compta@fournisseur.example"},
         },
         {
@@ -84,6 +94,7 @@ class CompactDossierTests(unittest.TestCase):
         self.assertTrue(self.view["deep_analysis"]["complete"])
         self.assertEqual(self.view["history"]["ground_truth_labels"], {"spam": 2})
         self.assertEqual(self.view["schema"], SCHEMA)
+        self.assertTrue(all("statement" not in clue for clue in self.view["clues"]))
 
     def test_evidence_families_group_the_clues(self) -> None:
         # Les familles sont celles du jugement, tirées de l'article et non du
@@ -92,7 +103,11 @@ class CompactDossierTests(unittest.TestCase):
         self.assertEqual(self.view["evidence_families"], ["identite", "liens"])
 
     def test_the_view_is_far_smaller_than_the_dossier(self) -> None:
-        complete = len(json.dumps(DOSSIER, ensure_ascii=False))
+        realistic = {
+            **DOSSIER,
+            "message": {**DOSSIER["message"], "body_text": "Contenu privé. " * 800},
+        }
+        complete = len(json.dumps(realistic, ensure_ascii=False))
         self.assertLess(len(self.text), complete)
 
     def test_the_fingerprint_is_stable_and_content_addressed(self) -> None:
@@ -104,6 +119,104 @@ class CompactDossierTests(unittest.TestCase):
         view = compact_dossier({})
         self.assertEqual(view["clues"], [])
         self.assertEqual(view["evidence_families"], [])
+
+    def test_the_legacy_product_name_is_a_schema_alias(self) -> None:
+        legacy = {**self.view, "schema": "sentinel-v3-training-view-1"}
+        self.assertEqual(canonical_dossier(legacy)["schema"], SCHEMA)
+
+    def test_a_legacy_free_text_statement_is_removed(self) -> None:
+        legacy = {**self.view, "clues": [dict(self.view["clues"][0])]}
+        legacy["clues"][0]["statement"] = (
+            "Client Dupont sur https://secret.example et client@example.org"
+        )
+        encoded = json.dumps(canonical_dossier(legacy), ensure_ascii=False)
+        self.assertNotIn("Client Dupont", encoded)
+        self.assertNotIn("secret.example", encoded)
+        self.assertNotIn("client@example.org", encoded)
+
+    def test_an_unknown_schema_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            canonical_dossier({"schema": "unrelated-training-view"})
+
+    def test_the_split_group_ignores_clue_order(self) -> None:
+        reversed_view = {**self.view, "clues": list(reversed(self.view["clues"]))}
+        self.assertEqual(split_group_hash(self.view), split_group_hash(reversed_view))
+
+    def test_la_vue_garde_les_seuils_et_la_piece_jointe(self) -> None:
+        # Sans ces champs, la mesure à 60 jours des règles de seuil serait
+        # impossible depuis verdict_runs.input_snapshot, comme elle l'était
+        # jusqu'ici pour learned_reduction.
+        dossier = {
+            **DOSSIER,
+            "llm_budget": {"truncated_for_llm": True},
+            "judgment_rules": {
+                **DOSSIER["judgment_rules"],
+                "attachment_analysis_complete": False,
+                "learned_reduction": 0.08,
+                "authenticated_allow_reduction": 0.08,
+                "threshold_reduction_applied": 0.0,
+                "reduction_suspended_by": ["CORRELATION_FINANCIAL_FRAUD", "X" * 300],
+                "allow_identity_authenticated": True,
+            },
+        }
+        view = compact_dossier(dossier)
+        rules = view["judgment_rules"]
+        self.assertIs(rules["attachment_analysis_complete"], False)
+        self.assertEqual(rules["learned_reduction"], 0.08)
+        self.assertEqual(rules["authenticated_allow_reduction"], 0.08)
+        self.assertEqual(rules["threshold_reduction_applied"], 0.0)
+        self.assertEqual(
+            rules["reduction_suspended_by"], ["CORRELATION_FINANCIAL_FRAUD", "X" * 100]
+        )
+        self.assertIs(rules["allow_identity_authenticated"], True)
+        self.assertIs(view["llm_truncated"], True)
+        self.assertEqual(canonical_dossier(view), view)
+
+        # Une vue conservée avant ce chantier se relit sans lever.
+        ancienne = {**self.view, "judgment_rules": {"version": "v3"}}
+        ancienne.pop("llm_truncated", None)
+        relue = canonical_dossier(ancienne)
+        self.assertIsNone(relue["judgment_rules"]["attachment_analysis_complete"])
+        self.assertEqual(relue["judgment_rules"]["threshold_reduction_applied"], 0.0)
+        self.assertEqual(relue["judgment_rules"]["reduction_suspended_by"], [])
+        self.assertIs(relue["llm_truncated"], False)
+
+    def test_la_vue_dit_pourquoi_un_message_douteux_a_ete_livre(self) -> None:
+        # 15 octobre 2026 : chez qui ne veut que les vrais doutes, un verdict
+        # suspect peut être livré. Sans le choix dans la vue, le corpus
+        # apprendrait « suspect, donc livrer » sans sa raison.
+        dossier = {
+            **DOSSIER,
+            "judgment_rules": {
+                **DOSSIER["judgment_rules"],
+                "ask_only_on_real_doubt": True,
+                "real_doubt": False,
+            },
+        }
+        rules = compact_dossier(dossier)["judgment_rules"]
+        self.assertIs(rules["ask_only_on_real_doubt"], True)
+        self.assertIs(rules["real_doubt"], False)
+        relue = canonical_dossier({**self.view, "judgment_rules": {"version": "v3"}})
+        self.assertIs(relue["judgment_rules"]["ask_only_on_real_doubt"], False)
+
+    def test_the_teacher_target_keeps_codes_but_not_free_text(self) -> None:
+        target = safe_teacher_target(
+            {
+                "classification": "dangerous",
+                "confidence": 0.97,
+                "delivery_decision": "junk",
+                "verdict_doubt": False,
+                "rationale": "Nom Client et compte bancaire FR76",
+                "supporting_clue_codes": ["AUTH_DMARC_FAIL"],
+                "contradicting_clue_codes": [],
+                "attack": {"techniques": ["T1566"], "impersonated_brand": "Banque"},
+            }
+        )
+        encoded = json.dumps(target, ensure_ascii=False)
+        self.assertIn("AUTH_DMARC_FAIL", encoded)
+        self.assertIn("T1566", encoded)
+        self.assertNotIn("Nom Client", encoded)
+        self.assertNotIn("Banque", encoded)
 
 
 if __name__ == "__main__":

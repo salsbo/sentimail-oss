@@ -80,13 +80,33 @@ def _ascii_identity_markers(value: str, field: str) -> list[dict[str, object]]:
                 and len(tail) >= 3
                 and sum(1 for c in tail if c.isalpha() and c.lower() not in "aeiou") >= 2
             )
-            if (
-                replacement is None
-                and not embedded_capital_i
-                and not camelcase_lowercase_i
-            ):
+            # « lnfosPRlME » (M-8d026c) : le l minuscule en tête de mot devant une
+            # consonne, qu'aucun mot n'écrit ainsi (« ln », « lr »), et le l
+            # minuscule pris entre deux majuscules, là où l'œil attend un I.
+            # Neutres comme les autres : le squelette les compare ensuite à
+            # l'organisation revendiquée (DEEP-026). Un domaine s'écrit en
+            # minuscules et abrège volontiers (lnkd.in) : la tête de mot ne se
+            # lit que dans le nom affiché.
+            suivant = token[index + 1] if index + 1 < len(token) else ""
+            leading_lowercase_i = (
+                field == "display_name"
+                and char == "l"
+                and index == 0
+                and suivant.isalpha()
+                and suivant.lower() not in "aeiouylh"
+            )
+            lowercase_i_among_capitals = (
+                char == "l"
+                and 0 < index < len(token) - 1
+                and token[index - 1].isupper()
+                and suivant.isupper()
+            )
+            lowercase_i = (
+                camelcase_lowercase_i or leading_lowercase_i or lowercase_i_among_capitals
+            )
+            if replacement is None and not embedded_capital_i and not lowercase_i:
                 continue
-            looks_like = "I" if camelcase_lowercase_i else (replacement or "l")
+            looks_like = "I" if lowercase_i else (replacement or "l")
             markers.append(
                 {
                     "field": field,

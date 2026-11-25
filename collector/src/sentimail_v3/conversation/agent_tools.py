@@ -48,6 +48,10 @@ TOOLS: dict[str, str] = {
 }
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def catalogue() -> str:
     return "\n".join(f"- {name} : {help_text}" for name, help_text in TOOLS.items())
 
@@ -108,7 +112,7 @@ async def run_tool(
             JOIN conversations c ON c.case_id=dc.id
             WHERE m.delivery_status='held'
               AND dc.state IN ('review_notice_pending','awaiting_reply')
-              AND lower(c.participant_email)=lower($1)
+              AND sentimail_same_client_mailbox(c.participant_email,$1)
             ORDER BY m.captured_at DESC LIMIT $2
             """,
             participant,
@@ -132,7 +136,7 @@ async def run_tool(
             FROM messages m
             WHERE EXISTS (
                 SELECT 1 FROM unnest(m.envelope_recipients) recipient
-                WHERE lower(recipient)=lower($1)
+                WHERE sentimail_same_client_mailbox(recipient,$1)
             )
             ORDER BY m.captured_at DESC LIMIT $2
             """,
@@ -159,15 +163,15 @@ async def run_tool(
             """
             SELECT m.id, m.subject, m.from_header, m.delivery_status
             FROM messages m
-            WHERE m.subject ILIKE '%' || $2 || '%'
+            WHERE m.subject ILIKE '%' || $2 || '%' ESCAPE '\\'
               AND EXISTS (
                   SELECT 1 FROM unnest(m.envelope_recipients) recipient
-                  WHERE lower(recipient)=lower($1)
+                  WHERE sentimail_same_client_mailbox(recipient,$1)
               )
             ORDER BY m.captured_at DESC LIMIT 1
             """,
             participant,
-            fragment,
+            _escape_like(fragment),
         )
         if row is None:
             return {"error": "aucun message de ta boîte ne correspond"}
@@ -202,9 +206,9 @@ async def run_tool(
     if name == "my_rules":
         policies = await pool.fetch(
             """
-            SELECT value_normalized, action, active
+            SELECT scope, value_normalized, action, active
             FROM sender_policies
-            WHERE lower(participant_email)=lower($1)
+            WHERE sentimail_same_client(participant_email,$1)
             ORDER BY created_at DESC LIMIT $2
             """,
             participant,
@@ -214,7 +218,7 @@ async def run_tool(
             """
             SELECT label, count(*) AS total
             FROM labels
-            WHERE lower(participant_email)=lower($1) AND active=true
+            WHERE sentimail_same_client(participant_email,$1) AND active=true
             GROUP BY label
             """,
             participant,
@@ -223,6 +227,9 @@ async def run_tool(
             "lists": [
                 {
                     "sender": str(row["value_normalized"]),
+                    "scope": (
+                        "domaine entier" if row["scope"] == "domain" else "adresse"
+                    ),
                     "list": "blanche" if row["action"] == "allow" else "noire",
                     "active": bool(row["active"]),
                 }
@@ -242,7 +249,7 @@ async def run_tool(
         FROM messages m
         WHERE EXISTS (
             SELECT 1 FROM unnest(m.envelope_recipients) recipient
-            WHERE lower(recipient)=lower($1)
+            WHERE sentimail_same_client_mailbox(recipient,$1)
         )
         """,
         participant,

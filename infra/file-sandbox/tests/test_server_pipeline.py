@@ -109,7 +109,7 @@ async def test_archive_pipeline_is_recursive_material_and_privacy_safe(
         }
     )
 
-    result = await server.analyze(_payload("outer.zip", outer))
+    result = server.analyze_content(_payload("outer.zip", outer))
 
     assert result["analysis_incomplete"] is False
     assert result["score"] == 0.95
@@ -134,8 +134,8 @@ async def test_pdf_pipeline_exposes_bounded_text_urls_and_provenance(
         server,
         "_extract_pdf",
         lambda *_args, **_kwargs: TextExtraction(
-            text="Invoice /JavaScript https://billing.example/pay",
-            text_total_chars=51,
+            text="Invoice https://billing.example/pay",
+            text_total_chars=35,
             text_truncated=False,
             urls=("https://billing.example/pay",),
             urls_total=1,
@@ -144,7 +144,9 @@ async def test_pdf_pipeline_exposes_bounded_text_urls_and_provenance(
         ),
     )
 
-    result = await server.analyze(_payload("invoice.pdf", b"%PDF synthetic"))
+    result = server.analyze_content(
+        _payload("invoice.pdf", b"%PDF-1.7\n1 0 obj << /JavaScript (alert(1)) >> endobj")
+    )
 
     assert result["analysis_incomplete"] is False
     assert result["extracted_text_source"] == "pdf"
@@ -160,9 +162,41 @@ async def test_pdf_pipeline_exposes_bounded_text_urls_and_provenance(
     assert any(finding["code"] == "PDF_JAVASCRIPT" for finding in result["findings"])
 
 
+def test_pdf_findings_ignores_benign_javascript_text_and_checks_raw_bytes() -> None:
+    extraction = TextExtraction(
+        text="Guide de developpement JavaScript et /OpenAction dans un tutoriel",
+        text_total_chars=64,
+        text_truncated=False,
+        urls=(),
+        urls_total=0,
+        urls_truncated=False,
+        complete=True,
+    )
+    benign_findings, benign_score = server._pdf_findings(extraction, b"%PDF-1.7\n% benign")
+    assert benign_findings == []
+    assert benign_score == 0.0
+
+    threat_findings, threat_score = server._pdf_findings(
+        extraction, b"%PDF-1.7\n1 0 obj << /OpenAction 2 0 R /JS (x) >> endobj"
+    )
+    codes = {finding["code"] for finding in threat_findings}
+    assert codes == {"PDF_JAVASCRIPT", "PDF_LAUNCH_ACTION"}
+    assert threat_score == 0.7
+
+
+def test_analyze_in_bounds_content_b64_length() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        server.AnalyzeIn(
+            filename="oversized.bin",
+            content_b64="A" * (server.MAX_CONTENT_B64_CHARS + 1),
+        )
+
+
 @pytest.mark.asyncio
 async def test_unsupported_archive_pipeline_can_never_pass_silently() -> None:
-    result = await server.analyze(_payload("opaque.rar", b"Rar!\x1a\x07\x01\x00synthetic"))
+    result = server.analyze_content(_payload("opaque.rar", b"Rar!\x1a\x07\x01\x00synthetic"))
 
     assert result["analysis_incomplete"] is True
     assert result["archive_analysis"]["kind"] == "unsupported"

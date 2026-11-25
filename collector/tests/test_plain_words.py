@@ -5,10 +5,14 @@ import re
 import unittest
 
 from sentimail_v3.code.plain_words import (
+    confidence_badge,
+    gap_lines,
     plain_clue,
     plain_limits,
     plain_points,
     plain_rationale,
+    sender_addresses,
+    sender_gap,
 )
 
 _CODE = re.compile(r"\b[A-Z][A-Z0-9]*(?:[-_.][A-Z0-9_]+)+\b")
@@ -109,6 +113,10 @@ class NouveauxCriteresTests(unittest.TestCase):
         "IDENTITY_ASCII_LOOKALIKE",
         "CONTENT_ACTIVE_HTML",
         "RSPAMD_PHISHING_HEURISTIC",
+        "CORRELATION_UNAUTHENTICATED_PHISHING_HEURISTIC",
+        # Émis en production et retombés jusque-là sur le repli.
+        "HISTORY_CONFIRMED_LEGITIMATE_SENDER",
+        "HISTORY_BEHAVIOR_DEVIATION",
     )
 
     def test_chaque_critere_se_dit_en_francais_sans_jargon(self) -> None:
@@ -119,6 +127,25 @@ class NouveauxCriteresTests(unittest.TestCase):
                 self.assertNotIn("apex", str(phrase).casefold())
                 self.assertNotIn("dkim", str(phrase).casefold())
                 self.assertNotEqual(phrase, "énoncé technique de repli.")
+
+    def test_l_heuristique_est_absorbee_par_son_faisceau(self) -> None:
+        # Le faisceau dit le soupçon du filtre et le défaut d'identité : le
+        # soupçon seul, à côté, redirait la moitié de la même chose.
+        from sentimail_v3.code.plain_words import _SHORT, short_points
+
+        points = short_points(
+            [
+                {"clue_code": "RSPAMD_PHISHING_HEURISTIC", "statement": ""},
+                {
+                    "clue_code": "CORRELATION_UNAUTHENTICATED_PHISHING_HEURISTIC",
+                    "statement": "",
+                },
+            ],
+            5,
+        )
+        self.assertEqual(
+            points, [_SHORT["CORRELATION_UNAUTHENTICATED_PHISHING_HEURISTIC"]]
+        )
 
 
 class JargonDuVerdictTests(unittest.TestCase):
@@ -225,9 +252,9 @@ class LExplicationDuJugeEstMontreeTests(unittest.TestCase):
         )
         self.assertIn("page générique de vérification", rendu)
 
-    def test_sans_explication_la_phrase_reste_seule(self) -> None:
+    def test_sans_explication_le_domaine_observe_reste_illustre(self) -> None:
         rendu = plain_clue(self.CODE, "peu importe", {"facts": {"sender_apex": "x.fr"}})
-        self.assertEqual(rendu, plain_clue(self.CODE, "peu importe"))
+        self.assertIn("Expéditeur observé : x.fr", rendu)
 
     def test_une_explication_qui_redit_le_grief_n_est_pas_repetee(self) -> None:
         rendu = plain_clue(
@@ -249,3 +276,124 @@ class LExplicationDuJugeEstMontreeTests(unittest.TestCase):
         )
         self.assertNotIn("DEEP-019", rendu)
         self.assertNotIn("55", rendu)
+
+
+class AdressesDeLExpediteurTests(unittest.TestCase):
+    """Ce qu'un avis montre de l'expéditeur en plus de ce qu'il affiche de lui.
+
+    Le `De :` d'un message est déclaratif : un fraudeur y écrit ce qu'il veut.
+    L'adresse d'enveloppe est celle que le serveur a réellement annoncée.
+    """
+
+    def test_une_enveloppe_differente_est_signalee_comme_telle(self) -> None:
+        lignes = sender_addresses(
+            "'bro' <info@amazon.com>", "bounce@mailer.example.ru", None
+        )
+        self.assertIn(
+            "Adresse d’enveloppe différente : bounce@mailer.example.ru", lignes
+        )
+
+    def test_une_enveloppe_identique_est_dite_sans_alarme(self) -> None:
+        lignes = sender_addresses(
+            "Amazon <info@amazon.com>", "info@amazon.com", None
+        )
+        self.assertIn("Adresse d’enveloppe : info@amazon.com", lignes)
+        self.assertNotIn("différente", " ".join(lignes))
+
+    def test_une_enveloppe_absente_le_dit_plutot_que_de_se_taire(self) -> None:
+        lignes = sender_addresses("Amazon <info@amazon.com>", "", None)
+        self.assertIn("Adresse d’enveloppe : (non disponible)", lignes)
+
+    def test_une_adresse_de_reponse_detournee_est_montree(self) -> None:
+        lignes = sender_addresses(
+            "Amazon <info@amazon.com>", "info@amazon.com", "reply@ailleurs.tld"
+        )
+        self.assertIn("Adresse de réponse différente : reply@ailleurs.tld", lignes)
+
+    def test_une_adresse_de_reponse_identique_n_encombre_pas(self) -> None:
+        lignes = sender_addresses(
+            "Amazon <info@amazon.com>", "info@amazon.com", "info@amazon.com"
+        )
+        self.assertNotIn("réponse", " ".join(lignes))
+
+
+class EcartDAdresseTests(unittest.TestCase):
+    """L'écart entre l'adresse affichée et celle que le serveur a annoncée.
+
+    Il ne se montre que lorsqu'il existe : sans écart, deux lignes identiques
+    n'apprennent rien et allongent l'avis.
+    """
+
+    def test_sans_ecart_il_n_y_a_rien_a_montrer(self) -> None:
+        self.assertIsNone(sender_gap("Amazon <info@amazon.com>", "info@amazon.com"))
+
+    def test_une_enveloppe_differente_fait_l_ecart(self) -> None:
+        ecart = sender_gap("'bro' <info@amazon.com>", "bounce@mailer.example.ru")
+        self.assertEqual(ecart["displayed"], "info@amazon.com")
+        self.assertEqual(ecart["real"], "bounce@mailer.example.ru")
+
+    def test_une_adresse_de_reponse_detournee_fait_l_ecart(self) -> None:
+        ecart = sender_gap(
+            "Amazon <info@amazon.com>", "info@amazon.com", "reply@ailleurs.tld"
+        )
+        self.assertEqual(ecart["reply_to"], "reply@ailleurs.tld")
+        self.assertIsNone(ecart["real"])
+
+    def test_une_enveloppe_absente_ne_fabrique_pas_d_ecart(self) -> None:
+        self.assertIsNone(sender_gap("Amazon <info@amazon.com>", ""))
+
+
+class IndiceDeConfianceTests(unittest.TestCase):
+    """Un niveau, un mot, une couleur : ce que l'œil lit avant de lire."""
+
+    def test_un_message_dangereux_est_dit_dangereux(self) -> None:
+        badge = confidence_badge("dangerous", 3)
+        self.assertEqual(badge["level"], "danger")
+        self.assertEqual(badge["word"], "DANGEREUX")
+        self.assertEqual(badge["detail"], "3 écarts relevés")
+
+    def test_un_seul_ecart_ne_prend_pas_le_pluriel(self) -> None:
+        self.assertEqual(confidence_badge("suspect", 1)["detail"], "1 écart relevé")
+
+    def test_un_message_suspect_ou_indesirable_reste_douteux(self) -> None:
+        for classification in ("suspect", "spam", "undetermined", ""):
+            self.assertEqual(confidence_badge(classification, 2)["level"], "doute")
+
+    def test_un_message_legitime_est_dit_sain(self) -> None:
+        badge = confidence_badge("legitimate", 0)
+        self.assertEqual(badge["level"], "sain")
+        self.assertEqual(badge["detail"], "aucun écart relevé")
+
+    def test_chaque_niveau_porte_sa_couleur_et_son_icone(self) -> None:
+        for classification in ("dangerous", "suspect", "legitimate"):
+            badge = confidence_badge(classification, 1)
+            self.assertTrue(badge["color"].startswith("#"))
+            self.assertIn(badge["level"], badge["cid"])
+
+
+class LignesDEcartTests(unittest.TestCase):
+    """La version texte de l'encart dit exactement la même chose que lui."""
+
+    CARTE = {
+        "claimed": "The Neuropathy Support Group",
+        "from_domain": "animalrights.eu",
+        "from_apex": "animalrights.eu",
+        "official": [],
+    }
+
+    def test_l_identite_annoncee_fait_face_au_domaine_reel(self) -> None:
+        lignes = gap_lines(self.CARTE, None)
+        self.assertEqual(
+            lignes,
+            [
+                "Annoncé : The Neuropathy Support Group",
+                "Écrit depuis : animalrights.eu",
+            ],
+        )
+
+    def test_les_adresses_suivent_l_identite(self) -> None:
+        lignes = gap_lines(self.CARTE, {"displayed": "a@b.test", "real": "c@d.test"})
+        self.assertEqual(lignes[-2:], ["Affiché : a@b.test", "Réel : c@d.test"])
+
+    def test_sans_rien_a_comparer_il_n_y_a_pas_de_ligne(self) -> None:
+        self.assertEqual(gap_lines(None, None), [])

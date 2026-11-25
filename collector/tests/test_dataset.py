@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from sentimail_v3.supervision.dataset import SPLITS, _bucket, split_of
+from sentimail_v3.supervision.dataset import (
+    SPLITS,
+    _bucket,
+    quality,
+    resolve_label,
+    split_of,
+)
 
 
 def sample(codes: list[str], families: list[str]) -> dict[str, object]:
@@ -38,6 +44,69 @@ class SplitTests(unittest.TestCase):
 
     def test_the_shares_are_a_whole(self) -> None:
         self.assertAlmostEqual(sum(share for _, share in SPLITS), 1.0, places=6)
+
+
+class AnnotationTests(unittest.TestCase):
+    def test_expert_label_has_priority_over_user_preference(self) -> None:
+        label, authority = resolve_label(
+            {
+                "annotations": [
+                    {"authority": "user", "label": "spam"},
+                    {"authority": "expert", "label": "legitimate"},
+                ]
+            }
+        )
+        self.assertEqual((label, authority), ("legitimate", "expert"))
+
+    def test_conflicting_experts_are_not_silently_resolved(self) -> None:
+        label, authority = resolve_label(
+            {
+                "annotations": [
+                    {"authority": "expert", "label": "spam"},
+                    {"authority": "expert", "label": "legitimate"},
+                ]
+            }
+        )
+        self.assertIsNone(label)
+        self.assertEqual(authority, "conflict")
+
+    def test_legacy_label_remains_exportable(self) -> None:
+        self.assertEqual(
+            resolve_label({"human_label": "spam", "annotations": []}),
+            ("spam", "legacy"),
+        )
+
+
+class _AsyncpgLikeRecord:
+    """Comme asyncpg.Record, l'itération rend les valeurs et keys() les noms."""
+
+    def __init__(self, values: dict[str, int]) -> None:
+        self.values = values
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __iter__(self):
+        return iter(self.values.values())
+
+    def keys(self):
+        return self.values.keys()
+
+    def __getitem__(self, key: str) -> int:
+        return self.values[key]
+
+
+class _QualityPool:
+    async def fetchrow(self, query: str):
+        return _AsyncpgLikeRecord({"active_labels": 91, "teacher_targets": 1535})
+
+
+class QualityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_asyncpg_record_column_names_are_used(self) -> None:
+        self.assertEqual(
+            await quality(_QualityPool()),
+            {"active_labels": 91, "teacher_targets": 1535},
+        )
 
 
 if __name__ == "__main__":

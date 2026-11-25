@@ -11,7 +11,11 @@ fournisseur maison peut différer entre le verdict et la conversation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import NamedTuple
+
+_EMPTY_BODY_EXTRAS: Mapping[str, object] = MappingProxyType({})
 
 
 class Preset(NamedTuple):
@@ -22,7 +26,7 @@ class Preset(NamedTuple):
     secret_filename: str | None
     # Champ(s) propriétaire(s) que ce fournisseur exige dans le corps de la
     # requête (ex. couper le raisonnement DeepSeek).
-    body_extras: dict[str, object] = {}
+    body_extras: Mapping[str, object] = _EMPTY_BODY_EXTRAS
 
 
 PRESETS: dict[str, Preset] = {
@@ -44,7 +48,7 @@ PRESETS: dict[str, Preset] = {
         "max_tokens", "ollama_api_key",
     ),
     "anthropic": Preset(
-        "anthropic", "https://api.anthropic.com", "claude-sonnet-4-5",
+        "anthropic", "https://api.anthropic.com", "claude-sonnet-5-5",
         "max_tokens", "anthropic_api_key",
     ),
     "custom": Preset("openai_compatible", "", "", "max_tokens", None),

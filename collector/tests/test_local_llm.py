@@ -10,7 +10,13 @@ import asyncpg
 import httpx
 from sentimail_v3 import llm
 from sentimail_v3.config import Settings, load_settings
-from sentimail_v3.llm import LlmError, ProviderRoute, local_chat_json, local_route
+from sentimail_v3.llm import (
+    LlmError,
+    ProviderRoute,
+    local_chat_json,
+    local_role,
+    local_route,
+)
 from sentimail_v3.supervision.local_llm import probe
 
 
@@ -38,6 +44,11 @@ def _ollama(content: str, status: int = 200) -> httpx.AsyncClient:
 
 
 class LocalChatTests(unittest.IsolatedAsyncioTestCase):
+    def test_auxiliary_calls_share_the_analysis_route(self) -> None:
+        for role in ("requested_action", "sender_relation", "identity_claim", "activity_coherence"):
+            self.assertEqual(local_role(role), "analysis")
+        self.assertEqual(local_role("conversation"), "conversation")
+
     async def test_a_local_answer_is_returned_with_its_provenance(self) -> None:
         async with _ollama('{"answer": "bonjour"}') as client:
             content, metadata = await local_chat_json(
@@ -91,6 +102,7 @@ class LocalChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(report["roles"]["conversation"]["ok"])
         self.assertIn("tool", report["roles"]["conversation"]["missing_keys"])
         self.assertFalse(report["roles"]["verdict"]["ok"])
+        self.assertFalse(report["roles"]["analysis"]["ok"])
 
 
 class FallbackRoleTests(unittest.IsolatedAsyncioTestCase):
@@ -125,7 +137,8 @@ class FallbackRoleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         async def remote_chat(
-            client: Any, *, route: ProviderRoute, messages: Any, max_tokens: int
+            client: Any, *, route: ProviderRoute, messages: Any, max_tokens: int,
+            deadline_seconds: float | None = None,
         ) -> tuple[str, dict[str, Any]]:
             return '{"ok":1}', {"model": route.model}
 
@@ -168,6 +181,50 @@ class FallbackRoleTests(unittest.IsolatedAsyncioTestCase):
         # Verrou : le rôle d'origine ("conversation") doit atteindre
         # active_provider lors du repli, jamais None.
         self.assertEqual(captured_roles, ["conversation"])
+
+    async def test_a_model_override_bypasses_local_and_reaches_the_provider(self) -> None:
+        captured_models: list[str] = []
+
+        async def active_provider_stub(
+            pool: Any, settings: Settings, role: str | None = None
+        ) -> ProviderRoute:
+            return ProviderRoute(
+                "openai_compatible",
+                "https://api.deepseek.com",
+                "deepseek-v4-pro",
+                "clef-de-test",
+                "max_tokens",
+            )
+
+        async def remote_chat(
+            client: Any, *, route: ProviderRoute, messages: Any, max_tokens: int,
+            deadline_seconds: float | None = None,
+        ) -> tuple[str, dict[str, Any]]:
+            captured_models.append(route.model)
+            return '{"ok":1}', {"model": route.model}
+
+        originals = llm.active_provider, llm.openai_compatible_chat_json
+        llm.active_provider = active_provider_stub
+        llm.openai_compatible_chat_json = remote_chat
+        try:
+            with unittest.mock.patch.dict(
+                os.environ, {"DATABASE_URL": "postgresql://test"}
+            ):
+                content, metadata = await llm.provider_chat_json(
+                    None,
+                    None,
+                    _settings(),
+                    messages=[{"role": "user", "content": "x"}],
+                    max_tokens=10,
+                    role="verdict",
+                    model_override="deepseek-v4-flash",
+                    allow_local=False,
+                )
+        finally:
+            llm.active_provider, llm.openai_compatible_chat_json = originals
+        self.assertIn("ok", content)
+        self.assertEqual(metadata["model"], "deepseek-v4-flash")
+        self.assertEqual(captured_models, ["deepseek-v4-flash"])
 
 
 @unittest.skipUnless(os.environ.get("DATABASE_URL"), "DATABASE_URL absent")

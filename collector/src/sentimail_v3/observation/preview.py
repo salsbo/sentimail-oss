@@ -15,6 +15,32 @@ MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
 _CID_SOURCE = re.compile(
     r"(?P<prefix>\bsrc\s*=\s*['\"]?)cid:(?P<cid>[^'\"\s>]+)", re.IGNORECASE
 )
+_RASTER_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
+def _image_only_source(parsed: EmailMessage) -> str | None:
+    """Photographie les images jointes quand le corps du courrier est vide."""
+    fragments = ["<!doctype html><html><body>"]
+    for part in parsed.walk():
+        mime = part.get_content_type()
+        if mime not in _RASTER_TYPES:
+            continue
+        payload = part.get_payload(decode=True)
+        if not payload or len(payload) > MAX_INLINE_IMAGE_BYTES:
+            continue
+        encoded = base64.b64encode(payload).decode("ascii")
+        fragment = (
+            '<p>Image jointe au message</p>'
+            f'<img src="data:{mime};base64,{encoded}" '
+            'style="max-width:100%;max-height:1050px;object-fit:contain">'
+        )
+        # Ne jamais couper un URI base64 au milieu pour respecter le budget.
+        if sum(map(len, fragments)) + len(fragment) + 14 > MAX_RENDER_HTML_CHARS:
+            continue
+        fragments.append(fragment)
+        if len(fragments) == 4:
+            break
+    return "".join(fragments) + "</body></html>" if len(fragments) > 1 else None
 
 
 def render_source(raw: bytes) -> str | None:
@@ -26,7 +52,7 @@ def render_source(raw: bytes) -> str | None:
             plain = parsed.get_body(preferencelist=("plain",))
             text = plain.get_content() if plain is not None else ""
             if not isinstance(text, str) or not text.strip():
-                return None
+                return _image_only_source(parsed)
             return (
                 "<!doctype html><html><body><pre>"
                 + html.escape(text[:200_000])

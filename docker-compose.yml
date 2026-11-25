@@ -1,3 +1,13 @@
+# Logs : driver syslog vers le rsyslog local du dedie (127.0.0.1:10514, UDP donc
+# jamais bloquant au demarrage), qui les pousse vers le collecteur central avec
+# une file disque. `docker logs` reste disponible par le cache local de Docker.
+x-logging: &logging_collecteur
+  driver: syslog
+  options:
+    syslog-address: "udp://127.0.0.1:10514"
+    syslog-format: rfc3164
+    tag: "{{.Name}}"
+
 services:
   db:
     image: postgres:16.11-alpine3.23
@@ -19,11 +29,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   migrate:
     image: postgres:16.11-alpine3.23
@@ -47,13 +53,7 @@ services:
       - ./database:/migrations:ro
     networks:
       - data_net
-    logging:
-      driver: json-file
-      options:
-        # migrate ne tourne qu'au démarrage : peu de volume, mais borné quand
-        # même pour qu'un redémarrage en boucle ne remplisse pas le disque.
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   backup:
     build: ./ops/backup
@@ -84,11 +84,7 @@ services:
       timeout: 10s
       retries: 2
       start_period: 10m
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   collector:
     build: ./collector
@@ -114,7 +110,7 @@ services:
       OPERATOR_ADDRESS: "${OPERATOR_ADDRESS:-}"
       DECISION_MODE: ${SENTINEL_V3_DECISION_MODE:-true}
       PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
-      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4}
       ASSISTANT_LLM_HOURLY_LIMIT: ${ASSISTANT_LLM_HOURLY_LIMIT:-20}
       ASSISTANT_LLM_DAILY_LIMIT: ${ASSISTANT_LLM_DAILY_LIMIT:-100}
@@ -124,6 +120,16 @@ services:
     networks:
       - data_net
       - sentimail_net
+      - render_sandbox_net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
     volumes:
       - sentimail_v3_provider_secrets:/run/sentinel-provider-secrets
     secrets:
@@ -135,11 +141,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
   assistant:
     build: ./collector
@@ -166,11 +168,12 @@ services:
       DEEPSEEK_BASE_URL: "https://api.deepseek.com"
       DEEPSEEK_ASSISTANT_MODEL: "deepseek-v4-pro"
       DEEPSEEK_TIMEOUT_SECONDS: "180"
+      REMOTE_LLM_DEADLINE_SECONDS: "${REMOTE_LLM_DEADLINE_SECONDS:-120}"
       DECISION_MODE: ${SENTINEL_V3_DECISION_MODE:-true}
       RELAY_HOST: "172.20.0.1"
       RELAY_PORT: "10027"
       PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
-      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4}
       ASSISTANT_LLM_HOURLY_LIMIT: ${ASSISTANT_LLM_HOURLY_LIMIT:-20}
       ASSISTANT_LLM_DAILY_LIMIT: ${ASSISTANT_LLM_DAILY_LIMIT:-100}
@@ -185,6 +188,15 @@ services:
     networks:
       - data_net
       - sentimail_net
+      - render_sandbox_net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
     secrets:
       - raw_eml_key
       - deepseek_api_key
@@ -199,11 +211,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
   verdict:
     build: ./collector
@@ -226,7 +234,9 @@ services:
       SEARCH_BASE_URL: "${SEARCH_BASE_URL:-https://api.tavily.com}"
       DEEPSEEK_VERDICT_MODEL: "deepseek-v4-pro"
       DEEPSEEK_TIMEOUT_SECONDS: "180"
-      VERDICT_INTERVAL_SECONDS: "5"
+      REMOTE_LLM_DEADLINE_SECONDS: "${REMOTE_LLM_DEADLINE_SECONDS:-120}"
+      ECONOMY_LLM_DEADLINE_SECONDS: "${ECONOMY_LLM_DEADLINE_SECONDS:-30}"
+      VERDICT_INTERVAL_SECONDS: "${VERDICT_INTERVAL_SECONDS:-1}"
       VERDICT_NOT_BEFORE: ${VERDICT_NOT_BEFORE:-}
       ACTION_ADDRESS: "${ACTION_ADDRESS:-maia@sentinel.sentimail.example}"
       PROBE_RECIPIENT: "${PROBE_RECIPIENT:-sentinel-probe@sentimail.example}"
@@ -243,7 +253,7 @@ services:
       RELAY_HOST: "172.20.0.1"
       RELAY_PORT: "10027"
       PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
-      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4}
       ASSISTANT_LLM_HOURLY_LIMIT: ${ASSISTANT_LLM_HOURLY_LIMIT:-20}
       ASSISTANT_LLM_DAILY_LIMIT: ${ASSISTANT_LLM_DAILY_LIMIT:-100}
@@ -254,13 +264,26 @@ services:
       # restait lexicale : aveugle à toute question posée avec d'autres mots.
       KNOWLEDGE_EMBEDDING_URL: ${KNOWLEDGE_EMBEDDING_URL:-http://172.20.0.1:11434}
       KNOWLEDGE_EMBEDDING_MODEL: ${KNOWLEDGE_EMBEDDING_MODEL:-bge-m3}
+      # Les enquêteurs sémantiques auxiliaires restent sur l'Ollama de l'hôte ;
+      # le verdict final conserve sa cascade distante.
+      LOCAL_LLM_URL: ${LOCAL_LLM_URL:-http://172.20.0.1:11434}
       VERDICT_CONCURRENCY: ${VERDICT_CONCURRENCY:-2}
+      GEMINI_DECISIONS_ENABLED: ${GEMINI_DECISIONS_ENABLED:-false}
+      GEMINI_DECISIONS_MODEL: ${GEMINI_DECISIONS_MODEL:-gemini-decision-1}
     networks:
       - sentimail_net
       - data_net
       - url_sandbox_net
       - file_sandbox_net
       - render_sandbox_net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
     secrets:
       - raw_eml_key
       - deepseek_api_key
@@ -275,11 +298,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
   enricher:
     build: ./collector
@@ -297,6 +316,14 @@ services:
     networks:
       - sentimail_net
       - data_net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
     secrets:
       - db_password
     healthcheck:
@@ -305,11 +332,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
   retention:
     build: ./collector
@@ -330,6 +353,14 @@ services:
       RETENTION_BATCH_SIZE: ${RETENTION_BATCH_SIZE:-500}
     networks:
       - data_net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
     secrets:
       - db_password
     healthcheck:
@@ -338,11 +369,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
   watchdog:
     build: ./collector
@@ -379,17 +406,22 @@ services:
     networks:
       - data_net
       - sentimail_net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+      - DAC_OVERRIDE
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-m", "sentimail_v3.supervision.health", "watchdog", "180"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
   admin:
     profiles: ["admin"]
@@ -444,17 +476,19 @@ services:
       # Accès à la base, qui reste sur un réseau sans issue vers l'extérieur.
       data_net:
         priority: 10
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8093/sante', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   relay:
     build: .
@@ -477,14 +511,12 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   caretaker:
-    build: ./collector
+    build:
+      context: ./collector
+      dockerfile: Dockerfile.caretaker
     container_name: sentimail-v3-caretaker
     restart: unless-stopped
     command: ["python", "-m", "sentimail_v3.supervision.caretaker"]
@@ -500,7 +532,7 @@ services:
       DEEPSEEK_BASE_URL: "https://api.deepseek.com"
       DEEPSEEK_ASSISTANT_MODEL: "deepseek-v4-pro"
       PROVIDER_SECRETS_DIR: /run/sentinel-provider-secrets
-      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-5-5}
       OPERATOR_ADDRESS: "${OPERATOR_ADDRESS:-}"
       CONSOLE_URL: "${CONSOLE_URL:-}"
       ASSISTANT_SENDER: "${ASSISTANT_SENDER:-MAIA - SentiMail <maia@sentimail.example>}"
@@ -511,6 +543,15 @@ services:
     networks:
       - data_net
       - sentimail_net
+      - render_sandbox_net
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_READ_SEARCH
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 1g
     secrets:
       - db_password
       - deepseek_api_key
@@ -525,11 +566,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging_collecteur
 
 
   # --------------------------------------------------------------------------
@@ -554,14 +591,14 @@ services:
       retries: 3
       start_period: 20s
     networks:
-      - sentimail_net
+      - url_sandbox_net
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     pids_limit: 128
     mem_limit: 512m
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   file-sandbox:
     # Sources rapatriées de SentiMail V2 (infra/file-sandbox) : V3 construit ses
@@ -577,14 +614,14 @@ services:
       retries: 3
       start_period: 20s
     networks:
-      - sentimail_net
+      - file_sandbox_net
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     pids_limit: 128
     mem_limit: 768m
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   render-sandbox:
     # Sources rapatriées de SentiMail V2 (infra/render-sandbox) : V3 construit ses
@@ -600,15 +637,15 @@ services:
       retries: 3
       start_period: 20s
     networks:
-      - sentimail_net
+      - render_sandbox_net
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     shm_size: "512m"
     pids_limit: 256
     mem_limit: 2g
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "3"
+    logging: *logging_collecteur
 
 
   # --------------------------------------------------------------------------
@@ -642,11 +679,7 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *logging_collecteur
 
   rspamd:
     profiles: ["mx"]
@@ -668,16 +701,12 @@ services:
     pids_limit: 256
     mem_limit: 1g
     healthcheck:
-      test: ["CMD", "rspamadm", "control", "stat"]
+      test: ["CMD-SHELL", "rspamadm configtest -q && rspamadm control stat"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
   mx:
     profiles: ["mx"]
@@ -715,6 +744,8 @@ services:
     volumes:
       - ${SENTINEL_V3_MX_TLS_SOURCE:-sentimail_v3_mx_tls}:/etc/letsencrypt:ro
       - sentimail_v3_mx_queue:/var/spool/postfix
+      # Routes opérateur hors capture V3, source externe facultative.
+      - ${SENTINEL_V3_MX_DIRECT_ROUTES_DIR:-./config/mx-direct}:/etc/postfix/direct-source:ro
       # Table cidr des sources hostiles, écrite par le watchdog.
       - sentimail_v3_hostile:/etc/postfix/hostile
     ports:
@@ -732,16 +763,12 @@ services:
     pids_limit: 256
     mem_limit: 512m
     healthcheck:
-      test: ["CMD-SHELL", "postfix status"]
+      test: ["CMD", "python3", "/usr/local/bin/mx-health.py"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
+    logging: *logging_collecteur
 
 networks:
   # Le sous-réseau est figé : la passerelle 172.20.0.1 est l'adresse par
@@ -774,8 +801,10 @@ networks:
     name: sentimail_v3_url_sandbox_net
   file_sandbox_net:
     name: sentimail_v3_file_sandbox_net
+    internal: true
   render_sandbox_net:
     name: sentimail_v3_render_sandbox_net
+    internal: true
 
 volumes:
   sentimail_v3_hostile:

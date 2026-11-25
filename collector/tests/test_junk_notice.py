@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import re
 import unittest
 from email import policy
@@ -13,316 +14,324 @@ from sentimail_v3.conversation.junk_notice import (
 )
 
 CONTEXTE = {
-    "subject": "Votre colis est en attente",
-    "sender": "suivi@colis-livraison.example",
+    "subject": "Reverse dementia in weeks? Bill Gates says yes",
+    "sender": "Alzheimer's Alert <support@rockbook.hu>",
     "verdict": "spam",
     "reasons": [
-        "Le domaine ne correspond pas au transporteur annoncé.",
-        "Le message presse d’agir avant ce soir.",
+        "Authentification : échec",
+        "Contenu : pression pour agir vite",
+        "Activité : sans rapport avec l’expéditeur",
     ],
-    "lessons": [
-        {"name": "Usurpation de marque", "description": "Le message se fait passer pour un transporteur connu."},
+    "message_excerpts": [
+        "Reverse dementia naturally in just a few weeks.",
+        "Visit https://hostile.example before midnight.",
     ],
-    "action_address": "maia@sentinel.mondomaine.example",
+    # Ces anciens blocs ne doivent plus allonger l'avis.
+    "lessons": [{"advice": "N’utilise aucun lien du message."}],
+    "identity_card": {
+        "claimed": "Alzheimer's Alert",
+        "from_domain": "rockbook.hu",
+        "from_apex": "rockbook.hu",
+        "official": ["example.invalid"],
+    },
     "has_preview": True,
+    "action_address": "maia@sentinel.mondomaine.example",
+    "reference": "M-10eb8e",
 }
 
 
-class ContenuTests(unittest.TestCase):
-    def test_l_apercu_est_annonce_comme_une_image(self) -> None:
+class RenduTelegraphiqueTests(unittest.TestCase):
+    def test_l_avis_tient_aux_faits_utiles(self) -> None:
         html = render_junk_html(dict(CONTEXTE))
-        self.assertIn("Aperçu de l’email", html)
-        self.assertRegex(html.casefold(), r"image|photo|capture")
-
-    def test_le_texte_du_message_n_est_pas_recopie(self) -> None:
-        """La capture remplace le corps : recopier le texte rendrait au message
-        sa force de persuasion, et ses liens leur pouvoir de nuire."""
-        contexte = dict(CONTEXTE)
-        contexte["body_text"] = "Cliquez ici pour recevoir votre colis MAINTENANT"
-        html = render_junk_html(contexte)
-        self.assertNotIn("MAINTENANT", html)
-
-    def test_la_raison_est_mise_en_forme_et_non_listee_brute(self) -> None:
-        html = render_junk_html(dict(CONTEXTE))
+        self.assertIn("CLASSÉ EN INDÉSIRABLES · AUCUNE ACTION REQUISE", html)
+        self.assertIn(">De<", html)
+        self.assertIn("support@rockbook.hu", html)
+        self.assertIn(">Objet<", html)
+        self.assertIn("Reverse dementia", html)
+        self.assertIn(">Motifs</div>", html)
         for raison in CONTEXTE["reasons"]:
-            self.assertIn(raison, html)
-        self.assertRegex(html, r"background:#[0-9a-fA-F]{6}")
+            self.assertIn(str(raison), html)
 
-    def test_la_technique_est_nommee(self) -> None:
+    def test_la_photo_du_message_est_montree(self) -> None:
         html = render_junk_html(dict(CONTEXTE))
-        self.assertIn("Usurpation de marque", html)
+        self.assertIn('src="cid:capture-email-neutralisee"', html)
+        self.assertLess(html.index(">Motifs</div>"), html.index("cid:capture-email"))
+        self.assertNotIn("cid:capture-email", render_junk_html({**CONTEXTE, "has_preview": False}))
 
-    def test_un_message_dangereux_se_distingue_d_un_indesirable(self) -> None:
-        indesirable = render_junk_html({**CONTEXTE, "verdict": "spam"})
-        dangereux = render_junk_html({**CONTEXTE, "verdict": "dangerous"})
-        self.assertNotEqual(indesirable, dangereux)
-        self.assertRegex(dangereux.casefold(), r"dangereux|dangereuse")
+    def test_adresse_affichee_et_adresse_reelle_sont_montrees(self) -> None:
+        html = render_junk_html(
+            {
+                **CONTEXTE,
+                "sender_lines": [
+                    "Nom affiché : Alzheimer's Alert",
+                    "Adresse affichée : support@rockbook.hu",
+                    "Adresse d’enveloppe différente : bounce@mailer.example.ru",
+                ],
+            }
+        )
+        self.assertIn("Adresse affichée", html)
+        self.assertIn("support@rockbook.hu", html)
+        self.assertIn("Adresse d’enveloppe différente", html)
+        self.assertIn("bounce@mailer.example.ru", html)
+        self.assertNotIn("<strong>De</strong>", html)
 
-    def test_sans_raison_l_avis_reste_lisible(self) -> None:
-        html = render_junk_html({**CONTEXTE, "reasons": [], "lessons": []})
-        self.assertIn("Aperçu de l’email", html)
-        self.assertTrue(len(html) > 400)
-
-
-class BoutonsTests(unittest.TestCase):
-    def test_un_bouton_permet_de_se_faire_livrer_le_message(self) -> None:
+    def test_les_anciens_blocs_ne_sont_plus_affiches(self) -> None:
         html = render_junk_html(dict(CONTEXTE))
-        self.assertRegex(html.casefold(), r"livre")
-        self.assertIn("mailto:maia@sentinel.mondomaine.example", html)
+        for absent in (
+            "Aperçu de l’email",
+            "Qui écrit",
+            "example.invalid",
+            "N’utilise aucun lien",
+            "Que veux-tu faire",
+        ):
+            self.assertNotIn(absent, html)
 
-    def test_les_reponses_sont_de_petits_boutons(self) -> None:
-        """Un avis d'indésirable se survole : il ne mérite pas de pavés."""
+    def test_de_courts_extraits_du_corps_restent_visibles(self) -> None:
         html = render_junk_html(dict(CONTEXTE))
-        for lettre in ("A", "C"):
-            with self.subTest(lettre=lettre):
-                lien = re.search(rf'<a [^>]*data-choice="{lettre}".*?</a>', html, re.S)
-                self.assertIsNotNone(lien)
-                self.assertIn("display:inline-block", lien.group(0))
-                self.assertNotRegex(lien.group(0), r"(?<!line-)height:")
+        self.assertIn("Aperçu inerte", html)
+        self.assertIn("Reverse dementia naturally", html)
 
-    def test_chaque_lettre_garde_la_couleur_des_autres_surfaces(self) -> None:
-        from sentimail_v3.conversation.choice_answers import GRIS, ROUGE, VERT
-
+    def test_les_liens_des_extraits_ne_sont_pas_actifs(self) -> None:
         html = render_junk_html(dict(CONTEXTE))
-        # Le classement est déjà fait : le confirmer (B) n'apporte rien.
+        self.assertNotIn("https://hostile.example", html)
+        self.assertNotIn('href="https://hostile.example', html)
+
+    def test_trois_motifs_au_plus(self) -> None:
+        html = render_junk_html(
+            {**CONTEXTE, "reasons": ["Un", "Deux", "Trois", "Quatre"]}
+        )
+        self.assertIn("Trois", html)
+        self.assertNotIn("Quatre", html)
+
+    def test_un_seul_bouton_livre_dans_la_boite(self) -> None:
+        html = render_junk_html(dict(CONTEXTE))
+        self.assertEqual(1, len(re.findall(r'data-choice="[A-Z]"', html)))
+        self.assertIn('data-choice="A"', html)
+        self.assertIn("Livrer dans ma boîte", html)
         self.assertNotIn('data-choice="B"', html)
-        for lettre, couleur in (("A", VERT), ("C", GRIS)):
-            with self.subTest(lettre=lettre):
-                lien = re.search(rf'<a [^>]*data-choice="{lettre}".*?</a>', html, re.S)
-                self.assertIsNotNone(lien)
-                self.assertIn(f"background:{couleur}", lien.group(0))
+        self.assertNotIn('data-choice="C"', html)
+
+    def test_le_repli_sans_motif_reste_telegraphique(self) -> None:
+        html = render_junk_html({**CONTEXTE, "reasons": []})
+        self.assertIn("Analyse : plusieurs indices concordants", html)
+        self.assertNotIn("faisceau", html.casefold())
+
+    def test_un_danger_reste_visible_sans_changer_la_structure(self) -> None:
+        html = render_junk_html({**CONTEXTE, "verdict": "dangerous"})
+        self.assertIn("DANGEREUX · CLASSÉ EN INDÉSIRABLES", html)
+        self.assertIn("Livrer dans ma boîte", html)
+
+    def test_la_reference_est_visible(self) -> None:
+        self.assertIn("M-10eb8e", render_junk_html(dict(CONTEXTE)))
+
+    def test_les_valeurs_hostiles_sont_echappees(self) -> None:
+        html = render_junk_html(
+            {
+                **CONTEXTE,
+                "sender": '<img src=x onerror="x">',
+                "reasons": ["<b>x</b>"],
+                "message_excerpts": ["<script>x</script>"],
+            }
+        )
+        self.assertNotIn("<img src=x", html)
+        self.assertNotIn("<b>x</b>", html)
+        self.assertNotIn("<script>", html)
 
 
 class LiensTests(unittest.TestCase):
-    def _corps(self, lettre: str) -> str:
-        lien = junk_choice_links("maia@sentinel.mondomaine.example")[lettre]
-        return parse_qs(urlsplit(lien).query)["body"][0]
+    def test_seule_la_livraison_est_proposee(self) -> None:
+        liens = junk_choice_links("maia@sentinel.mondomaine.example")
+        self.assertEqual(["A"], list(liens))
 
     def test_le_choix_a_demande_la_livraison(self) -> None:
         from sentimail_v3.conversation.directive_policy import evaluate_directive
 
-        verdict = evaluate_directive(
-            self._corps("A"), {"requested_action": "release_original"}
-        )
+        lien = junk_choice_links("maia@sentinel.mondomaine.example")["A"]
+        corps = parse_qs(urlsplit(lien).query)["body"][0]
+        verdict = evaluate_directive(corps, {"requested_action": "release_original"})
         self.assertEqual(verdict["explicit_action"], "release_original")
 
-    def test_aucun_bouton_ne_confirme_le_classement(self) -> None:
-        # Principe des jeux de boutons : un indésirable propose A et C, jamais
-        # B - le classement est déjà acquis, seul le désaccord a un geste.
-        self.assertNotIn("B", junk_choice_links("maia@sentinel.mondomaine.example"))
-
-    def test_le_choix_c_dit_quoi_ecrire(self) -> None:
-        # La séquence machine vit dans l'objet ; le corps invite à écrire.
-        corps = self._corps("C")
+    def test_l_objet_porte_le_jeton_machine(self) -> None:
+        lien = junk_choice_links("maia@sentinel.mondomaine.example")["A"]
+        sujet = parse_qs(urlsplit(lien).query)["subject"][0]
+        corps = parse_qs(urlsplit(lien).query)["body"][0]
+        self.assertIn(JUNK_TOKEN_PLACEHOLDER, sujet)
         self.assertNotIn(JUNK_TOKEN_PLACEHOLDER, corps)
-        self.assertRegex(corps.casefold(), r"écri|consigne|explique|demande|tapez")
-
-    def test_chaque_objet_porte_le_jeton(self) -> None:
-        for lettre in ("A", "C"):
-            with self.subTest(lettre=lettre):
-                lien = junk_choice_links("maia@sentinel.mondomaine.example")[lettre]
-                sujet = parse_qs(urlsplit(lien).query)["subject"][0]
-                self.assertIn(JUNK_TOKEN_PLACEHOLDER, sujet)
-                self.assertNotIn(JUNK_TOKEN_PLACEHOLDER, self._corps(lettre))
 
 
 class EnveloppeTests(unittest.TestCase):
-    """Le message livré doit être l'enveloppe, pas l'original."""
+    ORIGINAL = (
+        b"From: Alzheimer's Alert <support@rockbook.hu>\r\n"
+        b"To: operateur@mondomaine.example\r\n"
+        b"Subject: Reverse dementia in weeks? Bill Gates says yes\r\n"
+        b"Message-ID: <hostile@rockbook.example>\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n\r\n"
+        b'<html><body><a href="https://hostile.example">CLIQUE ICI</a></body></html>\r\n'
+    )
 
-    def _original(self) -> bytes:
-        return (
-            b"From: suivi@colis-livraison.example\r\n"
-            b"To: operateur@mondomaine.example\r\n"
-            b"Subject: Votre colis est en attente\r\n"
-            b"Content-Type: text/html; charset=utf-8\r\n\r\n"
-            b'<html><body><a href="http://mechant.top/x">Cliquez MAINTENANT</a></body></html>\r\n'
-        )
-
-    def test_l_enveloppe_ne_contient_plus_le_lien_d_origine(self) -> None:
+    def _enveloppe(self, **extra: object):
         from sentimail_v3.execution.delivery import build_junk_envelope
 
-        enveloppe = build_junk_envelope(
-            self._original(),
-            "spam",
-            reasons=["Le domaine ne correspond pas."],
-            lessons=[],
-            preview=b"\x89PNG\r\n\x1a\n" + b"0" * 40,
-            action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
-        )
-        self.assertNotIn(b"mechant.top", enveloppe)
-        self.assertNotIn(b"MAINTENANT", enveloppe)
+        params: dict[str, object] = {
+            "reasons": list(CONTEXTE["reasons"]),
+            "lessons": [{"name": "Technique", "advice": "Conseil long."}],
+            "preview": b"\x89PNG\r\n\x1a\n" + b"0" * 40,
+            "full_preview": b"image pleine",
+            "identity_card": CONTEXTE["identity_card"],
+            "action_address": "maia@sentinel.mondomaine.example",
+            "assistant_sender": "MAIA - SentiMail <maia@mondomaine.example>",
+            "recipient": "operateur@mondomaine.example",
+            "message_id": "10eb8e56-8444-4502-9b2d-c0434e4a26cc",
+            "envelope_from": "bounce@mailer.example.ru",
+        }
+        params.update(extra)
+        brut = build_junk_envelope(self.ORIGINAL, "spam", **params)  # type: ignore[arg-type]
+        return BytesParser(policy=policy.default).parsebytes(brut)
 
-    def test_l_enveloppe_porte_la_capture_en_piece_jointe(self) -> None:
-        from sentimail_v3.execution.delivery import build_junk_envelope
+    def test_l_original_est_remplace_par_de_courts_extraits(self) -> None:
+        source = self._enveloppe().as_bytes()
+        self.assertNotIn(b"hostile.example", source)
+        self.assertIn(b"CLIQUE ICI", source)
 
-        enveloppe = build_junk_envelope(
-            self._original(), "spam", reasons=[], lessons=[],
-            preview=b"\x89PNG\r\n\x1a\n" + b"0" * 40,
-            action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
-        )
-        message = BytesParser(policy=policy.default).parsebytes(enveloppe)
-        images = [
-            part for part in message.walk()
-            if part.get_content_type() == "image/png"
+    def test_la_miniature_est_dans_le_corps_et_la_capture_jointe(self) -> None:
+        enveloppe = self._enveloppe()
+        miniatures = [
+            part for part in enveloppe.walk()
+            if part.get("Content-ID") == "<capture-email-neutralisee>"
         ]
-        self.assertEqual(len(images), 1)
+        jointes = [
+            part for part in enveloppe.walk()
+            if part.get_content_disposition() == "attachment"
+        ]
+        self.assertEqual(1, len(miniatures))
+        self.assertEqual(["message-en-grand.png"], [p.get_filename() for p in jointes])
 
-    def test_l_objet_reste_reconnaissable(self) -> None:
-        from sentimail_v3.execution.delivery import build_junk_envelope
+    def test_sans_capture_aucune_image_ne_voyage(self) -> None:
+        enveloppe = self._enveloppe(preview=None)
+        images = [
+            part for part in enveloppe.walk()
+            if part.get_content_maintype() == "image"
+        ]
+        self.assertEqual([], images)
+        html = str(enveloppe.get_body(preferencelist=("html",)).get_content())
+        self.assertNotIn("cid:capture-email", html)
 
-        enveloppe = build_junk_envelope(
-            self._original(), "spam", reasons=[], lessons=[],
-            preview=None, action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
+    def test_entetes_et_objet_restent_exploitables(self) -> None:
+        enveloppe = self._enveloppe()
+        self.assertIn("maia@mondomaine.example", str(enveloppe["From"]))
+        self.assertIn("operateur@mondomaine.example", str(enveloppe["To"]))
+        self.assertIn("maia@sentinel.mondomaine.example", str(enveloppe["Reply-To"]))
+        self.assertIn("Indésirable - Reverse dementia", str(enveloppe["Subject"]))
+        self.assertIn("rockbook.hu", str(enveloppe["X-SentiMail-Original-From"]))
+        self.assertEqual("spam", str(enveloppe["X-Sentimail-Verdict"]))
+
+    def test_versions_html_et_texte_portent_la_meme_fiche(self) -> None:
+        enveloppe = self._enveloppe()
+        texte = str(enveloppe.get_body(preferencelist=("plain",)).get_content())
+        html = str(enveloppe.get_body(preferencelist=("html",)).get_content())
+        self.assertIn("Classé dans Indésirables", texte)
+        self.assertIn("CLASSÉ EN INDÉSIRABLES", html)
+        self.assertIn("Extraits du message", texte)
+        self.assertIn("Aperçu inerte", html)
+        for attendu in (
+            "support@rockbook.hu",
+            "Adresse affichée",
+            "Adresse d’enveloppe différente",
+            "bounce@mailer.example.ru",
+            "Reverse dementia",
+            "Authentification : échec",
+            "CLIQUE ICI",
+            "Livrer dans ma boîte",
+            "M-10eb8e",
+        ):
+            self.assertIn(attendu, texte)
+            self.assertIn(attendu, html)
+        self.assertNotIn("Conseil long", texte)
+        self.assertNotIn("Conseil long", html)
+
+    def test_sans_motif_la_carte_reste_dans_l_entete_d_audit(self) -> None:
+        enveloppe = self._enveloppe(reasons=[])
+        entete = str(enveloppe["X-Sentimail-Classification-Reason"])
+        self.assertIn("Se présente comme", entete)
+        html = str(enveloppe.get_body(preferencelist=("html",)).get_content())
+        self.assertNotIn("example.invalid", html)
+
+    def test_le_jeton_est_substitue(self) -> None:
+        source = self._enveloppe(token="JETON-DE-TEST").as_bytes().decode(
+            "utf-8", "replace"
         )
-        message = BytesParser(policy=policy.default).parsebytes(enveloppe)
-        self.assertIn("Votre colis est en attente", str(message.get("subject")))
+        self.assertNotIn(JUNK_TOKEN_PLACEHOLDER, source)
+        self.assertIn("JETON-DE-TEST", source)
 
-    def test_sans_capture_l_enveloppe_est_quand_meme_produite(self) -> None:
-        # Le bac à sable de rendu peut être indisponible : on ne renvoie pas
-        # pour autant le message hostile intact.
-        from sentimail_v3.execution.delivery import build_junk_envelope
+    def test_sans_jeton_le_marqueur_ne_fuit_pas(self) -> None:
+        self.assertNotIn(JUNK_TOKEN_PLACEHOLDER.encode(), self._enveloppe().as_bytes())
 
-        enveloppe = build_junk_envelope(
-            self._original(), "spam", reasons=["Motif."], lessons=[],
-            preview=None, action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
+    def test_un_expediteur_d_avis_manquant_est_refuse(self) -> None:
+        with self.assertRaises(ValueError):
+            self._enveloppe(assistant_sender="")
+
+    def test_un_destinataire_manquant_est_refuse(self) -> None:
+        with self.assertRaises(ValueError):
+            self._enveloppe(recipient="  ")
+
+
+class MotifsTelegraphiquesTests(unittest.TestCase):
+    def test_le_cas_rockbook_tient_en_trois_lignes(self) -> None:
+        from sentimail_v3.code.plain_words import classification_reasons
+
+        indices = [
+            {"clue_code": "AUTH_DMARC_FAIL", "statement": ""},
+            {"clue_code": "AUTH_DKIM_INCONCLUSIVE", "statement": ""},
+            {"clue_code": "AUTH_SPF_SOFTFAIL", "statement": ""},
+            {"clue_code": "CONTENT_URGENCY", "statement": ""},
+            {"clue_code": "CORRELATION_COMPROMISED_SENDER", "statement": ""},
+            {"clue_code": "SENDER_ACTIVITY_INCOHERENT", "statement": ""},
+        ]
+        self.assertEqual(
+            [
+                "Authentification : échec",
+                "Contenu : pression pour agir vite",
+                "Activité : sans rapport avec l’expéditeur",
+            ],
+            classification_reasons(indices, "", telegraphique=True),
         )
-        self.assertNotIn(b"mechant.top", enveloppe)
-        self.assertIn(b"Motif.", enveloppe.replace(b"=\r\n", b""))
 
-    def test_les_entetes_d_origine_sont_conserves_pour_l_audit(self) -> None:
-        from sentimail_v3.execution.delivery import build_junk_envelope
+    def test_un_indice_sans_libelle_devient_une_fiche(self) -> None:
+        from sentimail_v3.code.plain_words import classification_reasons
 
-        enveloppe = build_junk_envelope(
-            self._original(), "spam", reasons=[], lessons=[],
-            preview=None, action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
+        self.assertEqual(
+            ["Message : insiste pour obtenir une réponse immédiate"],
+            classification_reasons(
+                [
+                    {
+                        "clue_code": "NOUVEL_INDICE",
+                        "statement": "Le message insiste pour obtenir une réponse immédiate.",
+                    }
+                ],
+                "",
+                telegraphique=True,
+            ),
         )
-        message = BytesParser(policy=policy.default).parsebytes(enveloppe)
-        self.assertTrue(message.get("X-SentiMail-Original-From"))
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-class JetonEtBranchementTests(unittest.TestCase):
-    """Un avis dont le jeton reste un marqueur ne rattache aucune réponse."""
-
-    def test_le_jeton_est_substitue_dans_l_enveloppe(self) -> None:
-        from sentimail_v3.execution.delivery import build_junk_envelope
-
-        enveloppe = build_junk_envelope(
-            b"From: a@b.c\r\nSubject: Test\r\n\r\ncorps\r\n",
-            "spam",
-            reasons=[],
-            lessons=[],
-            preview=None,
-            action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
-            token="JETON-DE-TEST-INACTIF",
-        )
-        texte = enveloppe.decode("utf-8", "replace").replace("=\r\n", "")
-        self.assertNotIn(JUNK_TOKEN_PLACEHOLDER, texte)
-        self.assertIn("S3-ACTION%3AJETON-DE-TEST-INACTIF", texte.replace("=3A", "%3A"))
-
-    def test_sans_jeton_le_marqueur_ne_fuit_pas_dans_l_avis(self) -> None:
-        # Mieux vaut un avis sans lien pré-rempli qu'un avis affichant un
-        # marqueur interne au destinataire.
-        from sentimail_v3.execution.delivery import build_junk_envelope
-
-        enveloppe = build_junk_envelope(
-            b"From: a@b.c\r\nSubject: Test\r\n\r\ncorps\r\n",
-            "spam", reasons=[], lessons=[], preview=None,
-            action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
-        )
-        self.assertNotIn(JUNK_TOKEN_PLACEHOLDER.encode(), enveloppe)
 
 
 class LivraisonBrancheeTests(unittest.TestCase):
-    """La leçon des traductions non branchées : vérifier l'appel réel."""
-
-    def test_la_livraison_classee_construit_l_enveloppe(self) -> None:
-        import inspect
-
+    def test_la_livraison_classee_photographie_et_passe_l_enveloppe(self) -> None:
         from sentimail_v3.execution import delivery
 
         source = inspect.getsource(delivery.release_original)
         self.assertIn("build_junk_envelope", source)
+        self.assertIn("await screenshot", source)
+        self.assertIn("await thumbnail", source)
+        self.assertIn('envelope_from=row["envelope_from"]', source)
 
-    def test_l_ancien_bandeau_n_est_qu_un_repli(self) -> None:
-        # Il reste comme filet si l'avis échoue - perdre un message serait pire
-        # qu'en livrer un mal présenté - mais il ne doit pas être le chemin
-        # normal : l'enveloppe est construite d'abord.
-        import inspect
-
+    def test_l_ancien_bandeau_reste_le_repli_fail_soft(self) -> None:
         from sentimail_v3.execution import delivery
 
         source = inspect.getsource(delivery.release_original)
         self.assertLess(
-            source.index("build_junk_envelope"),
-            source.index("annotate_classified"),
-            "le bandeau est appliqué avant l'enveloppe",
+            source.index("build_junk_envelope"), source.index("annotate_classified")
         )
 
 
-class EnteteDeTriTests(unittest.TestCase):
-    """Sans l'en-tête exact, l'avis atterrit en boîte de réception.
-
-    C'est lui, et lui seul, qui fait ranger le message en indésirables côté
-    serveur de messagerie. Une enveloppe qui le perdrait ferait arriver tous
-    les spams classés dans la boîte principale.
-    """
-
-    def test_l_enveloppe_porte_l_entete_de_classement(self) -> None:
-        from sentimail_v3.execution.delivery import build_junk_envelope
-
-        enveloppe = build_junk_envelope(
-            b"From: a@b.c\r\nSubject: Test\r\n\r\ncorps\r\n",
-            "spam", reasons=["Motif."], lessons=[], preview=None,
-            action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
-        )
-        message = BytesParser(policy=policy.default).parsebytes(enveloppe)
-        self.assertEqual(str(message.get("X-Sentimail-Verdict")), "spam")
-
-    def test_la_graphie_est_celle_que_le_tri_attend(self) -> None:
-        # classify_header est la source de vérité : l'enveloppe doit employer
-        # exactement la même graphie, pas une variante.
-        from sentimail_v3.execution.delivery import build_junk_envelope, classify_header
-
-        attendu = classify_header(b"From: a@b.c\r\n\r\nx\r\n", "spam", reasons=[], techniques=[])
-        nom = attendu.split(b":")[0]
-        enveloppe = build_junk_envelope(
-            b"From: a@b.c\r\nSubject: T\r\n\r\ncorps\r\n",
-            "spam", reasons=[], lessons=[], preview=None,
-            action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
-        )
-        self.assertIn(nom + b":", enveloppe)
-
-    def test_un_message_dangereux_porte_son_verdict(self) -> None:
-        from sentimail_v3.execution.delivery import build_junk_envelope
-
-        enveloppe = build_junk_envelope(
-            b"From: a@b.c\r\nSubject: T\r\n\r\ncorps\r\n",
-            "dangerous", reasons=[], lessons=[], preview=None,
-            action_address="maia@sentinel.mondomaine.example",
-            assistant_sender="MAIA - SentiMail <maia@mondomaine.example>",
-            recipient="moi@mondomaine.example",
-        )
-        message = BytesParser(policy=policy.default).parsebytes(enveloppe)
-        self.assertEqual(str(message.get("X-Sentimail-Verdict")), "dangerous")
+if __name__ == "__main__":
+    unittest.main()

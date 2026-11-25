@@ -24,11 +24,16 @@ intervention immédiate.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
 
 from sentimail_v3.supervision.evaluation import (
+    ASK,
+    DELIVER,
+    JUNK,
     confusion_matrix,
     generalized_risk,
     hold_precision,
@@ -41,22 +46,13 @@ from sentimail_v3.supervision.evaluation import (
 COMPONENT = "evaluation"
 DEFAULT_WINDOW_DAYS = 30
 
-# L'issue vient des événements, la vérité de l'utilisateur seul. Un message
-# peut porter plusieurs labels au fil du temps ; le dernier qualifié fait foi,
-# c'est le dernier avis que l'utilisateur a exprimé.
+# Une erreur ou une réponse ne constitue pas une première exécution. Les
+# événements d'exécution sont triés, au lieu de privilégier un classement final.
 _ROWS_SQL = """
 SELECT
-  CASE
-    WHEN EXISTS (
-      SELECT 1 FROM delivery_events de
-      WHERE de.case_id = dc.id AND de.event_type = 'original_filed_as_junk'
-    ) THEN 'filed_as_junk'
-    WHEN EXISTS (
-      SELECT 1 FROM delivery_events de
-      WHERE de.case_id = dc.id AND de.event_type = 'review_notice_delivered'
-    ) THEN 'ask_user'
-    ELSE 'deliver'
-  END AS outcome,
+  m.delivery_status, dc.id AS case_id, dc.state AS case_state,
+  first_execution.event_type AS first_event_type,
+  first_execution.created_at AS first_event_at,
   (
     SELECT CASE
              WHEN l.label = 'legitimate' THEN 'legitimate'
@@ -65,42 +61,119 @@ SELECT
            END
     FROM labels l
     WHERE l.message_id = m.id AND l.is_ground_truth AND l.active
-    ORDER BY l.created_at DESC LIMIT 1
+    ORDER BY l.created_at DESC, l.id DESC LIMIT 1
   ) AS truth
 FROM messages m
-JOIN delivery_cases dc ON dc.message_id = m.id
-WHERE m.captured_at > now() - ($1 * interval '1 day')
-  AND m.delivery_status <> 'consumed'
-  -- Un dossier abandonne faute de reponse n'est ni une reussite ni un echec :
-  -- le compter comme sollicitation ferait du silence de l'utilisateur une
-  -- performance de la chaine, dans un sens ou dans l'autre.
-  AND dc.state <> 'ignored'
+LEFT JOIN delivery_cases dc ON dc.message_id = m.id
+LEFT JOIN LATERAL (
+  SELECT de.event_type, de.created_at
+  FROM delivery_events de
+  WHERE de.case_id = dc.id
+    AND de.event_type IN (
+      'original_delivered', 'original_released', 'original_filed_as_junk',
+      'review_notice_delivered', 'policy_suppressed'
+    )
+  ORDER BY de.created_at, de.id LIMIT 1
+) first_execution ON true
+WHERE m.captured_at >= $1 AND m.captured_at < $2
 """
+
+_EXECUTION_OUTCOMES = {
+    "original_delivered": DELIVER,
+    "original_released": DELIVER,
+    "original_filed_as_junk": JUNK,
+    "review_notice_delivered": ASK,
+    "policy_suppressed": "suppressed",
+}
+_EXCLUDED_OUTCOMES = ("suppressed", "undeliverable", "pending", "unconfirmed")
+
+
+def first_outcome(row: dict[str, Any]) -> str:
+    """Une absence de preuve de livraison ne devient jamais une livraison."""
+    event = row.get("first_event_type")
+    if event in _EXECUTION_OUTCOMES:
+        return _EXECUTION_OUTCOMES[event]
+    status = row.get("delivery_status")
+    if status in ("suppressed", "undeliverable"):
+        return str(status)
+    if status == "delivered" or row.get("case_state") in ("closed", "ignored"):
+        return "unconfirmed"
+    return "pending"
+
+
+def assemble(
+    rows: list[dict[str, Any]], *, days: int, start: datetime, end: datetime
+) -> dict[str, Any]:
+    """Sépare la population captée, les exécutions et la qualité mesurable."""
+    protected = [r for r in rows if r.get("delivery_status") != "consumed"]
+    outcomes: Counter[str] = Counter()
+    residuals: Counter[str] = Counter()
+    quality: list[dict[str, Any]] = []
+    for row in protected:
+        outcome = first_outcome(row)
+        outcomes[outcome] += 1
+        if outcome in (DELIVER, ASK, JUNK):
+            # L'abandon n'est pas une qualification. Un vrai label actif reste
+            # utilisable ; son absence reste inconnue, même après l'abandon.
+            quality.append({"outcome": outcome, "truth": row.get("truth")})
+        if row.get("case_id") is None:
+            residuals["missing_case"] += 1
+        if row.get("first_event_type") is None:
+            residuals["without_execution_event"] += 1
+            if row.get("delivery_status") in ("delivered", "suppressed"):
+                residuals[f"{row['delivery_status']}_without_event"] += 1
+        if outcome == "unconfirmed":
+            residuals["unconfirmed"] += 1
+    rates = trec_rates(quality)
+    return {
+        "schema_version": 2,
+        "window_days": days,
+        "window_start_utc": start.isoformat(),
+        "window_end_utc": end.isoformat(),
+        "collected_at_utc": datetime.now(timezone.utc).isoformat(),
+        "population": {
+            "captured": len(rows),
+            "consumed_excluded": len(rows) - len(protected),
+            "protected": len(protected),
+            "quality_evaluated": len(quality),
+            "quality_exclusions": {key: outcomes[key] for key in _EXCLUDED_OUTCOMES},
+            "ignored": sum(r.get("case_state") == "ignored" for r in protected),
+            "ignored_with_notice": sum(
+                r.get("case_state") == "ignored" and first_outcome(r) == ASK
+                for r in protected
+            ),
+        },
+        "executions": {key: outcomes[key] for key in (DELIVER, ASK, JUNK, *_EXCLUDED_OUTCOMES)},
+        "final_statuses": dict(Counter(r.get("delivery_status") for r in protected)),
+        "residuals": {key: residuals[key] for key in (
+            "missing_case", "without_execution_event", "delivered_without_event",
+            "suppressed_without_event", "unconfirmed",
+        )},
+        "coverage": labelling_coverage(quality),
+        "matrix": confusion_matrix(quality),
+        "hold_precision": hold_precision(quality),
+        "generalized_risk": generalized_risk(quality),
+        "trec_rates": rates,
+        "lam_optimistic": lam_percent(rates["hm_optimistic"], rates["sm_optimistic"]),
+        "lam_pessimistic": lam_percent(rates["hm_pessimistic"], rates["sm_pessimistic"]),
+        "utility": utility_score(quality),
+    }
 
 
 async def collect(
-    pool: asyncpg.Pool[Any], *, days: int = DEFAULT_WINDOW_DAYS
+    pool: asyncpg.Pool[Any], *, days: int = DEFAULT_WINDOW_DAYS,
+    as_of: datetime | None = None,
 ) -> dict[str, Any]:
     """Le rapport complet : conditions de validité d'abord, taux ensuite."""
-    lignes = [dict(row) for row in await pool.fetch(_ROWS_SQL, days)]
-    taux = trec_rates(lignes)
-    return {
-        "window_days": days,
-        # En tête, et jamais en note de bas de page : un taux dont on ignore
-        # la couverture se lit comme s'il était mesuré.
-        "coverage": labelling_coverage(lignes),
-        "matrix": confusion_matrix(lignes),
-        "hold_precision": hold_precision(lignes),
-        "generalized_risk": generalized_risk(lignes),
-        "trec_rates": taux,
-        "lam_optimistic": lam_percent(
-            taux["hm_optimistic"], taux["sm_optimistic"]
-        ),
-        "lam_pessimistic": lam_percent(
-            taux["hm_pessimistic"], taux["sm_pessimistic"]
-        ),
-        "utility": utility_score(lignes),
-    }
+    if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
+        raise ValueError("la fenêtre doit compter un nombre positif de jours")
+    end = as_of or datetime.now(timezone.utc)
+    if end.tzinfo is None or end.utcoffset() is None:
+        raise ValueError("la borne de mesure doit porter son fuseau horaire")
+    end = end.astimezone(timezone.utc)
+    start = end - timedelta(days=days)
+    rows = [dict(row) for row in await pool.fetch(_ROWS_SQL, start, end)]
+    return assemble(rows, days=days, start=start, end=end)
 
 
 async def publish(

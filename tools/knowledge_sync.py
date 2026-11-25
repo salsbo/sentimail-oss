@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 KNOWLEDGE = ROOT / "knowledge"
 SNAPSHOTS = KNOWLEDGE / "snapshots"
 MANIFEST = KNOWLEDGE / "manifest.json"
-USER_AGENT = "sentimail-v3-knowledge-sync/1.0"
+USER_AGENT = "Mozilla/5.0 (compatible)"
 
 # Uniquement des normes et des spécifications : stables, publiques, citables.
 # La veille et les annuaires n'ont pas leur place ici, ils ne se vérifient pas
